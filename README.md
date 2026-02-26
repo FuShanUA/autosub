@@ -8,8 +8,9 @@ AutoSub is a professional, "zero-click" workflow to download, transcribe, transl
 ## ✨ Features
 - **Smart Download**: Automatically fetches videos from YouTube, Twitter, Bilibili, etc.
 - **Whisper Transcription**: Uses `faster-whisper` for high-accuracy English transcription.
-- **LLM Translation**: Context-aware translation using Gemini (Flash/Pro) with humanized style rules.
+- **LLM Translation**: Context-aware translation using Gemini (Flash/Pro), Zhipu (GLM), or OpenAI, with humanized style rules.
 - **Professional Styling**: One-click generation of hard-subbed videos with bilingual layouts and vector-box styles.
+- **Dynamic Model Discovery**: Automatically discovers the latest models from API providers.
 - **GUI & CLI**: User-friendly interface or powerful command-line automation.
 
 ## 🚀 One-Click Installation (Windows)
@@ -18,8 +19,11 @@ AutoSub is a professional, "zero-click" workflow to download, transcribe, transl
 2. **Right-click** `install.ps1` and select **"Run with PowerShell"**.
    - *This script will automatically install Python 3.12, FFmpeg, and all required Python libraries.*
 3. **Configure API Key**:
-   - Open the `.env` file in the root directory.
-   - Add your `GEMINI_API_KEY=your_actual_key_here`.
+   - **Method A (Easiest)**: Run the GUI (`autosub_gui.py`), enter your key in the "API Key" field, and click **"Save Key"**. The `.env` file will be created automatically.
+   - **Method B (Manual)**: Create a `.env` file in the root directory and add:
+     - `ZHIPUAI_API_KEY=your_key` (Recommended: Free tier supported)
+     - `GEMINI_API_KEY=your_key`
+     - `OPENAI_API_KEY=your_key`
 
 ## 📖 How to Use
 
