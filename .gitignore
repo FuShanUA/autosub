@@ -1,0 +1,17 @@
+
+__pycache__/
+*.pyc
+.env
+Projects/
+Library/Tools/autosub/results/
+Library/Tools/transcriber/results/
+Library/Tools/vdown/download/
+Library/Tools/common/__pycache__/
+*.log
+*.tmp
+temp_*/
+downloads/
+ffmpeg.exe
+ffprobe.exe
+node.exe
+Library/Tools/transcriber/models/

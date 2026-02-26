@@ -1,0 +1,7 @@
+
+yt-dlp
+faster-whisper
+google-generativeai
+python-dotenv
+requests
+Pillow
