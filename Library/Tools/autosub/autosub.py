@@ -209,7 +209,12 @@ def download_video(url, workdir, cookies=None):
     try: 
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', bufsize=1, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
         for line in process.stdout:
-            print(line.strip(), flush=True)
+            msg = line.strip()
+            if "Progress:" in msg or ("[download]" in msg and "%" in msg):
+                sys.stdout.write(f"\r   {msg}    ")
+                sys.stdout.flush()
+            else:
+                print(msg, flush=True)
         process.wait()
         if process.returncode != 0:
             raise subprocess.CalledProcessError(process.returncode, cmd)
@@ -234,7 +239,12 @@ def transcribe_video(video_path, workdir, model="large-v3-turbo"):
     try:
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', bufsize=1, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
         for line in process.stdout:
-            print(line.strip(), flush=True)
+            msg = line.strip()
+            if "Progress:" in msg or ("[download]" in msg and "%" in msg):
+                sys.stdout.write(f"\r   {msg}    ")
+                sys.stdout.flush()
+            else:
+                print(msg, flush=True)
         process.wait()
         res = os.path.join(workdir, os.path.splitext(os.path.basename(video_path))[0] + ".srt")
         if os.path.exists(res):
@@ -265,9 +275,11 @@ def merge_bilingual(src_srt, zh_srt, main_lang="cn", llm_model="gemini-3.1-pro-p
         for line in process.stdout:
             msg = line.strip()
             if "Progress:" in msg:
-                print(msg, flush=True)
+                sys.stdout.write(f"\r   {msg}    ")
+                sys.stdout.flush()
             else:
                 print(f"   [Merge] {msg}", flush=True)
+        sys.stdout.write("\n")
         process.wait()
         
         if process.returncode == 0 and os.path.exists(bi_path):
@@ -316,11 +328,12 @@ def burn_subtitle(video_path, srt_path, layout, main_lang, cn_font, en_font, cn_
         for line in process.stdout:
             msg = line.strip()
             if msg:
-                # If it's a progress line, don't prefix it so it's cleaner for the GUI regex
                 if "Progress:" in msg:
-                    print(msg, flush=True)
+                    sys.stdout.write(f"\r   {msg}    ")
+                    sys.stdout.flush()
                 else:
                     print(f"   [Burn] {msg}", flush=True)
+        sys.stdout.write("\n")
                 last_logs.append(msg)
                 if len(last_logs) > 50: last_logs.pop(0)
         

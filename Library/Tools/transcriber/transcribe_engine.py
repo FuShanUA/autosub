@@ -499,8 +499,8 @@ def main():
                 
                 if duration > 0:
                     p = int((s.end / duration) * 100)
-                    if p > last_p and p % 5 == 0:
-                        print(f"   Progress: {p}% ({s.end:.0f}/{duration:.0f}s)")
+                    if p > last_p and p >= 0:
+                        print(f"Progress: {p}% ({s.end:.0f}/{duration:.0f}s)", flush=True)
                         last_p = p
 
             # Final safety check if video is extremely short
@@ -526,7 +526,7 @@ def main():
                         milliseconds = int((t - int(t)) * 1000)
                         return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
                     
-                    print(f"[{fmt(start)} --> {fmt(end)}] {text}")
+                    # print(f"[{fmt(start)} --> {fmt(end)}] {text}")  # REMOVED per user request to clean up progress area
                     f.write(f"{segment.id}\n{fmt(start)} --> {fmt(end)}\n{text}\n\n")
                     
                     # Update Progress
