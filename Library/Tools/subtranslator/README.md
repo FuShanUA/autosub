@@ -77,3 +77,10 @@ English subtitles often split sentences across blocks. You MUST align the Chines
     - **Common ASR Errors**: Often mis-transcribed as **"Cloud"**, **"Clawed"**, or **"Clouds"**.
     - **Logic**: If the context mentions "GPT", "Gemini", "Llama", "Anthropic", or "Reasoning Model", then "Cloud" usually refers to "Claude".
     - **Translation**: "Claude" (Keep English). **NEVER** "云" (Cloud computing) in this specific context.
+
+## Multi-Speaker Formatting (关键: 多方插话处理)
+在极快语速或多人对话重叠的情况下，使用方括号 `[]` 标注短促的插入语或背景反馈。
+1. **Principle**: `[内容]` 表示插话的起止口。
+2. **Logic**: 插话部分加方括号；主发言人重新接回的部分**不加**。
+   - **好**: `谁会被血洗？是工人。[没错，历来如此。] 所以，`
+   - **坏**: `谁会被血洗？是工人。[没错，历来如此。][所以，]`

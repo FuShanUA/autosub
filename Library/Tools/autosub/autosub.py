@@ -63,7 +63,7 @@ if getattr(sys, 'frozen', False):
     TOOLS_DIR = os.path.join(BUNDLE_DIR, "Library", "Tools")
     USER_DATA_DIR = os.path.join(os.path.expanduser("~"), "Documents", "AutoSub")
     PROJECT_ROOT = USER_DATA_DIR
-    BASE_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "Project")
+    BASE_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "Projects")
     env_path = os.path.join(PROJECT_ROOT, ".env")
     
     # In bundled mode, common is in BUNDLE_DIR/Library/Tools/common
@@ -80,7 +80,7 @@ else:
     else:
         PROJECT_ROOT = tmp_root
         
-    BASE_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "Project")
+    BASE_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "Projects")
     env_path = os.path.join(PROJECT_ROOT, ".env")
     
     # In dev mode, common is in d:\cc\Library\Tools\common
@@ -358,7 +358,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("input")
     parser.add_argument("--model", default="large-v3-turbo")
-    parser.add_argument("--llm-model", default="gemini-1.5-flash", help="LLM Model (gemini-1.5-flash, gpt-4o, moonshot-v1-8k, qwen-plus, glm-4, etc.)")
+    parser.add_argument("--llm-model", default="gemini-3-flash-preview", help="LLM Model (gemini-3-flash-preview, gemini-3-pro-preview, gpt-4o, etc.)")
     parser.add_argument("--style", default="casual")
     parser.add_argument("--cookies")
     parser.add_argument("--layout", default="bilingual")
@@ -489,7 +489,7 @@ def main():
     if not zh_srt:
         print("🌍 Smart-translating...")
         try:
-            cmd = list(SMART_TRANSLATE_CMD) + [src_srt, "--style", args.style, "--model", args.llm_model]
+            cmd = [sys.executable, SMART_TRANSLATE_CMD[1], src_srt, "--style", args.style, "--model", args.llm_model]
             subprocess.run(cmd, check=True)
             if os.path.exists(expected_cn): zh_srt = expected_cn
             elif os.path.exists(expected_zh): zh_srt = expected_zh

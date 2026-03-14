@@ -115,9 +115,11 @@ TARGET STYLE: {style}
 - NO long dashes "——".
 - Vary sentence length.
 
-### STEP 3: CONTEXT AWARENESS
-- Use the provided Context Lines (if any) to understand the meaning, but ONLY translate the Target Line.
-- If a sentence is split across lines, translate the PARTIAL meaning naturaly for that time slot.
+### CORE REQUIREMENTS:
+1. **Timing & Rhythm (Highest Priority)**: Maintain strict alignment with the time-axis. The Chinese text should match the rhythm of the English speech. 
+2. **Context-Driven Meaning**: Use the 'Context Lines' to understand the full sentence, but only translate the specific 'Target Line'.
+3. **Synchronization Constraint**: Do not significantly restructure sentences across time boundaries. Ensure the meaning of each segment is self-contained enough to be understood at that specific moment.
+4. **Glossary Consistency**: Strictly follow the terms provided in the 'ARTICLE ANALYSIS'.
 
 INPUT BLOCK:
 {input_text}
@@ -139,7 +141,8 @@ OUTPUT FORMAT:
             if match:
                 idx = match.group(1)
                 content = match.group(2).strip()
-                translated_map[idx] = content
+                if content:  # guard: reject empty translations
+                    translated_map[idx] = content
         
         # Apply translations back to blocks
         translated_blocks = []
@@ -161,7 +164,7 @@ OUTPUT FORMAT:
         return chunk_blocks # Return original on failure
 
 
-STYLE_GUIDE_PATH = os.path.join(TOOLS_DIR, "common", "STYLE_GUIDE.md")
+STYLE_GUIDE_PATH = os.path.join(TOOLS_DIR, "common", "HARD_CONSTRAINTS.md")
 
 def load_regex_rules(filepath):
     rules = []
@@ -342,7 +345,7 @@ def main():
     parser = argparse.ArgumentParser(description="Smart Translation with Context & Style")
     parser.add_argument("input", help="Input English SRT file")
     parser.add_argument("--style", default="casual", choices=["casual", "formal", "edgy"])
-    parser.add_argument("--model", default="gemini-3-pro", help="Gemini Model (e.g. gemini-3-flash)")
+    parser.add_argument("--model", default="gemini-3-flash", help="Gemini Model (e.g. gemini-3-flash)")
     parser.add_argument("--chunk-size", type=int, default=50, help="Number of blocks per batch")
     
     args = parser.parse_args()

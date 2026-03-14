@@ -6,7 +6,14 @@ import time
 import ctypes
 import re
 import subprocess
-from faster_whisper import WhisperModel
+try:
+    from faster_whisper import WhisperModel
+except ImportError:
+    # Attempt to force reload site packages if we are in a transitionary environment state
+    import site
+    from importlib import reload
+    reload(site)
+    from faster_whisper import WhisperModel
 import io
 
 # Force UTF-8 for stdout/stderr to handle emojis in logs on Windows
@@ -42,7 +49,8 @@ if getattr(sys, 'frozen', False):
         LOCAL_MODELS = os.path.join(BUNDLE_DIR, "Library", "Tools", "transcriber", "models")
 else:
     # Development/Raw script logic
-    RESULT_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
+    # USER REQUEST: Ensure files save under 'd:\cc\Projects' instead of a local 'results' or 'project' folder
+    RESULT_ROOT = r"d:\cc\Projects"
     LOCAL_MODELS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
     DOCS_MODELS = None # Disable Documents fallback in dev mode
 

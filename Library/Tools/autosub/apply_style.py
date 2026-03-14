@@ -5,7 +5,7 @@ import argparse
 import sys
 
 # Assume we are run from tools dir or similar, find STYLE_GUIDE relative
-STYLE_GUIDE_PATH = os.path.join(os.path.dirname(__file__), "..", "common", "STYLE_GUIDE.md")
+HARD_CONSTRAINTS_PATH = os.path.join(os.path.dirname(__file__), "..", "common", "HARD_CONSTRAINTS.md")
 
 def load_regex_rules(filepath):
     rules = []
@@ -52,7 +52,7 @@ def load_regex_rules(filepath):
         print(f"Warning: STYLE_GUIDE not found at {filepath}")
     return rules
 
-REGEX_RULES = load_regex_rules(STYLE_GUIDE_PATH)
+REGEX_RULES = load_regex_rules(HARD_CONSTRAINTS_PATH)
 
 def process_line(line):
     # Skip timestamp/index lines (simple heuristic)
