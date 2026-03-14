@@ -38,7 +38,28 @@ python Library\Tools\autosub\autosub_gui.py
 3. 点击扩展，导出为 **Netscape 格式** 的 `cookies.txt`。
 4. **使用方法**：
    - **GUI**：在“Cookies”栏点击“选择...”，加载该文件。
-   - **CLI**：在命令后添加 `--cookies "path/to/cookies.txt"`。
+   - **CLI**: Append `--cookies "path/to/cookies.txt"` to your command.
+
+## ⚠️ 常见问题与解决方案 (Troubleshooting)
+
+### 1. 视频下载失败 (YouTube/B站报错)
+如果下载时报错（如 `Sign in to confirm you are not a bot` 或 `Video unavailable`），请尝试以下方案：
+- **方案 A：配置 Cookies (强烈推荐)**
+  按照上方 [Cookies 配置] 步骤操作。这是解决机器人检测和受限视频最有效的方法。
+- **方案 B：手动更新下载核心**
+  在终端运行以下命令确保 `yt-dlp` 是最新版本：
+  ```powershell
+  python -m pip install -U yt-dlp
+  ```
+- **方案 C：更换代理/网络**
+  部分视频会根据 IP 地理位置锁定，请确保您的科学上网环境畅通。
+
+### 2. 翻译卡住或报错
+- 检查 `.env` 中的 API Key 是否正确。
+- 检查网络是否能正常访问对应的 AI 厂商（特别是 Gemini 需要全球化网络环境）。
+
+### 3. 硬压失败
+- 确保系统已安装 **FFmpeg**。如果您使用 `install.ps1` 安装，程序会自动处理。
 
 ### 3. AI 智能体模式 (IDE / 工作区)
 如果您正在使用支持智能体的工作空间（如 Antigravity 或 CC），只需输入：

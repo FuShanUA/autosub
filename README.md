@@ -42,6 +42,27 @@ If you encounter YouTube bot detection or need to download Bilibili premium cont
    - **GUI**: Click "Browse..." in the "Cookies" row to load the file.
    - **CLI**: Append `--cookies "path/to/cookies.txt"` to your command.
 
+## ⚠️ Troubleshooting
+
+### 1. Video Download Failure (YouTube/Bilibili Errors)
+If you get errors like `Sign in to confirm you are not a bot` or `Video unavailable`, try:
+- **Solution A: Configure Cookies (Highly Recommended)**
+  Follow the [Cookie Configuration] steps above. This is the most effective way to bypass bot detection.
+- **Solution B: Update the Download Engine**
+  Run the following command to ensure `yt-dlp` is up to date:
+  ```powershell
+  python -m pip install -U yt-dlp
+  ```
+- **Solution C: Check Proxy/VPN**
+  Some videos are region-locked. Ensure your network environment is stable and correctly configured.
+
+### 2. Translation Stuck or Errors
+- Verify your API Key in the `.env` file.
+- Check if you can access the AI provider's API from your network (esp. Gemini which requires global internet access).
+
+### 3. Hard-burn Failure
+- Ensure **FFmpeg** is installed and in your PATH. If you used `install.ps1`, this should be handled automatically.
+
 ### 3. AI Agent Mode (IDE / Workspace)
 If you are using an AI Agent (like Antigravity or CC), you can simply type:
 > `/autosub`
