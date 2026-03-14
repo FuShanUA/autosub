@@ -333,9 +333,9 @@ def burn_subtitle(video_path, srt_path, layout, main_lang, cn_font, en_font, cn_
                     sys.stdout.flush()
                 else:
                     print(f"   [Burn] {msg}", flush=True)
-        sys.stdout.write("\n")
                 last_logs.append(msg)
                 if len(last_logs) > 50: last_logs.pop(0)
+        sys.stdout.write("\n")
         
         process.wait()
         if process.returncode != 0:
