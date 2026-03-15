@@ -5,7 +5,7 @@ a = Analysis(
     ['autosub_gui.py'],
     pathex=[],
     binaries=[('D:\\Program Files\\CapCut\\7.7.0.3143\\ffmpeg.exe', '.')],
-    datas=[('..\\vdown', 'Library\\Tools\\vdown'), ('..\\transcriber', 'Library\\Tools\\transcriber'), ('..\\hardsubber', 'Library\\Tools\\hardsubber'), ('..\\subtranslator', 'Library\\Tools\\subtranslator'), ('..\\common', 'Library\\Tools\\common'), ('autosub.py', 'Library\\Tools\\autosub'), ('autosub_gui.py', 'Library\\Tools\\autosub'), ('agent_task_runner.py', 'Library\\Tools\\autosub'), ('apply_style.py', 'Library\\Tools\\autosub'), ('defaults.json', 'Library\\Tools\\autosub'), ('smart_translate.py', 'Library\\Tools\\autosub'), ('autosub.ico', 'Library\\Tools\\autosub'), ('C:\\Program Files\\Python\\Python312\\DLLs\\sqlite3.dll', '.')],
+    datas=[('..\\vdown', 'Library\\Tools\\vdown'), ('..\\transcriber', 'Library\\Tools\\transcriber'), ('..\\hardsubber', 'Library\\Tools\\hardsubber'), ('..\\subtranslator', 'Library\\Tools\\subtranslator'), ('..\\common', 'Library\\Tools\\common'), ('..\\verbalizer', 'Library\\Tools\\verbalizer'), ('autosub.py', 'Library\\Tools\\autosub'), ('autosub_gui.py', 'Library\\Tools\\autosub'), ('agent_task_runner.py', 'Library\\Tools\\autosub'), ('apply_style.py', 'Library\\Tools\\autosub'), ('defaults.json', 'Library\\Tools\\autosub'), ('smart_translate.py', 'Library\\Tools\\autosub'), ('autosub.ico', 'Library\\Tools\\autosub'), ('C:\\Program Files\\Python\\Python312\\DLLs\\sqlite3.dll', '.')],
     hiddenimports=['yt_dlp', 'faster_whisper', 'torch', 'torchaudio', 'google.generativeai', 'pysubs2', 'tkinter'],
     hookspath=[],
     hooksconfig={},
