@@ -373,6 +373,7 @@ def main():
     parser.add_argument("--model", default="large-v3-turbo")
     parser.add_argument("--llm-model", default="gemini-3-flash-preview", help="LLM Model (gemini-3-flash-preview, gemini-3-pro-preview, gpt-4o, etc.)")
     parser.add_argument("--style", default="casual")
+    parser.add_argument("--trans-mode", default="balanced", choices=["paraphrase", "balanced"])
     parser.add_argument("--cookies")
     parser.add_argument("--layout", default="bilingual")
     parser.add_argument("--main-lang", default="cn")
@@ -502,7 +503,7 @@ def main():
     if not zh_srt:
         print("🌍 Smart-translating...")
         try:
-            cmd = [sys.executable, SMART_TRANSLATE_CMD[1], src_srt, "--style", args.style, "--model", args.llm_model]
+            cmd = [sys.executable, SMART_TRANSLATE_CMD[1], src_srt, "--style", args.style, "--model", args.llm_model, "--trans-mode", getattr(args, "trans_mode", "balanced")]
             subprocess.run(cmd, check=True)
             if os.path.exists(expected_cn): zh_srt = expected_cn
             elif os.path.exists(expected_zh): zh_srt = expected_zh

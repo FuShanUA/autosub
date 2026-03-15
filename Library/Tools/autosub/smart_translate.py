@@ -234,7 +234,7 @@ def is_untranslated(block: Dict) -> bool:
 
 def translate_blocks(blocks: List[Dict], client, model: str, style: str,
                      verbalizer_snippet: str, humanizer_snippet: str,
-                     knowledge_snippet: str) -> List[Dict]:
+                     knowledge_snippet: str, trans_mode_snippet: str = "") -> List[Dict]:
     """
     Translates a list of blocks (may be any size) using generate_batch.
     Returns the blocks with translations applied. Does NOT apply humanize_text.
@@ -263,6 +263,7 @@ TARGET STYLE: {style}
 
 ### STEP 3: HUMANIZATION (De-AI)
 {humanizer_snippet}...
+{trans_mode_snippet}
 
 ### STEP 4: CONTEXT AWARENESS
 INPUT BLOCK:
@@ -304,7 +305,7 @@ OUTPUT FORMAT (STRICT — one line per segment, no extra text):
 
 def postprocess_retry_loop(final_blocks: List[Dict], client, model: str, style: str,
                             verbalizer_snippet: str, humanizer_snippet: str,
-                            knowledge_snippet: str, max_iterations: int = 5) -> List[Dict]:
+                            knowledge_snippet: str, trans_mode_snippet: str = "", max_iterations: int = 5) -> List[Dict]:
     """
     Iteratively re-translates any untranslated/empty blocks until all are done
     (or max_iterations is reached). Returns final_blocks with all translations filled.
@@ -322,7 +323,7 @@ def postprocess_retry_loop(final_blocks: List[Dict], client, model: str, style: 
         missed_blocks = [final_blocks[i] for i in missed_positions]
         retranslated = translate_blocks(
             missed_blocks, client, model, style,
-            verbalizer_snippet, humanizer_snippet, knowledge_snippet
+            verbalizer_snippet, humanizer_snippet, knowledge_snippet, trans_mode_snippet
         )
 
         # Re-insert results at original positions
@@ -347,6 +348,7 @@ def main():
     parser.add_argument("--style", default="casual", choices=["casual", "formal", "edgy"])
     parser.add_argument("--model", default="gemini-3-flash", help="Gemini Model (e.g. gemini-3-flash)")
     parser.add_argument("--chunk-size", type=int, default=50, help="Number of blocks per batch")
+    parser.add_argument("--trans-mode", default="balanced", choices=["paraphrase", "balanced"], help="Translation Mode")
     
     args = parser.parse_args()
     
@@ -385,6 +387,19 @@ def main():
         else:
             # Fallback to general constraints if section not found (or just empty)
             pass
+            
+    if args.trans_mode == "balanced":
+        trans_mode_snippet = """
+### STEP 3.5: TRANSLATION BALANCE (CRITICAL)
+- **Conciseness**: Prevent Chinese character count from blowing up. Keep translations sharp and direct.
+- **Metaphors & Terms**: For important protocols, technical concepts, or product metaphors (e.g., Gastown, Ralph Wiggum), reflect the original text primarily rather than over-explaining the context.
+- **Context Injection**: Do not forcefully add background explanations unless absolutely necessary. (e.g., "in financial terms" -> "金融行话是").
+"""
+    else:
+        trans_mode_snippet = """
+### STEP 3.5: TRANSLATION PARAPHRASE
+- Focus on sense-for-sense paraphrasing. Explain metaphors and add cultural/contextual background if it helps the domestic audience understand the subtext.
+"""
     
     print(f"📦 Preparing {total_chunks} chunks for parallel processing...")
     
@@ -412,6 +427,7 @@ TARGET STYLE: {args.style}
 
 ### STEP 3: HUMANIZATION (De-AI)
 {humanizer_snippet}...
+{trans_mode_snippet}
 
 ### STEP 4: CONTEXT AWARENESS
 INPUT BLOCK:
@@ -479,7 +495,7 @@ OUTPUT FORMAT:
         print(f"\n🔍 Post-processing: {untranslated_count} untranslated segment(s) found. Starting retry loop...")
         final_blocks = postprocess_retry_loop(
             final_blocks, client, target_model, args.style,
-            verbalizer_snippet, humanizer_snippet, knowledge_snippet
+            verbalizer_snippet, humanizer_snippet, knowledge_snippet, trans_mode_snippet
         )
     else:
         print("\n✅ All segments translated on first pass. Skipping post-processing.", flush=True)

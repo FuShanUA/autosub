@@ -200,6 +200,10 @@ class AutoSubGUI:
         self.style_var = tk.StringVar(value=self.settings.get("style", "casual"))
         ttk.Combobox(settings_frame, textvariable=self.style_var, values=["casual", "formal", "edgy"], width=15, state="readonly").grid(row=2, column=3, sticky="w", padx=5)
 
+        tk.Label(settings_frame, text="翻译策略:").grid(row=3, column=0, sticky="w")
+        self.trans_mode_var = tk.StringVar(value=self.settings.get("trans_mode", "平衡模式 (Balanced)"))
+        ttk.Combobox(settings_frame, textvariable=self.trans_mode_var, values=["平衡模式 (Balanced)", "复述模式 (Paraphrase)"], width=15, state="readonly").grid(row=3, column=1, sticky="w", padx=5)
+
         self.model_status_label = tk.Label(settings_frame, text="", fg="red", font=("Microsoft YaHei", 8))
         self.model_status_label.grid(row=2, column=4, sticky="w")
         
@@ -388,6 +392,8 @@ class AutoSubGUI:
         cmd.extend(["--model", self.model_var.get()])
         cmd.extend(["--llm-model", self.llm_model_var.get()])
         cmd.extend(["--style", self.style_var.get()])
+        trans_val = "balanced" if "Balanced" in self.trans_mode_var.get() else "paraphrase"
+        cmd.extend(["--trans-mode", trans_val])
         
         # Advanced Layout Args
         cmd.extend(["--layout", self.layout_var.get()])
@@ -629,6 +635,7 @@ class AutoSubGUI:
         self.settings['llm_vendor'] = self.vendor_var.get()
         self.settings['llm_model'] = self.llm_model_var.get()
         self.settings['output_dir'] = self.output_dir_var.get()
+        self.settings['trans_mode'] = self.trans_mode_var.get()
         
         settings_file = os.path.join(PROJECT_ROOT, "settings.json")
         try:

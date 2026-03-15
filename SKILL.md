@@ -10,19 +10,19 @@ A fully automated "zero-click" workflow to generate professional bilingual subti
 ## Workflow
 1.  **Download**: Fetches video from URL (YouTube/X/Bilibili) using `vdown`.
 2.  **Transcribe**: Generates English SRT using `transcriber` (Whisper Large V2).
-3.  **Translate**: Translates to Chinese using Gemini Flash 1.5 with "Humanizer" style rules.
+3.  **Translate**: Translates to Chinese using AI (Gemini, ChatGPT, Kimi, Qwen, or GLM) with "Humanizer" style rules.
 4.  **Burn**: Generates `hardsub` video with professional vector-box styling (`hardsubber`).
 
 ## Usage
 
 ### GUI Mode (Recommended)
 ```powershell
-python Library\Tools\autosub\autosub_gui.py
+python d:\cc\Library\Tools\autosub\autosub_gui.py
 ```
 
 ### Command Line Mode
 ```powershell
-python Library\Tools\autosub\autosub.py <URL|FILE> [options]
+python d:\cc\Library\Tools\autosub\autosub.py <URL|FILE> [options]
 ```
 
 ### Advanced Translation Strategy (IDE Mode)
@@ -65,4 +65,5 @@ The default values for all parameters are managed via external JSON files:
 
 ## Requirements
 *   `GEMINI_API_KEY` or `GOOGLE_API_KEY` in environment (or `.env`).
-*   Core engines bundled in `Library/Tools/`.
+*   `vdown`, `transcriber`, `hardsubber` skills installed.
+
