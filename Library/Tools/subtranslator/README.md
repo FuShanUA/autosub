@@ -64,6 +64,7 @@ English subtitles often split sentences across blocks. You MUST align the Chines
 ## Screen Fit & Length Control (视觉适配)
 - **Max Width**: Chinese characters should ideally not exceed **18-20 per line**. 
 - **Split Strategy**: If a sentence is long, insert a hard line break (`\n`) to split it into two visual lines within the same timestamp block.
+- 🚫 **No Splitting English Phrases (严禁生硬切断英语)**: If a translation contains an English phrase (e.g., "Claude Code"), NEVER split the phrase across a line break (`\n`) and NEVER split it across two different subtitle blocks. Keep the full English phrase intact on the same line or in the same block.
 
 ## Domain Knowledge & ASR Correction
 ### Palantir Context

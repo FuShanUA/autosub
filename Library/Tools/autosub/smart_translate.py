@@ -391,9 +391,11 @@ def main():
     if args.trans_mode == "balanced":
         trans_mode_snippet = """
 ### STEP 3.5: TRANSLATION BALANCE (CRITICAL)
-- **Conciseness**: Prevent Chinese character count from blowing up. Keep translations sharp and direct.
-- **Metaphors & Terms**: For important protocols, technical concepts, or product metaphors (e.g., Gastown, Ralph Wiggum), reflect the original text primarily rather than over-explaining the context.
-- **Context Injection**: Do not forcefully add background explanations unless absolutely necessary. (e.g., "in financial terms" -> "金融行话是").
+### STEP 3.5: TRANSLATION BALANCE (CRITICAL CONCISENESS)
+- **Aggressive Conciseness**: The output must be as short and punchy as possible. Compress verbose English phrases into dense, telegraphic Chinese. Drop unnecessary pronouns, filler words, and conjunctions.
+- **Example Constraint**: "As Anurag said, this is our fifth DevCon in about 15 months, and momentum is palpable, I think." -> "正如 Anurag 所说，15个月内第五届 DevCon，势头非常迅猛。"
+- **Metaphors & Terms**: Do not expand or explain (e.g., keep "DevCon", do not translate to "开发者大会" if it wastes space). Keep terms like "Gastown", "Ralph Wiggum" as direct translations or original English.
+- **Context Injection**: Strictly forbidden. Do not add any explanatory background.
 """
     else:
         trans_mode_snippet = """
