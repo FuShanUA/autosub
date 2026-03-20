@@ -8,9 +8,10 @@ AutoSub is a professional, "zero-click" workflow to download, transcribe, transl
 ## ✨ Features
 - **Smart Download**: Automatically fetches videos from YouTube, Twitter, Bilibili, etc.
 - **Whisper Transcription**: Uses `faster-whisper` for high-accuracy English transcription.
-- **LLM Translation**: Context-aware translation using Gemini (Flash/Pro), Zhipu (GLM), or OpenAI, with humanized style rules.
+- **LLM Translation**: Context-aware translation using Gemini (Flash/Pro), DeepSeek, Silicon Flow, Zhipu (GLM), or OpenAI, with humanized style rules.
 - **Professional Styling**: One-click generation of hard-subbed videos with bilingual layouts and vector-box styles.
 - **Dynamic Model Discovery**: Automatically discovers the latest models from API providers.
+- **Portable Workspaces**: Supports isolated Project Root directories to keep video assets and subtitles neatly organized.
 - **GUI & CLI**: User-friendly interface or powerful command-line automation.
 
 ## 🚀 One-Click Installation (Windows)
@@ -19,9 +20,11 @@ AutoSub is a professional, "zero-click" workflow to download, transcribe, transl
 2. **Right-click** `install.ps1` and select **"Run with PowerShell"**.
    - *This script will automatically install Python 3.12, FFmpeg, and all required Python libraries.*
 3. **Configure API Key**:
-   - **Method A (Easiest)**: Run the GUI (`autosub_gui.py`), enter your key in the "API Key" field, and click **"Save Key"**. The `.env` file will be created automatically.
-   - **Method B (Manual)**: Create a `.env` file in the root directory and add:
-     - `ZHIPUAI_API_KEY=your_key` (Recommended: Free tier supported)
+   - **Method A (Easiest)**: Run the GUI (`autosub_gui.py`), enter your key in the "API Key" field, and click **"Save Key"**. The `.env` file will be created automatically in the correct relative tools directory.
+   - **Method B (Manual)**: Create a `.env` file in the `Library/Tools` directory (or `~/Documents/AutoSub` if using bundled executable) and add:
+     - `DEEPSEEK_API_KEY=your_key`
+     - `SILICONFLOW_API_KEY=your_key`
+     - `ZHIPUAI_API_KEY=your_key`
      - `GEMINI_API_KEY=your_key`
      - `OPENAI_API_KEY=your_key`
 
@@ -63,11 +66,11 @@ If you get errors like `Sign in to confirm you are not a bot` or `Video unavaila
 ### 3. Hard-burn Failure
 - Ensure **FFmpeg** is installed and in your PATH. If you used `install.ps1`, this should be handled automatically.
 
-### 3. AI Agent Mode (IDE / Workspace)
+### 4. AI Agent Mode (IDE / Workspace)
 If you are using an AI Agent (like Antigravity or CC), you can simply type:
 > `/autosub`
 
-The agent will read the workflow in `.agent/workflows/autosub.md` and guide you through the process.
+The agent will read the workflow in `.agents/workflows/autosub.md` and guide you through the process.
 
 ## 🛠️ Project Structure
 - `.agent/workflows/`: Contains the workflow definition for AI Agents.
