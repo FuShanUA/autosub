@@ -21,7 +21,10 @@ def get_env_path():
         potential = os.path.join(curr, ".env")
         if os.path.exists(potential): return potential
         curr = os.path.dirname(curr)
-    return os.path.join(os.getcwd(), ".env")
+        
+    # Default to the parent directory of this script's folder (e.g. Library/Tools)
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_dir, ".env")
 
 ENV_PATH = get_env_path()
 
@@ -76,6 +79,30 @@ class LLMClient:
             LLMProvider.SILICONFLOW: os.environ.get("SILICONFLOW_API_KEY"),
         }
         
+        # Read .env sequentially to establish cascade order
+        self.ordered_configs = []
+        if os.path.exists(ENV_PATH):
+            with open(ENV_PATH, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'): continue
+                    if '=' in line:
+                        key, val = line.split('=', 1)
+                        key = key.strip()
+                        val = val.strip().strip("'").strip('"')
+                        if not val: continue 
+                        
+                        prov, mod = None, None
+                        if key in ["GEMINI_API_KEY", "GOOGLE_API_KEY"]: prov, mod = LLMProvider.GEMINI, "gemini-3.1-pro-preview"
+                        elif key == "OPENAI_API_KEY": prov, mod = LLMProvider.OPENAI, "gpt-4o"
+                        elif key == "MOONSHOT_API_KEY": prov, mod = LLMProvider.MOONSHOT, "moonshot-v1-8k"
+                        elif key == "DASHSCOPE_API_KEY": prov, mod = LLMProvider.DASHSCOPE, "qwen-max"
+                        elif key in ["ZHIPUAI_API_KEY", "ZHIPU_API_KEY"]: prov, mod = LLMProvider.ZHIPU, "glm-4"
+                        elif key == "DEEPSEEK_API_KEY": prov, mod = LLMProvider.DEEPSEEK, "deepseek-chat"
+                        elif key == "SILICONFLOW_API_KEY": prov, mod = LLMProvider.SILICONFLOW, "deepseek-ai/DeepSeek-V3"
+                        
+                        if prov: self.ordered_configs.append((prov, val, mod))
+
         # Default tier settings
         tier_str = os.environ.get("LLM_TIER", "tier1").lower()
         if tier_str == "free":
@@ -117,7 +144,7 @@ class LLMClient:
         
         self.limiter.wait()
         try:
-            response = requests.post(f"{base_url}/chat/completions", headers=headers, json=data, timeout=60)
+            response = requests.post(f"{base_url}/chat/completions", headers=headers, json=data, timeout=300)
             response.raise_for_status()
             res_json = response.json()
             return res_json['choices'][0]['message']['content'].strip()
@@ -125,17 +152,15 @@ class LLMClient:
             print(f"❌ OpenAI-compatible API error ({model_name}): {e}")
             return None
 
-    def _call_gemini(self, model_name: str, prompt: str) -> Optional[str]:
-        api_key = self.api_keys[LLMProvider.GEMINI]
+    def _call_gemini(self, model_name: str, prompt: str, api_key: str) -> Optional[str]:
         if not api_key:
             print("❌ Error: Gemini API Key not found.")
             return None
             
         try:
             import google.generativeai as genai
-            if not self._gemini_configured:
-                genai.configure(api_key=api_key)
-                self._gemini_configured = True
+            genai.configure(api_key=api_key) # Reconfigure to support switching keys during cascade
+            self._gemini_configured = True
             
             model = genai.GenerativeModel(model_name)
             self.limiter.wait()
@@ -145,38 +170,69 @@ class LLMClient:
             return None
         except Exception as e:
             print(f"❌ Gemini API error: {e}")
-            return None
+            # Raise exception to allow cascade catching
+            raise Exception(f"Gemini API Error: {e}")
 
-    def generate_content(self, prompt: str, model_name: str = "gemini-1.5-flash", fallback: bool = True) -> Optional[str]:
-        provider = self._get_provider(model_name)
-        
+    def _execute_provider_call(self, provider: LLMProvider, model_name: str, prompt: str, api_key: str) -> Optional[str]:
         if provider == LLMProvider.GEMINI:
-            return self._call_gemini(model_name, prompt)
-        
+            return self._call_gemini(model_name, prompt, api_key)
         elif provider == LLMProvider.OPENAI:
             base_url = os.environ.get("OPENAI_API_BASE") or "https://api.openai.com/v1"
-            # Ensure no double /v1
             if base_url.endswith("/v1/"): base_url = base_url[:-1]
-            return self._call_openai_compatible(model_name, prompt, base_url, self.api_keys[LLMProvider.OPENAI])
-            
+            return self._call_openai_compatible(model_name, prompt, base_url, api_key)
         elif provider == LLMProvider.MOONSHOT:
-            return self._call_openai_compatible(model_name, prompt, "https://api.moonshot.cn/v1", self.api_keys[LLMProvider.MOONSHOT])
-            
+            return self._call_openai_compatible(model_name, prompt, "https://api.moonshot.cn/v1", api_key)
         elif provider == LLMProvider.DASHSCOPE:
-            return self._call_openai_compatible(model_name, prompt, "https://dashscope.aliyuncs.com/compatible-mode/v1", self.api_keys[LLMProvider.DASHSCOPE])
-            
+            return self._call_openai_compatible(model_name, prompt, "https://dashscope.aliyuncs.com/compatible-mode/v1", api_key)
         elif provider == LLMProvider.ZHIPU:
-            return self._call_openai_compatible(model_name, prompt, "https://open.bigmodel.cn/api/paas/v4", self.api_keys[LLMProvider.ZHIPU])
-            
+            return self._call_openai_compatible(model_name, prompt, "https://open.bigmodel.cn/api/paas/v4", api_key)
         elif provider == LLMProvider.DEEPSEEK:
-            return self._call_openai_compatible(model_name, prompt, "https://api.deepseek.com", self.api_keys[LLMProvider.DEEPSEEK])
-            
+            return self._call_openai_compatible(model_name, prompt, "https://api.deepseek.com", api_key)
         elif provider == LLMProvider.SILICONFLOW:
-            return self._call_openai_compatible(model_name, prompt, "https://api.siliconflow.cn/v1", self.api_keys[LLMProvider.SILICONFLOW])
-            
+            return self._call_openai_compatible(model_name, prompt, "https://api.siliconflow.cn/v1", api_key)
         return None
 
-    def generate_batch(self, tasks: List[Dict], model_name: str = "gemini-1.5-flash") -> List[Dict]:
+    def generate_content(self, prompt: str, model_name: Optional[str] = None, fallback: bool = True) -> Optional[str]:
+        targets = []
+        
+        # If user hardcoded a specific model, try it first
+        if model_name:
+            prov = self._get_provider(model_name)
+            key = self.api_keys.get(prov)
+            if key: targets.append((prov, key, model_name))
+            
+        # Add the ordered fallbacks from .env
+        if fallback:
+            for prov, key, mod in self.ordered_configs:
+                # Avoid duplicating the first explicit try (if same provider)
+                if not model_name or prov != self._get_provider(model_name):
+                    targets.append((prov, key, mod))
+                    
+        # If .env parsing yielded nothing, fallback to available keys
+        if not targets:
+            for prov, key in self.api_keys.items():
+                if key: 
+                    # Guess a model 
+                    guess = "gemini-3.1-pro-preview" if prov == LLMProvider.GEMINI else "gpt-4o"
+                    targets.append((prov, key, guess))
+
+        errors = []
+        for provider, api_key, m_name in targets:
+            print(f"🔄 Executing LLM Call -> Provider: {provider.value}, Model: {m_name}")
+            try:
+                result = self._execute_provider_call(provider, m_name, prompt, api_key)
+                if result: 
+                    return result
+                else:
+                    errors.append(f"{provider.value}: Returned empty or controlled failure.")
+            except Exception as e:
+                print(f"⚠️ Cascade Fallback Triggered. {provider.value} failed: {e}")
+                errors.append(f"{provider.value}: {str(e)}")
+                continue
+                
+        raise Exception(f"❌ All LLM API fallbacks exhausted. Errors: {errors}")
+
+    def generate_batch(self, tasks: List[Dict], model_name: str = "gemini-3.1-pro-preview") -> List[Dict]:
         results = []
         total = len(tasks)
         print(f"🚀 Starting batch generation for {total} items (Workers: {self.max_workers}, Model: {model_name})...")
@@ -296,6 +352,12 @@ class LLMClient:
                 for m in genai.list_models():
                     if 'generateContent' in m.supported_generation_methods:
                         models.append(m.name.replace("models/", ""))
+                
+                # Ensure experimental models are forcibly available
+                for exp_model in ["gemini-3.1-pro-preview", "gemini-3.1-flash-preview", "gemini-3-flash-preview", "gemini-3-pro-preview"]:
+                    if exp_model not in models:
+                        models.append(exp_model)
+                        
                 return sorted(models)
             except: return []
             

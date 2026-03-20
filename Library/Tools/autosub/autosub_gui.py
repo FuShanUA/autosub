@@ -65,7 +65,9 @@ else:
         PROJECT_ROOT = os.path.dirname(tmp_root)
     else:
         PROJECT_ROOT = tmp_root
-    ENV_PATH = os.path.join(PROJECT_ROOT, ".env")
+        
+    # Evaluate ENV_PATH relative to parent directory (e.g. Library/Tools)
+    ENV_PATH = os.path.join(TOOLS_DIR, ".env")
 
 AUTOSUB_SCRIPT = os.path.join(CURRENT_DIR, "autosub.py")
 sys.path.append(os.path.join(CURRENT_DIR, "..", "common"))
@@ -81,7 +83,7 @@ class AutoSubGUI:
         self.root.title("AutoSub - 自动视频字幕生成工具 (Pro)")
         
         # Set Window Icon
-        icon_path = os.path.join(CURRENT_DIR, "autosub.ico")
+        icon_path = os.path.join(CURRENT_DIR, "autosub_v9.ico")
         if os.path.exists(icon_path):
             try:
                 self.root.iconbitmap(icon_path)
@@ -116,8 +118,8 @@ class AutoSubGUI:
             except Exception: pass
 
         # 2. Load user settings (overrides)
-        # Check Project Root (Documents/AutoSub) first, then App Root
-        settings_locations = [os.path.join(PROJECT_ROOT, "settings.json")]
+        # Check relative parent dir (TOOLS_DIR) first, then App Root
+        settings_locations = [os.path.join(TOOLS_DIR, "settings.json"), os.path.join(PROJECT_ROOT, "settings.json")]
         if getattr(sys, 'frozen', False):
             settings_locations.append(os.path.join(os.path.dirname(sys.executable), "settings.json"))
 
@@ -513,7 +515,8 @@ class AutoSubGUI:
             elif current_vendor == saved_vendor and saved_model in models:
                 self.llm_model_var.set(saved_model)
             else:
-                if "gemini-1.5-flash" in models: self.llm_model_var.set("gemini-1.5-flash")
+                if "gemini-3.1-pro-preview" in models: self.llm_model_var.set("gemini-3.1-pro-preview")
+                elif "gemini-1.5-flash" in models: self.llm_model_var.set("gemini-1.5-flash")
                 elif "gpt-4o-mini" in models: self.llm_model_var.set("gpt-4o-mini")
                 elif "glm-4-flash" in models: self.llm_model_var.set("glm-4-flash")
                 elif "moonshot-v1-8k" in models: self.llm_model_var.set("moonshot-v1-8k")
@@ -637,7 +640,8 @@ class AutoSubGUI:
         self.settings['output_dir'] = self.output_dir_var.get()
         self.settings['trans_mode'] = self.trans_mode_var.get()
         
-        settings_file = os.path.join(PROJECT_ROOT, "settings.json")
+        settings_file = os.path.join(TOOLS_DIR, "settings.json")
+                
         try:
             with open(settings_file, "w", encoding="utf-8") as f:
                 json.dump(self.settings, f, indent=4, ensure_ascii=False)
