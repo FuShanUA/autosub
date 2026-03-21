@@ -15,3 +15,6 @@ ffmpeg.exe
 ffprobe.exe
 node.exe
 Library/Tools/transcriber/models/
+build/
+dist/
+*.spec
