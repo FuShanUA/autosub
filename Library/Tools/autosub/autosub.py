@@ -63,7 +63,7 @@ if getattr(sys, 'frozen', False):
     TOOLS_DIR = os.path.join(BUNDLE_DIR, "Library", "Tools")
     USER_DATA_DIR = os.path.join(os.path.expanduser("~"), "Documents", "AutoSub")
     PROJECT_ROOT = USER_DATA_DIR
-    BASE_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "Projects")
+    BASE_OUTPUT_DIR = os.path.join(os.path.dirname(PROJECT_ROOT), "Projects")
     env_path = os.path.join(PROJECT_ROOT, ".env")
     
     # In bundled mode, common is in BUNDLE_DIR/Library/Tools/common
@@ -80,7 +80,7 @@ else:
     else:
         PROJECT_ROOT = tmp_root
         
-    BASE_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "Projects")
+    BASE_OUTPUT_DIR = os.path.join(os.path.dirname(PROJECT_ROOT), "Projects")
     env_path = os.path.join(PROJECT_ROOT, ".env")
     
     # In dev mode, common is in d:\cc\Library\Tools\common

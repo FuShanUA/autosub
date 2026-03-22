@@ -70,7 +70,13 @@ $requirements = @(
     "faster-whisper",
     "google-generativeai",
     "python-dotenv",
-    "requests"
+    "requests",
+    "google-api-python-client",
+    "google-auth-httplib2",
+    "google-auth-oauthlib",
+    "tqdm",
+    "playwright",
+    "Pillow"
 )
 
 foreach ($req in $requirements) {

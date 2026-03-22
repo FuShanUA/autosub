@@ -14,6 +14,12 @@ AutoSub is a professional, "zero-click" workflow to download, transcribe, transl
 - **Portable Workspaces**: Supports isolated Project Root directories to keep video assets and subtitles neatly organized.
 - **GUI & CLI**: User-friendly interface or powerful command-line automation.
 
+## 🆕 What's New in v9.1
+- **Robust Installation**: Missing dependencies (`google-api-python-client`, `tqdm`, `playwright`, `Pillow`) are now automatically handled by `install.ps1`.
+- **Environment Isolation**: `.env` and `Projects` folders are now cleanly instantiated relative to the true installation root to keep your workspace parallel and clean.
+- **Dynamic Python Binding**: Hardcoded `yt-dlp` python paths were removed in favor of dynamic executable resolution.
+- **UI Improvements**: Fixed the taskbar application icon rendering natively onto the Windows OS.
+
 ## 🚀 One-Click Installation (Windows)
 
 1. **Clone or Download** this repository to your computer.

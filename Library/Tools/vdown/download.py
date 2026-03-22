@@ -9,12 +9,14 @@ from pathlib import Path
 # --- Configuration ---
 # Find working executables
 PYTHON_EXE = sys.executable
-# Target specifically the one we verified
-YTDLP_EXE = r"C:\Program Files\Python\Python312\Scripts\yt-dlp.exe"
-if not os.path.exists(YTDLP_EXE):
-    # Fallback search
-    import shutil
-    YTDLP_EXE = shutil.which("yt-dlp") or "yt-dlp"
+# target specifically the one we verified
+import shutil
+YTDLP_EXE = shutil.which("yt-dlp")
+if not YTDLP_EXE:
+    # Fallback to current Python Scripts directory
+    YTDLP_EXE = os.path.join(os.path.dirname(sys.executable), "Scripts", "yt-dlp.exe")
+    if not os.path.exists(YTDLP_EXE):
+        YTDLP_EXE = "yt-dlp"
 
 NODE_EXE = "node"
 possible_node_paths = [
