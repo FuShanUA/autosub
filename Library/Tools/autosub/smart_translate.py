@@ -513,9 +513,19 @@ OUTPUT FORMAT:
     else:
         output_path = input_path.replace(".srt", ".cn.srt")
 
-    if os.path.exists(output_path):
-        base, ext = os.path.splitext(output_path)
-        output_path = f"{base}_smart{ext}"
+    def get_versioned_filename(filepath):
+        if not os.path.exists(filepath): return filepath
+        base, ext = os.path.splitext(filepath)
+        match = re.search(r'_v(\d+)$', base)
+        if match:
+            version = int(match.group(1)); base = base[:match.start()]
+        else: version = 0
+        while True:
+            version += 1
+            new_path = f"{base}_v{version}{ext}"
+            if not os.path.exists(new_path): return new_path
+
+    output_path = get_versioned_filename(output_path)
 
     srt_utils.write_srt(final_blocks, output_path)
     print(f"✅ Translation Saved to: {output_path}", flush=True)

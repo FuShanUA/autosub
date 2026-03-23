@@ -17,8 +17,9 @@ These specific strings will be replaced globally by the post-processing script.
 | Cloud Family to Claude Family | `(?i)\bCloud\b(?=\s*(Family\|Model))` | `Claude` | "Cloud Family" -> "Claude Family" |
 | Fix Antrophic Typo | `(?i)Antrophic` | `Anthropic` | Fix typo |
 | Fix Gemini Flash Casing | `(?i)Gemini\s*Flash` | `Gemini Flash` | Ensure consistent casing |
-| FDE Full Name | `(?i)Forward[\s-]Deployed\s+Engineer(ing\|s)?` | `前线部署工程师` | Consistent term |
-| FDE Acronym | `\bFDE\b` | `前线部署工程师` | Expand acronym |
+| FDE Full Name | `(?i)Forward[\s-]*Deployed\s*Engineer(ing\|s)?` | `前置部署工程` | Consistent term |
+| FDE Acronym | `\bFDE\b` | `前置部署工程` | Expand acronym |
+| Vibe Coding | `(?i)(?:vibe\s-?coding|凭感觉写代码)` | `vibe coding` | Preserve specific term without translation |
 | OpenClaw Fix | `(?i)Open\s*(Clause\|Cloud\|Claw)s?` | `OpenClaw` | Fix ASR error for OpenClaw |
 
 ## 2. Text Cleanup (Regex)
@@ -40,7 +41,6 @@ These regex patterns will be executed in order by the post-processing script.
 | Comma Normalization | `,` | `，` | Convert English comma to Chinese |
 | Colon Normalization | `:` | `：` | Convert English colon to Chinese |
 | Semicolon Normalization | `;` | `；` | Convert English semicolon to Chinese |
-| Fix 不是...而是 | `不是([^，。,！？]+)而是` | `并非\1，而是` | Avoid translationese structure |
 
 ## 3. Absolute Bans (Hardcoded AI Clichés)
 

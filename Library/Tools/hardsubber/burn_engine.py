@@ -339,8 +339,12 @@ class BurnProgressApp:
         except Exception as e:
             self.update_status(f"Launch Error: {e}", "red")
             if hasattr(self, 'temp_ass_path') and os.path.exists(self.temp_ass_path):
-                try: os.remove(self.temp_ass_path)
-                except: pass
+                for _ in range(5):
+                    try:
+                        os.remove(self.temp_ass_path)
+                        break
+                    except Exception:
+                        time.sleep(0.5)
             return
 
         time_pattern = re.compile(r"time=(\d{2}:\d{2}:\d{2}\.\d{2})")
@@ -389,10 +393,12 @@ class BurnProgressApp:
         self.is_running = False
 
         if hasattr(self, 'temp_ass_path') and os.path.exists(self.temp_ass_path):
-            try:
-                os.remove(self.temp_ass_path)
-            except:
-                pass
+            for _ in range(5):
+                try:
+                    os.remove(self.temp_ass_path)
+                    break
+                except Exception:
+                    time.sleep(0.5)
 
         if ret_code == 0:
             self.finished = True

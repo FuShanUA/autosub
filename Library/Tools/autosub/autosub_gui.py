@@ -66,8 +66,8 @@ else:
     else:
         PROJECT_ROOT = tmp_root
         
-    # Evaluate ENV_PATH relative to parent directory
-    ENV_PATH = os.path.join(PROJECT_ROOT, ".env")
+    # Evaluate ENV_PATH relative to parent directory (e.g. Library/Tools)
+    ENV_PATH = os.path.join(TOOLS_DIR, ".env")
 
 AUTOSUB_SCRIPT = os.path.join(CURRENT_DIR, "autosub.py")
 sys.path.append(os.path.join(CURRENT_DIR, "..", "common"))
@@ -87,6 +87,9 @@ class AutoSubGUI:
         if os.path.exists(icon_path):
             try:
                 self.root.iconbitmap(icon_path)
+                # Fix for Taskbar icon in Windows
+                myappid = 'mycompany.myproduct.subproduct.version' # arbitrary string
+                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
             except Exception as e:
                 print(f"Warning: Could not set icon: {e}")
         self.root.geometry("650x650")
@@ -686,13 +689,6 @@ class AutoSubGUI:
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
-    # Fix for Taskbar icon in Windows BEFORE Tk()
-    try:
-        import ctypes
-        myappid = 'mycompany.myproduct.subproduct.version' # arbitrary string
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
-    except Exception:
-        pass
     root = tk.Tk()
     app = AutoSubGUI(root)
     root.mainloop()

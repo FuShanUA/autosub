@@ -63,7 +63,7 @@ if getattr(sys, 'frozen', False):
     TOOLS_DIR = os.path.join(BUNDLE_DIR, "Library", "Tools")
     USER_DATA_DIR = os.path.join(os.path.expanduser("~"), "Documents", "AutoSub")
     PROJECT_ROOT = USER_DATA_DIR
-    BASE_OUTPUT_DIR = os.path.join(os.path.dirname(PROJECT_ROOT), "Projects")
+    BASE_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "Projects")
     env_path = os.path.join(PROJECT_ROOT, ".env")
     
     # In bundled mode, common is in BUNDLE_DIR/Library/Tools/common
@@ -80,7 +80,7 @@ else:
     else:
         PROJECT_ROOT = tmp_root
         
-    BASE_OUTPUT_DIR = os.path.join(os.path.dirname(PROJECT_ROOT), "Projects")
+    BASE_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "Projects")
     env_path = os.path.join(PROJECT_ROOT, ".env")
     
     # In dev mode, common is in d:\cc\Library\Tools\common
@@ -369,7 +369,14 @@ def get_video_dimensions(path):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("input")
+    parser.add_argument("input", nargs="?", default="", help="Input video URL or local file")
+    
+    # Batch mode arguments
+    parser.add_argument("--batch-urls", nargs="+", help="Multiple URLs or path to a .txt/.md file containing URLs")
+    parser.add_argument("--batch-dir", help="Directory containing multiple video project folders to process automatically")
+    parser.add_argument("--workers", type=int, default=5, help="Number of concurrent workers max 10")
+    parser.add_argument("--max-api-calls", type=int, default=20, help="Global concurrency limit for Translation APIs")
+
     parser.add_argument("--model", default="large-v3-turbo")
     parser.add_argument("--llm-model", default="gemini-3-flash-preview", help="LLM Model (gemini-3-flash-preview, gemini-3-pro-preview, gpt-4o, etc.)")
     parser.add_argument("--style", default="casual")
@@ -386,6 +393,14 @@ def main():
     parser.add_argument("--no-bg-box", action="store_true")
     parser.add_argument("--output-dir", help="Project root directory for output files")
     args = parser.parse_args()
+
+    # Determine if we should run batch mode
+    if args.batch_urls or args.batch_dir:
+        import autosub_batch
+        return autosub_batch.run_batch(args)
+        
+    if not args.input:
+        return parser.print_help()
 
     # --- Directory Logic ---
     final_output_dir = args.output_dir or DEFAULTS.get("output_dir") or BASE_OUTPUT_DIR
