@@ -6,14 +6,7 @@ import time
 import ctypes
 import re
 import subprocess
-try:
-    from faster_whisper import WhisperModel
-except ImportError:
-    # Attempt to force reload site packages if we are in a transitionary environment state
-    import site
-    from importlib import reload
-    reload(site)
-    from faster_whisper import WhisperModel
+from faster_whisper import WhisperModel
 import io
 
 # Force UTF-8 for stdout/stderr to handle emojis in logs on Windows
@@ -49,8 +42,7 @@ if getattr(sys, 'frozen', False):
         LOCAL_MODELS = os.path.join(BUNDLE_DIR, "Library", "Tools", "transcriber", "models")
 else:
     # Development/Raw script logic
-    # USER REQUEST: Ensure files save under 'd:\cc\Projects' instead of a local 'results' or 'project' folder
-    RESULT_ROOT = r"d:\cc\Projects"
+    RESULT_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
     LOCAL_MODELS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
     DOCS_MODELS = None # Disable Documents fallback in dev mode
 
@@ -499,8 +491,8 @@ def main():
                 
                 if duration > 0:
                     p = int((s.end / duration) * 100)
-                    if p > last_p and p >= 0:
-                        print(f"Progress: {p}% ({s.end:.0f}/{duration:.0f}s)", flush=True)
+                    if p > last_p and p % 5 == 0:
+                        print(f"   Progress: {p}% ({s.end:.0f}/{duration:.0f}s)")
                         last_p = p
 
             # Final safety check if video is extremely short
@@ -526,7 +518,7 @@ def main():
                         milliseconds = int((t - int(t)) * 1000)
                         return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
                     
-                    # print(f"[{fmt(start)} --> {fmt(end)}] {text}")  # REMOVED per user request to clean up progress area
+                    print(f"[{fmt(start)} --> {fmt(end)}] {text}")
                     f.write(f"{segment.id}\n{fmt(start)} --> {fmt(end)}\n{text}\n\n")
                     
                     # Update Progress

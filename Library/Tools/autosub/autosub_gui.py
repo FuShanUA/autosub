@@ -65,9 +65,7 @@ else:
         PROJECT_ROOT = os.path.dirname(tmp_root)
     else:
         PROJECT_ROOT = tmp_root
-        
-    # Evaluate ENV_PATH relative to parent directory (e.g. Library/Tools)
-    ENV_PATH = os.path.join(TOOLS_DIR, ".env")
+    ENV_PATH = os.path.join(PROJECT_ROOT, ".env")
 
 AUTOSUB_SCRIPT = os.path.join(CURRENT_DIR, "autosub.py")
 sys.path.append(os.path.join(CURRENT_DIR, "..", "common"))
@@ -83,7 +81,7 @@ class AutoSubGUI:
         self.root.title("AutoSub - 自动视频字幕生成工具 (Pro)")
         
         # Set Window Icon
-        icon_path = os.path.join(CURRENT_DIR, "autosub_v9.ico")
+        icon_path = os.path.join(CURRENT_DIR, "autosub.ico")
         if os.path.exists(icon_path):
             try:
                 self.root.iconbitmap(icon_path)
@@ -118,8 +116,8 @@ class AutoSubGUI:
             except Exception: pass
 
         # 2. Load user settings (overrides)
-        # Check relative parent dir (TOOLS_DIR) first, then App Root
-        settings_locations = [os.path.join(TOOLS_DIR, "settings.json"), os.path.join(PROJECT_ROOT, "settings.json")]
+        # Check Project Root (Documents/AutoSub) first, then App Root
+        settings_locations = [os.path.join(PROJECT_ROOT, "settings.json")]
         if getattr(sys, 'frozen', False):
             settings_locations.append(os.path.join(os.path.dirname(sys.executable), "settings.json"))
 
@@ -145,11 +143,6 @@ class AutoSubGUI:
         ttk.Entry(input_frame, textvariable=self.cookies_var, width=50).grid(row=1, column=1, padx=5, pady=2)
         ttk.Button(input_frame, text="选择...", command=self.browse_cookies).grid(row=1, column=2)
 
-        tk.Label(input_frame, text="项目根目录:").grid(row=2, column=0, sticky="w")
-        self.output_dir_var = tk.StringVar(value=self.settings.get("output_dir", ""))
-        ttk.Entry(input_frame, textvariable=self.output_dir_var, width=50).grid(row=2, column=1, padx=5, pady=2)
-        ttk.Button(input_frame, text="选择...", command=self.browse_output_dir).grid(row=2, column=2)
-
         # --- Settings Section ---
         settings_frame = ttk.LabelFrame(root, text="基础设置 (Basic Settings)", padding=10)
         settings_frame.pack(fill="x", padx=10, pady=5)
@@ -161,9 +154,7 @@ class AutoSubGUI:
             "OpenAI (ChatGPT)": "openai",
             "Moonshot (Kimi)": "moonshot",
             "Alibaba (Qwen)": "dashscope",
-            "Zhipu (GLM)": "zhipu",
-            "DeepSeek": "deepseek",
-            "Silicon Flow (硅基流动)": "siliconflow"
+            "Zhipu (GLM)": "zhipu"
         }
         vendor_default = self.settings.get("llm_vendor", "Google Gemini")
         self.vendor_var = tk.StringVar(value=vendor_default)
@@ -201,10 +192,6 @@ class AutoSubGUI:
         tk.Label(settings_frame, text="内容语气:").grid(row=2, column=2, sticky="w", padx=10)
         self.style_var = tk.StringVar(value=self.settings.get("style", "casual"))
         ttk.Combobox(settings_frame, textvariable=self.style_var, values=["casual", "formal", "edgy"], width=15, state="readonly").grid(row=2, column=3, sticky="w", padx=5)
-
-        tk.Label(settings_frame, text="翻译策略:").grid(row=3, column=0, sticky="w")
-        self.trans_mode_var = tk.StringVar(value=self.settings.get("trans_mode", "平衡模式 (Balanced)"))
-        ttk.Combobox(settings_frame, textvariable=self.trans_mode_var, values=["平衡模式 (Balanced)", "复述模式 (Paraphrase)"], width=15, state="readonly").grid(row=3, column=1, sticky="w", padx=5)
 
         self.model_status_label = tk.Label(settings_frame, text="", fg="red", font=("Microsoft YaHei", 8))
         self.model_status_label.grid(row=2, column=4, sticky="w")
@@ -336,10 +323,6 @@ class AutoSubGUI:
         filename = filedialog.askopenfilename(filetypes=[("Txt", "*.txt")])
         if filename: self.cookies_var.set(filename)
 
-    def browse_output_dir(self):
-        dirname = filedialog.askdirectory()
-        if dirname: self.output_dir_var.set(dirname)
-
     def log_clear(self):
         self.log_text.config(state="normal")
         self.log_text.delete(1.0, "end")
@@ -394,8 +377,6 @@ class AutoSubGUI:
         cmd.extend(["--model", self.model_var.get()])
         cmd.extend(["--llm-model", self.llm_model_var.get()])
         cmd.extend(["--style", self.style_var.get()])
-        trans_val = "balanced" if "Balanced" in self.trans_mode_var.get() else "paraphrase"
-        cmd.extend(["--trans-mode", trans_val])
         
         # Advanced Layout Args
         cmd.extend(["--layout", self.layout_var.get()])
@@ -418,9 +399,6 @@ class AutoSubGUI:
         if self.cookies_var.get():
             cmd.extend(["--cookies", self.cookies_var.get()])
             
-        if self.output_dir_var.get():
-            cmd.extend(["--output-dir", self.output_dir_var.get()])
-            
         threading.Thread(target=self.run_subprocess, args=(cmd,), daemon=True).start()
 
     def run_subprocess(self, cmd):
@@ -431,7 +409,7 @@ class AutoSubGUI:
             env["PYTHONUNBUFFERED"] = "1"
             
             # Store process ref for killing
-            self.current_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', env=env, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+            self.current_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', env=env)
             process = self.current_process
             
             for line in process.stdout:
@@ -464,9 +442,7 @@ class AutoSubGUI:
             "openai": "OPENAI_API_KEY",
             "moonshot": "MOONSHOT_API_KEY",
             "dashscope": "DASHSCOPE_API_KEY",
-            "zhipu": "ZHIPUAI_API_KEY",
-            "deepseek": "DEEPSEEK_API_KEY",
-            "siliconflow": "SILICONFLOW_API_KEY"
+            "zhipu": "ZHIPUAI_API_KEY"
         }
         env_key = env_map[vendor_id]
         
@@ -515,13 +491,10 @@ class AutoSubGUI:
             elif current_vendor == saved_vendor and saved_model in models:
                 self.llm_model_var.set(saved_model)
             else:
-                if "gemini-3.1-pro-preview" in models: self.llm_model_var.set("gemini-3.1-pro-preview")
-                elif "gemini-1.5-flash" in models: self.llm_model_var.set("gemini-1.5-flash")
+                if "gemini-1.5-flash" in models: self.llm_model_var.set("gemini-1.5-flash")
                 elif "gpt-4o-mini" in models: self.llm_model_var.set("gpt-4o-mini")
                 elif "glm-4-flash" in models: self.llm_model_var.set("glm-4-flash")
                 elif "moonshot-v1-8k" in models: self.llm_model_var.set("moonshot-v1-8k")
-                elif "deepseek-chat" in models: self.llm_model_var.set("deepseek-chat")
-                elif "deepseek-ai/DeepSeek-V3" in models: self.llm_model_var.set("deepseek-ai/DeepSeek-V3")
                 elif models: self.llm_model_var.set(models[0])
                 
             self.model_status_label.config(text="")
@@ -540,9 +513,7 @@ class AutoSubGUI:
             "openai": "OPENAI_API_KEY",
             "moonshot": "MOONSHOT_API_KEY",
             "dashscope": "DASHSCOPE_API_KEY",
-            "zhipu": "ZHIPUAI_API_KEY",
-            "deepseek": "DEEPSEEK_API_KEY",
-            "siliconflow": "SILICONFLOW_API_KEY"
+            "zhipu": "ZHIPUAI_API_KEY"
         }
         env_key = env_map[vendor_id]
         
@@ -551,7 +522,7 @@ class AutoSubGUI:
     def open_keys_dialog(self):
         dialog = tk.Toplevel(self.root)
         dialog.title("API 密钥配置 (LLM Keys)")
-        dialog.geometry("450x400")
+        dialog.geometry("450x300")
         dialog.resizable(False, False)
         dialog.transient(self.root)
         dialog.grab_set()
@@ -563,8 +534,6 @@ class AutoSubGUI:
             "MOONSHOT_API_KEY": tk.StringVar(value=os.environ.get("MOONSHOT_API_KEY", "")),
             "DASHSCOPE_API_KEY": tk.StringVar(value=os.environ.get("DASHSCOPE_API_KEY", "")),
             "ZHIPUAI_API_KEY": tk.StringVar(value=os.environ.get("ZHIPUAI_API_KEY", "")),
-            "DEEPSEEK_API_KEY": tk.StringVar(value=os.environ.get("DEEPSEEK_API_KEY", "")),
-            "SILICONFLOW_API_KEY": tk.StringVar(value=os.environ.get("SILICONFLOW_API_KEY", "")),
         }
 
         labels = [
@@ -573,8 +542,6 @@ class AutoSubGUI:
             ("Moonshot (Kimi):", "MOONSHOT_API_KEY"),
             ("DashScope (Qwen):", "DASHSCOPE_API_KEY"),
             ("Zhipu (GLM):", "ZHIPUAI_API_KEY"),
-            ("DeepSeek Key:", "DEEPSEEK_API_KEY"),
-            ("Silicon Flow:", "SILICONFLOW_API_KEY"),
         ]
 
         for i, (label_text, key_name) in enumerate(labels):
@@ -637,11 +604,8 @@ class AutoSubGUI:
         """Saves current vendor and model to settings.json."""
         self.settings['llm_vendor'] = self.vendor_var.get()
         self.settings['llm_model'] = self.llm_model_var.get()
-        self.settings['output_dir'] = self.output_dir_var.get()
-        self.settings['trans_mode'] = self.trans_mode_var.get()
         
-        settings_file = os.path.join(TOOLS_DIR, "settings.json")
-                
+        settings_file = os.path.join(PROJECT_ROOT, "settings.json")
         try:
             with open(settings_file, "w", encoding="utf-8") as f:
                 json.dump(self.settings, f, indent=4, ensure_ascii=False)

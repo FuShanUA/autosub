@@ -2,7 +2,7 @@
 # Verbalizer Skill (Persona Focus)
 
 本技能的职责不是基础翻译，而是**风格迁移 (Style Transfer)**。
-它接收已经准确但可能平淡的中文字幕或文字，根据设定的**角色 (Role)** 和 **调性 (Tone)** 进行深度重写。没有设定角色和调性时，默认使用[学术/严谨] (Academic/Formal) 风格。
+它接收已经准确但可能平淡的中文字幕，根据设定的**角色 (Role)** 和 **调性 (Tone)** 进行深度重写。
 
 ## 核心理念 (Core Philosophy)
 - **Subtranslator 负责"信"**: 确保意思准确，没有语法错误，去除基础翻译腔。

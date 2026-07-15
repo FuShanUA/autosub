@@ -18,3 +18,5 @@ Library/Tools/transcriber/models/
 build/
 dist/
 *.spec
+yt-dlp.exe
+*.exe

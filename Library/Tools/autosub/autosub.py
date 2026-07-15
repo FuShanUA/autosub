@@ -171,17 +171,17 @@ if os.path.exists(env_path):
                     if k and v: os.environ[k] = v.strip('"\'')
     except: pass
 
-def get_workdir(input_val, base_output_dir):
+def get_workdir(input_val):
     if input_val.startswith("http"):
-        return os.path.join(base_output_dir, "temp_" + str(int(time.time())))
+        return os.path.join(BASE_OUTPUT_DIR, "temp_" + str(int(time.time())))
     else:
         abs_path = os.path.abspath(input_val)
         try:
-            base = os.path.normpath(base_output_dir).lower()
+            base = os.path.normpath(BASE_OUTPUT_DIR).lower()
             current = os.path.normpath(abs_path).lower()
             if current.startswith(base): return os.path.dirname(abs_path)
         except: pass
-        return os.path.join(base_output_dir, os.path.splitext(os.path.basename(input_val))[0])
+        return os.path.join(BASE_OUTPUT_DIR, os.path.splitext(os.path.basename(input_val))[0])
 
 def get_video_title(url, cookies=None):
     """Fetches video title using download.py --get-title."""
@@ -207,14 +207,9 @@ def download_video(url, workdir, cookies=None):
     if not os.path.exists(workdir): os.makedirs(workdir)
     cmd = list(VDOWN_CMD) + [url, cookies or "", workdir]
     try: 
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', bufsize=1, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', bufsize=1)
         for line in process.stdout:
-            msg = line.strip()
-            if "Progress:" in msg or ("[download]" in msg and "%" in msg):
-                sys.stdout.write(f"\r   {msg}    ")
-                sys.stdout.flush()
-            else:
-                print(msg, flush=True)
+            print(line.strip(), flush=True)
         process.wait()
         if process.returncode != 0:
             raise subprocess.CalledProcessError(process.returncode, cmd)
@@ -237,14 +232,9 @@ def transcribe_video(video_path, workdir, model="large-v3-turbo"):
     print(f"🎙️ Transcribing {os.path.basename(video_path)}...", flush=True)
     cmd = list(TRANSCRIBER_CMD) + [video_path, "--model", model, "--output", workdir, "--no-gui"]
     try:
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', bufsize=1, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', bufsize=1)
         for line in process.stdout:
-            msg = line.strip()
-            if "Progress:" in msg or ("[download]" in msg and "%" in msg):
-                sys.stdout.write(f"\r   {msg}    ")
-                sys.stdout.flush()
-            else:
-                print(msg, flush=True)
+            print(line.strip(), flush=True)
         process.wait()
         res = os.path.join(workdir, os.path.splitext(os.path.basename(video_path))[0] + ".srt")
         if os.path.exists(res):
@@ -271,15 +261,13 @@ def merge_bilingual(src_srt, zh_srt, main_lang="cn", llm_model="gemini-3.1-pro-p
     env = os.environ.copy(); env["GEMINI_MODEL"] = llm_model
     
     try:
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', env=env, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', env=env)
         for line in process.stdout:
             msg = line.strip()
             if "Progress:" in msg:
-                sys.stdout.write(f"\r   {msg}    ")
-                sys.stdout.flush()
+                print(msg, flush=True)
             else:
                 print(f"   [Merge] {msg}", flush=True)
-        sys.stdout.write("\n")
         process.wait()
         
         if process.returncode == 0 and os.path.exists(bi_path):
@@ -323,19 +311,18 @@ def burn_subtitle(video_path, srt_path, layout, main_lang, cn_font, en_font, cn_
 
     cmd = list(BURNSUB_CMD) + [video_path, ass_path, out_video, "--headless"]
     try:
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace')
         last_logs = []
         for line in process.stdout:
             msg = line.strip()
             if msg:
+                # If it's a progress line, don't prefix it so it's cleaner for the GUI regex
                 if "Progress:" in msg:
-                    sys.stdout.write(f"\r   {msg}    ")
-                    sys.stdout.flush()
+                    print(msg, flush=True)
                 else:
                     print(f"   [Burn] {msg}", flush=True)
                 last_logs.append(msg)
                 if len(last_logs) > 50: last_logs.pop(0)
-        sys.stdout.write("\n")
         
         process.wait()
         if process.returncode != 0:
@@ -369,18 +356,10 @@ def get_video_dimensions(path):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("input", nargs="?", default="", help="Input video URL or local file")
-    
-    # Batch mode arguments
-    parser.add_argument("--batch-urls", nargs="+", help="Multiple URLs or path to a .txt/.md file containing URLs")
-    parser.add_argument("--batch-dir", help="Directory containing multiple video project folders to process automatically")
-    parser.add_argument("--workers", type=int, default=5, help="Number of concurrent workers max 10")
-    parser.add_argument("--max-api-calls", type=int, default=20, help="Global concurrency limit for Translation APIs")
-
+    parser.add_argument("input")
     parser.add_argument("--model", default="large-v3-turbo")
-    parser.add_argument("--llm-model", default="gemini-3-flash-preview", help="LLM Model (gemini-3-flash-preview, gemini-3-pro-preview, gpt-4o, etc.)")
+    parser.add_argument("--llm-model", default="gemini-1.5-flash", help="LLM Model (gemini-1.5-flash, gpt-4o, moonshot-v1-8k, qwen-plus, glm-4, etc.)")
     parser.add_argument("--style", default="casual")
-    parser.add_argument("--trans-mode", default="balanced", choices=["paraphrase", "balanced"])
     parser.add_argument("--cookies")
     parser.add_argument("--layout", default="bilingual")
     parser.add_argument("--main-lang", default="cn")
@@ -391,24 +370,7 @@ def main():
     parser.add_argument("--cn-color", default="Gold")
     parser.add_argument("--en-color", default="White")
     parser.add_argument("--no-bg-box", action="store_true")
-    parser.add_argument("--output-dir", help="Project root directory for output files")
     args = parser.parse_args()
-
-    # Determine if we should run batch mode
-    if args.batch_urls or args.batch_dir:
-        import autosub_batch
-        return autosub_batch.run_batch(args)
-        
-    if not args.input:
-        return parser.print_help()
-
-    # --- Directory Logic ---
-    final_output_dir = args.output_dir or DEFAULTS.get("output_dir") or BASE_OUTPUT_DIR
-    if not os.path.isabs(final_output_dir):
-        final_output_dir = os.path.abspath(os.path.join(PROJECT_ROOT, final_output_dir))
-    
-    # Update global-like state for this run
-    effective_base_output_dir = final_output_dir
 
     # 0. Intelligent Project Naming
     if args.input.startswith("http"):
@@ -416,14 +378,14 @@ def main():
         title = get_video_title(args.input, args.cookies)
         if title:
             safe_title = sanitize_filename(title)
-            workdir = os.path.join(effective_base_output_dir, safe_title)
+            workdir = os.path.join(BASE_OUTPUT_DIR, safe_title)
             print(f"📁 Project Folder: {safe_title}")
         else:
-            workdir = get_workdir(args.input, effective_base_output_dir)
+            workdir = get_workdir(args.input)
     else:
-        workdir = get_workdir(args.input, effective_base_output_dir)
+        workdir = get_workdir(args.input)
 
-    if not os.path.exists(workdir): os.makedirs(workdir, exist_ok=True)
+    if not os.path.exists(workdir): os.makedirs(workdir)
     
     # --- Initialize Workflow Logging ---
     log_path = os.path.join(workdir, "workflow.log")
@@ -518,7 +480,7 @@ def main():
     if not zh_srt:
         print("🌍 Smart-translating...")
         try:
-            cmd = [sys.executable, SMART_TRANSLATE_CMD[1], src_srt, "--style", args.style, "--model", args.llm_model, "--trans-mode", getattr(args, "trans_mode", "balanced")]
+            cmd = list(SMART_TRANSLATE_CMD) + [src_srt, "--style", args.style, "--model", args.llm_model]
             subprocess.run(cmd, check=True)
             if os.path.exists(expected_cn): zh_srt = expected_cn
             elif os.path.exists(expected_zh): zh_srt = expected_zh

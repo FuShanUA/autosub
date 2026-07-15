@@ -115,11 +115,9 @@ TARGET STYLE: {style}
 - NO long dashes "——".
 - Vary sentence length.
 
-### CORE REQUIREMENTS:
-1. **Timing & Rhythm (Highest Priority)**: Maintain strict alignment with the time-axis. The Chinese text should match the rhythm of the English speech. 
-2. **Context-Driven Meaning**: Use the 'Context Lines' to understand the full sentence, but only translate the specific 'Target Line'.
-3. **Synchronization Constraint**: Do not significantly restructure sentences across time boundaries. Ensure the meaning of each segment is self-contained enough to be understood at that specific moment.
-4. **Glossary Consistency**: Strictly follow the terms provided in the 'ARTICLE ANALYSIS'.
+### STEP 3: CONTEXT AWARENESS
+- Use the provided Context Lines (if any) to understand the meaning, but ONLY translate the Target Line.
+- If a sentence is split across lines, translate the PARTIAL meaning naturaly for that time slot.
 
 INPUT BLOCK:
 {input_text}
@@ -141,8 +139,7 @@ OUTPUT FORMAT:
             if match:
                 idx = match.group(1)
                 content = match.group(2).strip()
-                if content:  # guard: reject empty translations
-                    translated_map[idx] = content
+                translated_map[idx] = content
         
         # Apply translations back to blocks
         translated_blocks = []
@@ -164,7 +161,7 @@ OUTPUT FORMAT:
         return chunk_blocks # Return original on failure
 
 
-STYLE_GUIDE_PATH = os.path.join(TOOLS_DIR, "common", "HARD_CONSTRAINTS.md")
+STYLE_GUIDE_PATH = os.path.join(TOOLS_DIR, "common", "STYLE_GUIDE.md")
 
 def load_regex_rules(filepath):
     rules = []
@@ -234,7 +231,7 @@ def is_untranslated(block: Dict) -> bool:
 
 def translate_blocks(blocks: List[Dict], client, model: str, style: str,
                      verbalizer_snippet: str, humanizer_snippet: str,
-                     knowledge_snippet: str, trans_mode_snippet: str = "") -> List[Dict]:
+                     knowledge_snippet: str) -> List[Dict]:
     """
     Translates a list of blocks (may be any size) using generate_batch.
     Returns the blocks with translations applied. Does NOT apply humanize_text.
@@ -263,7 +260,6 @@ TARGET STYLE: {style}
 
 ### STEP 3: HUMANIZATION (De-AI)
 {humanizer_snippet}...
-{trans_mode_snippet}
 
 ### STEP 4: CONTEXT AWARENESS
 INPUT BLOCK:
@@ -305,7 +301,7 @@ OUTPUT FORMAT (STRICT — one line per segment, no extra text):
 
 def postprocess_retry_loop(final_blocks: List[Dict], client, model: str, style: str,
                             verbalizer_snippet: str, humanizer_snippet: str,
-                            knowledge_snippet: str, trans_mode_snippet: str = "", max_iterations: int = 5) -> List[Dict]:
+                            knowledge_snippet: str, max_iterations: int = 5) -> List[Dict]:
     """
     Iteratively re-translates any untranslated/empty blocks until all are done
     (or max_iterations is reached). Returns final_blocks with all translations filled.
@@ -323,7 +319,7 @@ def postprocess_retry_loop(final_blocks: List[Dict], client, model: str, style: 
         missed_blocks = [final_blocks[i] for i in missed_positions]
         retranslated = translate_blocks(
             missed_blocks, client, model, style,
-            verbalizer_snippet, humanizer_snippet, knowledge_snippet, trans_mode_snippet
+            verbalizer_snippet, humanizer_snippet, knowledge_snippet
         )
 
         # Re-insert results at original positions
@@ -346,9 +342,8 @@ def main():
     parser = argparse.ArgumentParser(description="Smart Translation with Context & Style")
     parser.add_argument("input", help="Input English SRT file")
     parser.add_argument("--style", default="casual", choices=["casual", "formal", "edgy"])
-    parser.add_argument("--model", default="gemini-3-flash", help="Gemini Model (e.g. gemini-3-flash)")
+    parser.add_argument("--model", default="gemini-3-pro", help="Gemini Model (e.g. gemini-3-flash)")
     parser.add_argument("--chunk-size", type=int, default=50, help="Number of blocks per batch")
-    parser.add_argument("--trans-mode", default="balanced", choices=["paraphrase", "balanced"], help="Translation Mode")
     
     args = parser.parse_args()
     
@@ -387,21 +382,6 @@ def main():
         else:
             # Fallback to general constraints if section not found (or just empty)
             pass
-            
-    if args.trans_mode == "balanced":
-        trans_mode_snippet = """
-### STEP 3.5: TRANSLATION BALANCE (CRITICAL)
-### STEP 3.5: TRANSLATION BALANCE (CRITICAL CONCISENESS)
-- **Aggressive Conciseness**: The output must be as short and punchy as possible. Compress verbose English phrases into dense, telegraphic Chinese. Drop unnecessary pronouns, filler words, and conjunctions.
-- **Example Constraint**: "As Anurag said, this is our fifth DevCon in about 15 months, and momentum is palpable, I think." -> "正如 Anurag 所说，15个月内第五届 DevCon，势头非常迅猛。"
-- **Metaphors & Terms**: Do not expand or explain (e.g., keep "DevCon", do not translate to "开发者大会" if it wastes space). Keep terms like "Gastown", "Ralph Wiggum" as direct translations or original English.
-- **Context Injection**: Strictly forbidden. Do not add any explanatory background.
-"""
-    else:
-        trans_mode_snippet = """
-### STEP 3.5: TRANSLATION PARAPHRASE
-- Focus on sense-for-sense paraphrasing. Explain metaphors and add cultural/contextual background if it helps the domestic audience understand the subtext.
-"""
     
     print(f"📦 Preparing {total_chunks} chunks for parallel processing...")
     
@@ -429,7 +409,6 @@ TARGET STYLE: {args.style}
 
 ### STEP 3: HUMANIZATION (De-AI)
 {humanizer_snippet}...
-{trans_mode_snippet}
 
 ### STEP 4: CONTEXT AWARENESS
 INPUT BLOCK:
@@ -497,7 +476,7 @@ OUTPUT FORMAT:
         print(f"\n🔍 Post-processing: {untranslated_count} untranslated segment(s) found. Starting retry loop...")
         final_blocks = postprocess_retry_loop(
             final_blocks, client, target_model, args.style,
-            verbalizer_snippet, humanizer_snippet, knowledge_snippet, trans_mode_snippet
+            verbalizer_snippet, humanizer_snippet, knowledge_snippet
         )
     else:
         print("\n✅ All segments translated on first pass. Skipping post-processing.", flush=True)
@@ -513,19 +492,9 @@ OUTPUT FORMAT:
     else:
         output_path = input_path.replace(".srt", ".cn.srt")
 
-    def get_versioned_filename(filepath):
-        if not os.path.exists(filepath): return filepath
-        base, ext = os.path.splitext(filepath)
-        match = re.search(r'_v(\d+)$', base)
-        if match:
-            version = int(match.group(1)); base = base[:match.start()]
-        else: version = 0
-        while True:
-            version += 1
-            new_path = f"{base}_v{version}{ext}"
-            if not os.path.exists(new_path): return new_path
-
-    output_path = get_versioned_filename(output_path)
+    if os.path.exists(output_path):
+        base, ext = os.path.splitext(output_path)
+        output_path = f"{base}_smart{ext}"
 
     srt_utils.write_srt(final_blocks, output_path)
     print(f"✅ Translation Saved to: {output_path}", flush=True)
