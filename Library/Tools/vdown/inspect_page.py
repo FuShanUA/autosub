@@ -23,12 +23,12 @@ def inspect_page(url, cookies_file):
         response = session.get(url)
         response.raise_for_status()
         print(f"Successfully fetched {url} (Status: {response.status_code})")
-        
+
         # Save content to file for inspection
         with open("page_source.html", "w", encoding="utf-8") as f:
             f.write(response.text)
         print("Saved page source to page_source.html")
-        
+
         # Quick search for keywords
         keywords = ["m3u8", "mp4", "iframe", "embed", "video", "bizzabo", "jwplayer", "brightcove"]
         print("\n--- Key Findings ---")
@@ -44,7 +44,7 @@ def inspect_page(url, cookies_file):
                         found = True
                         if found and i > 5: break # Limit output
                 print("-" * 20)
-        
+
         if not found:
             print("No obvious video keywords found.")
 
@@ -55,7 +55,7 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: python inspect_page.py <URL>")
         sys.exit(1)
-    
+
     url = sys.argv[1]
     cookies_path = "cookies.txt"
     inspect_page(url, cookies_path)

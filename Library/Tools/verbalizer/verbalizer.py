@@ -43,16 +43,16 @@ def process_text_file(input_path, output_path, style="Edgy/Intellectual"):
     print(f"Verbalizing Text: {input_path}")
     with open(input_path, 'r', encoding='utf-8') as f:
         lines = f.readlines()
-        
+
     verbalized_lines = []
     current_speaker = None
-    
+
     for line in lines:
         stripped = line.strip()
         if is_editorial_content(stripped):
             verbalized_lines.append(line)
             continue
-            
+
         speaker, content = extract_speaker(stripped)
         if speaker:
             current_speaker = speaker
@@ -67,7 +67,7 @@ def process_text_file(input_path, output_path, style="Edgy/Intellectual"):
                 verbalized_lines.append(new_content + "\n")
             else:
                 verbalized_lines.append(line)
-                
+
     with open(output_path, 'w', encoding='utf-8') as f:
         f.writelines(verbalized_lines)
     print(f"Saved: {output_path}")
@@ -81,16 +81,16 @@ def process_srt_file(input_path, output_path, style="Edgy/Intellectual"):
 
     blocks = srt_tool.parse_srt(input_path)
     verbalized_blocks = []
-    
+
     for block in blocks:
         original_text = " ".join(block['lines'])
         # Simple processing, assume no speaker labels inside subtitles for now
         new_text = call_llm_style_transfer(original_text, style)
-        
+
         new_block = block.copy()
         new_block['lines'] = [new_text]
         verbalized_blocks.append(new_block)
-        
+
     srt_tool.write_srt(verbalized_blocks, output_path)
     print(f"Saved: {output_path}")
 
@@ -103,7 +103,7 @@ def process_file(input_file, style="Edgy/Intellectual", output_file=None):
     # Auto-detect type
     # We DO NOT split/merge here. We just process the file given.
     # It is the job of the caller (Subtranslator) to pass the correct MONOLINGUAL file.
-    
+
     base, ext = os.path.splitext(input_file)
     if not output_file:
          output_file = f"{base}.verbalized{ext}"
@@ -120,7 +120,7 @@ def process_file(input_file, style="Edgy/Intellectual", output_file=None):
                 if '-->' in f.read(100): is_srt = True
         except:
             pass
-            
+
     if is_srt:
         process_srt_file(input_file, output_file, style)
     else:
@@ -131,6 +131,6 @@ if __name__ == "__main__":
     parser.add_argument('input_file', help="Path to input file (SRT/Text)")
     parser.add_argument('--style', default="Edgy/Intellectual", help="Style persona")
     parser.add_argument('--output', help="Optional output path")
-    
+
     args = parser.parse_args()
     process_file(args.input_file, args.style, args.output)

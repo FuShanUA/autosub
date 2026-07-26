@@ -30,7 +30,7 @@ if sys.platform == "win32":
         pass
 
 # Configuration
-TOOLS_DIR = r"d:\cc\Library\Tools"
+TOOLS_DIR = r"/Users/shanfu/cc/Library/Tools"
 sys.path.append(os.path.join(TOOLS_DIR, "common")) # For gemini_utils and srt_utils
 
 HAS_GENAI = False
@@ -47,24 +47,24 @@ def process_split(args):
     input_path = os.path.abspath(args.input_file)
     output_dir = args.output_dir if args.output_dir else get_default_output_dir(input_path)
     chunks_dir = os.path.join(output_dir, "chunks")
-    
+
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
-    
+
     if not os.path.exists(chunks_dir):
         os.makedirs(chunks_dir)
-        
+
     print(f"Processing split for: {input_path}")
     print(f"Output Directory: {output_dir}")
 
     source_en_path = os.path.join(output_dir, "source.en.srt")
     subs = srt_utils.parse_srt(input_path)
     has_chinese = any(srt_utils.is_chinese(line) for sub in subs for line in sub['lines'])
-    
+
     if has_chinese:
         print("Detected Chinese characters. Assuming Bilingual/CN input.")
         print(f"Extracting English track to {source_en_path}...")
-        
+
         subs_en = []
         for sub in subs:
             lines_en = [l for l in sub['lines'] if not srt_utils.is_chinese(l)]
@@ -88,7 +88,7 @@ def process_merge(args):
         base_dir = os.path.dirname(input_path)
         filename = os.path.basename(input_path)
         base_name = os.path.splitext(filename)[0]
-        
+
         if base_name.lower().endswith('.en'):
             base_name = base_name[:-3]
         if base_name.lower().endswith('.bi'):
@@ -100,13 +100,13 @@ def process_merge(args):
 
     output_dir = args.output_dir if args.output_dir else base_dir
     chunks_dir = os.path.join(output_dir, "chunks")
-    
+
     if args.translated_file:
          combined_cn_path = os.path.abspath(args.translated_file)
          print(f"Using provided translated file: {combined_cn_path}")
     else:
          combined_cn_path = os.path.join(output_dir, f"{base_name}.zh.srt")
-    
+
     if os.path.exists(combined_cn_path) and os.path.getsize(combined_cn_path) > 0:
         print(f"✅ Found existing translated file: {combined_cn_path}")
     else:
@@ -123,15 +123,18 @@ def process_merge(args):
                 print("❌ No translated chunks found AND no pre-translated file exists.")
                 return
         srt_utils.merge_chunks(chunks_dir, combined_cn_path, cn_pattern)
-    
+
+    print(f"Progress: 5.0% (Loading tracks...)")
     final_bi_path = os.path.join(output_dir, f"{base_name}.bi.srt")
     potential_source_en = os.path.join(output_dir, "source.en.srt")
     if os.path.exists(potential_source_en):
         source_path = potential_source_en
-    
+
+    print(f"Progress: 25.5% (Aligning timelines...)")
     print(f"Using SMART MERGE logic (Time-based alignment) -> {final_bi_path}")
     srt_utils.merge_tracks(combined_cn_path, source_path, final_bi_path)
-    
+
+    print(f"Progress: 60.0% (Filling gaps...)")
     print("\n--- Auto-Filling Gaps ---")
     fill_count = run_fill(final_bi_path)
     if fill_count > 0:
@@ -144,7 +147,8 @@ def process_merge(args):
             print(f"⚠️ Could not sync back to translated file: {e}")
     else:
         print("No gaps found requiring fill.")
-        
+
+    print(f"Progress: 100.0% (Merge complete)")
     print(f"Merge & Fix pipeline complete. Output: {final_bi_path}")
 
 def validate_chunks(chunks_dir):
@@ -152,7 +156,7 @@ def validate_chunks(chunks_dir):
     src_pattern = os.path.join(chunks_dir, "chunk_*.srt")
     src_files = sorted(glob.glob(src_pattern))
     src_files = [f for f in src_files if not f.endswith('.cn.srt') and not f.endswith('.en.srt')]
-    
+
     issues = 0
     checked = 0
     for src_file in src_files:
@@ -168,7 +172,7 @@ def validate_chunks(chunks_dir):
                 issues += 1
         except Exception as e:
             print(f"Error parsing {src_file}: {e}")
-            
+
     if checked == 0: print("No translated chunks found to validate.")
     elif issues == 0: print(f"✅ All {checked} translated chunks match original block counts.")
     else: print(f"Found {issues} chunk mismatches.")
@@ -203,15 +207,15 @@ def run_fill(input_path):
     input_path = os.path.abspath(input_path)
     subs = srt_utils.parse_srt(input_path)
     gaps = []
-    
+
     for i, sub in enumerate(subs):
         lines = sub['lines']
         if not lines: continue
-        
+
         has_gap = False
         gap_idx = -1
         src_lines = []
-        
+
         for idx, line in enumerate(lines):
             if "[UNTRANSLATED]" in line:
                 has_gap = True
@@ -219,18 +223,18 @@ def run_fill(input_path):
             elif not srt_utils.is_chinese(line):
                 clean_line = line.strip()
                 if clean_line: src_lines.append(clean_line)
-        
+
         if has_gap and gap_idx != -1 and src_lines:
             src_text = " ".join(src_lines)
             prev_sub = subs[i-1] if i > 0 else None
             next_sub = subs[i+1] if i < len(subs)-1 else None
-            
+
             def get_ctx(s_block):
                 if not s_block: return ""
                 cn = " ".join([l for l in s_block['lines'] if srt_utils.is_chinese(l)])
                 en = " ".join([l for l in s_block['lines'] if not srt_utils.is_chinese(l) and '[UNTRANSLATED]' not in l])
                 return f"[{en}] -> [{cn}]"
-                
+
             gaps.append({
                 'id': len(gaps)+1,
                 'sub_index': i,
@@ -242,7 +246,7 @@ def run_fill(input_path):
 
     if not gaps: return 0
     print(f"⚡ Found {len(gaps)} gaps. Executing batched fill...")
-    
+
     BATCH_SIZE = 5
     batches = [gaps[i:i + BATCH_SIZE] for i in range(0, len(gaps), BATCH_SIZE)]
     tasks = []
@@ -295,7 +299,7 @@ def process_compare(args):
 def main():
     parser = argparse.ArgumentParser(description="Subtranslator Tool")
     subparsers = parser.add_subparsers(dest='step', required=True)
-    
+
     p_split = subparsers.add_parser('split'); p_split.add_argument('input_file'); p_split.add_argument('--output-dir'); p_split.add_argument('--chunk-size', type=int, default=30)
     p_merge = subparsers.add_parser('merge'); p_merge.add_argument('input_file'); p_merge.add_argument('--translated-file'); p_merge.add_argument('--output-dir'); p_merge.add_argument('--english-top', action='store_true')
     p_val = subparsers.add_parser('validate'); p_val.add_argument('input_file')

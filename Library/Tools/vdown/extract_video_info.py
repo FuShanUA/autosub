@@ -19,7 +19,7 @@ def extract_info(file_path):
         print(f"--- Scanning {file_path} ---")
         # Don't set found_any for Bizzabo, detecting it is just metadata
         found_video_id = False
-        
+
         for label, regex_list in patterns.items():
             for pattern in regex_list:
                 matches = re.findall(pattern, content, re.IGNORECASE)
@@ -27,12 +27,12 @@ def extract_info(file_path):
                     print(f"Found {label}: {matches[0]}")
                     if label != "Bizzabo":
                         found_video_id = True
-                    
+
                     unique_matches = set(matches)
                     if len(unique_matches) > 1:
                         print(f"  All unique matches: {unique_matches}")
-                    break 
-        
+                    break
+
         # Always search for context keywords to help debugging
         keywords = ['m3u8', 'mp4', 'broadcast', 'stream', 'master.m3u8', 'manifest']
         print("\n--- Context Search ---")
@@ -40,7 +40,7 @@ def extract_info(file_path):
             if kw in content.lower():
                  print(f"\nContext for '{kw}':")
                  literals = [m.start() for m in re.finditer(re.escape(kw), content, re.IGNORECASE)]
-                 for start in literals[:3]: 
+                 for start in literals[:3]:
                      print(content[max(0, start-100):min(len(content), start+200)])
                      print("-" * 20)
 

@@ -3,10 +3,10 @@ import os
 
 candidates = [
     r"d:\downloads\Palantir-Technologies-Q4-2025-Earnings1080p.srt",
-    r"d:\cc\Palantir-Technologies-Q4-2025-Earnings1080p.srt",
-    r"d:\cc\transcriber\Palantir-Technologies-Q4-2025-Earnings1080p.srt",
-    r"d:\cc\results\Palantir_Technologies_Q4_2025_Earnings1080p\Palantir-Technologies-Q4-2025-Earnings1080p.srt",
-    r"d:\cc\results\Palantir_Technologies_Q4_2025_Earnings1080p\Palantir-Technologies-Q4-2025-Earnings1080p.srt"
+    r"/Users/shanfu/cc/Palantir-Technologies-Q4-2025-Earnings1080p.srt",
+    r"/Users/shanfu/cc/transcriber/Palantir-Technologies-Q4-2025-Earnings1080p.srt",
+    r"/Users/shanfu/cc/results/Palantir_Technologies_Q4_2025_Earnings1080p/Palantir-Technologies-Q4-2025-Earnings1080p.srt",
+    r"/Users/shanfu/cc/results/Palantir_Technologies_Q4_2025_Earnings1080p/Palantir-Technologies-Q4-2025-Earnings1080p.srt"
 ]
 
 found = False
@@ -17,7 +17,7 @@ for p in candidates:
         print(f"SIZE: {stat.st_size}")
         print(f"MTIME: {stat.st_mtime}")
         found = True
-        
+
     print("Checking d:\\downloads...")
     try:
         files = os.listdir(r"d:\downloads")

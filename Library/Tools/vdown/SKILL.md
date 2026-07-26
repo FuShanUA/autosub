@@ -13,7 +13,21 @@ This skill downloads videos from various platforms using `yt-dlp` with intellige
 /vdown [URL] [optional_cookies_file]
 ```
 
-## Supported Sources
+## Recommended Method (GUI)
+
+The `/vdown` command and backend scripts now support a graphical progress window by default when invoked via the wrapper.
+
+### Commands
+
+**GUI (Preferred)**
+```powershell
+python /Users/shanfu/cc/Library/Tools/vdown/vdown_gui.py "<URL>" " " "/Users/shanfu/cc/download"
+```
+
+**CLI (Backend)**
+```powershell
+python /Users/shanfu/cc/Library/Tools/vdown/download.py "<URL>" " " "/Users/shanfu/cc/download"
+```
 
 ### Standard Platforms (Full Automation)
 - **YouTube, X.com, Vimeo**: Fully automated download
@@ -66,7 +80,7 @@ For age-restricted, private, or "Sign in to confirm you're not a bot" videos:
 2. **Open Incognito**: Open a new incognito/private window
 3. **Navigate**: Go to `https://www.youtube.com/robots.txt` in the incognito tab
 4. **Login**: Log into your YouTube account in that same incognito tab
-5. **Export**: Click the extension icon → Export → Save to `d:\cc\vdown\cookies.txt`
+5. **Export**: Click the extension icon → Export → Save to `/Users/shanfu/cc/vdown/cookies.txt`
 6. **Close**: Close the incognito window immediately (prevents cookie rotation)
 7. **Run**: Execute `/vdown <URL>` - it will automatically use cookies.txt
 

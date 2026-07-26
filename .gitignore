@@ -20,3 +20,14 @@ dist/
 *.spec
 yt-dlp.exe
 *.exe
+
+# 本地调试与运行时产物
+Library/Tools/autosub/.hw_SS.json
+Library/Tools/autosub/*_state.json
+Library/Tools/autosub/gui_crash_report.txt
+Library/Tools/autosub/gui_debug_*.txt
+Library/Tools/vdown/network_log.txt
+Library/Tools/vdown/screenshot_debug.png
+*_backup*.png
+*_backup*.ico
+Library/Tools/autosub/_backup_*

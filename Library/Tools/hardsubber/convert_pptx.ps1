@@ -1,4 +1,4 @@
-$sourcePath = "d:\cc\hardsubber\input.pptx"
+$sourcePath = "/Users/shanfu/cc/hardsubber/input.pptx"
 $desktopPath = [Environment]::GetFolderPath("Desktop")
 $baseName = [System.IO.Path]::GetFileNameWithoutExtension($sourcePath)
 $picPptxPath = Join-Path $desktopPath "${baseName}_Picture.pptx"

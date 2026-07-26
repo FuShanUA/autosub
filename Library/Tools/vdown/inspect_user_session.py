@@ -22,16 +22,16 @@ def fetch_user_session():
     })
 
     url = "https://api.bizzabo.com/api/v2/agenda/events/800562/userSessions"
-    
+
     # Try POSTing empty JSON as seen in some Bizzabo implementations
     # Sometimes it needs {sessionId: ...}
-    
+
     # First attempt: simple empty POST (often used to 'join' the event context)
     try:
         print(f"POSTing to {url}...")
-        response = session.post(url, json={}) 
+        response = session.post(url, json={})
         print(f"Status: {response.status_code}")
-        
+
         try:
             data = response.json()
             with open("user_session_response.json", "w", encoding="utf-8") as f:

@@ -1,50 +1,38 @@
+# Verbalizer: Subtitle Tone & Persona Rules
 
-# Verbalizer Skill (Persona Focus)
+Rules for verbalizing translated subtitles — choosing register, rhythm, and
+persona so the Chinese reads like spoken speech that fits the video, not like
+translated prose. Consumed by `smart_translate.py` via `load_skill_rules`.
 
-本技能的职责不是基础翻译，而是**风格迁移 (Style Transfer)**。
-它接收已经准确但可能平淡的中文字幕，根据设定的**角色 (Role)** 和 **调性 (Tone)** 进行深度重写。
+## Spoken Register
+- Default to natural spoken Chinese, not written prose. Prefer short clauses
+  over compound sentences. If an English line is a sentence fragment, the
+  Chinese stays a fragment too — do not "complete" it by pulling in content
+  from adjacent blocks.
+- Use contractions of spoken rhythm: 也就是、其实、对吧、就是说、你懂的、对、嗯.
+  Match the speaker's energy — interview/casual = loose; keynote = tighter.
+- Drop filler only when it adds nothing; keep "you know", "I mean" as 对吧/就是说
+  when the speaker leans on them for tone.
 
-## 核心理念 (Core Philosophy)
-- **Subtranslator 负责"信"**: 确保意思准确，没有语法错误，去除基础翻译腔。
-- **Verbalizer 负责"达"与"雅"**: 赋予文本灵魂，使其听起来像特定的人在特定的场合说的话。
+## Persona & Consistency
+- Keep the speaker's stance. A founder pitching is confident and concrete;
+  a host bantering is lighter; a technical demo is precise. Do not flatten
+  everyone into the same neutral voice.
+- Keep proper nouns, product names, acronyms in English unless there is a
+  well-known Chinese name (Palantir, AIPCon, SurfOS, CTOL, eVTOL, BrokerOS).
 
-## Parameters (风格参数)
+## Rhythm & Timeline Alignment
+- One subtitle block = one beat on the timeline. The Chinese for block N must
+  match what is being said DURING block N. Never pull meaning from block N+1
+  forward into block N, even if the English sentence spans the boundary.
+- Prefer dense, telegraphic Chinese so a block is readable in its on-screen
+  time. If a block would overflow, compress — do not push content to neighbors.
+- Do not add explanatory background, definitions, or context the speaker did
+  not give. The audience reads in real time.
 
-在调用时，必须指定以下参数：
-
-### 1. Style / Tone (风格/调性)
-- **[另类/智性] (Edgy/Intellectual)**: 
-  - 适用：Alex Karp (Palantir), Elon Musk 等科技思想领袖。
-  - 特征：使用高势能词汇（底层逻辑、范式、博弈、穿透），冷峻，极简，带有哲学思辨色彩。
-  - **拒绝文学化**: 所谓的智性是“深刻的思维”，而不是“华丽的辞藻”。严禁使用文艺气息重的词汇。用 backdrop 而不是 background，翻译成“大环境/宏观背景”，而不是“惊鸿一瞥”。
-  - **去噪**: 强力去除口语废话和犹豫，使其听起来思维敏捷、直击要害。
-- **[老炮/江湖] (Veteran/Colloquial)**:
-  - 适用：经验丰富的行业老手，私下谈话。
-  - 特征：大量使用口语连接词（其实、说白了、这就好比），节奏从容，词汇接地气但有力量。
-  - **保留**: 可以保留部分语气词以增加"人味"。
-- **[学术/严谨] (Academic/Formal)**:
-  - 适用：教授，研究员，正式汇报。
-  - 特征：逻辑严密，用词精准，语气平和，多用关联词。
-
-### 2. Context (语境)
-- **演讲/发布会**: 需要更有煽动性和感染力。
-- **对谈/播客**: 需要自然的交互感，保留一定的呼吸感。
-
-### 3. Input Types
-- **Subtitle (SRT)**: Standard time-coded subtitles.
-- **Narrative Text (TXT/MD)**: Interview transcripts, meeting notes, etc.
-  - **Smart Filtering**: Should identify and preserve metadata, editorial notes (e.g., `[Laughter]`, `(Editor's note: ...)`), and narration.
-  - **Speaker Recognition**: If specific speakers are identified (e.g., "Elon:", "Interviewer:"), automatically apply the corresponding legacy/persona.
-
-## Guidelines
-Detailed style definitions and examples can be found in this document. 
-Refer to [SKILL.md](./SKILL.md) for technical execution steps.
-
-## Examples
-
-**原文**: "我们正在经历一场巨大的技术变革。"
-- **[另类]**: "我们要谈的是一场范式转移。"
-
-**原文**: "但是...如果...在这个...实际上..." (Dysfluency)
-- **[另类]**: "实际上...核心在于..." (简化，保留逻辑转折)
-- **[老炮]**: "咋说呢... 其实吧..." (保留犹豫)
+## Anti-Patterns
+- No "翻译腔": avoid 此外、意味着、不可或缺、值得注意的是、众所周知、总而言之.
+- No em-dashes —— to chain clauses; use commas or split into another block.
+- No back-translating idioms literally; use the nearest spoken Chinese equivalent.
+- No mixing English common words (actually, so, like) into Chinese lines;
+  proper nouns and acronyms are fine.

@@ -21,12 +21,12 @@ def fetch_recording_data():
     })
 
     url = "https://api.bizzabo.com/api/v2/agenda/events/800562/sessions/1799544/virtualSession/recording?_nocache=1769852197962"
-    
+
     try:
         print(f"Fetching {url}...")
-        response = session.get(url) 
+        response = session.get(url)
         print(f"Status: {response.status_code}")
-        
+
         try:
             data = response.json()
             with open("recording_response.json", "w", encoding="utf-8") as f:

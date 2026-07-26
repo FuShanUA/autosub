@@ -39,10 +39,10 @@ Executes the FFmpeg burn process.
 ### Command Line
 ```powershell
 # 1. Generate Styled ASS (Default STKaiti + Gold text)
-python d:\cc\Library\Tools\hardsubber\srt_to_ass.py "input.srt" "output.ass" --cn-font "STKaiti" --cn-color "Gold"
+python /Users/shanfu/cc/Library/Tools/hardsubber/srt_to_ass.py "input.srt" "output.ass" --cn-font "STKaiti" --cn-color "Gold"
 
 # 2. Burn to Video (GUI Progress)
-python d:\cc\Library\Tools\hardsubber\burn_engine.py "video.mp4" "output.ass" "final_hardsub.mp4"
+python /Users/shanfu/cc/Library/Tools/hardsubber/burn_engine.py "video.mp4" "output.ass" "final_hardsub.mp4"
 ```
 
 ## Workflow Tips

@@ -14,7 +14,7 @@ The linguistic rules, anti-translationese guidelines, and formatting constraints
 
 1.  **Split**:
     -   Divide a large SRT file into chunks for processing.
-    -   Command: `python d:\cc\Library\Tools\subtranslator\subtranslator.py split <input.srt>`
+    -   Command: `python /Users/shanfu/cc/Library/Tools/subtranslator/subtranslator.py split <input.srt>`
     -   Targets: Creates `chunks/*.srt`.
 
 2.  **Translation**:
@@ -23,15 +23,15 @@ The linguistic rules, anti-translationese guidelines, and formatting constraints
 
 3.  **Merge**:
     -   Combine the translated chunks with the original English to create a bilingual SRT.
-    -   Command: `python d:\cc\Library\Tools\subtranslator\subtranslator.py merge <input.srt>`
+    -   Command: `python /Users/shanfu/cc/Library/Tools/subtranslator/subtranslator.py merge <input.srt>`
     -   Output: Generates `<filename>.bilingual.srt`.
 
 4.  **Validate**:
     -   Verify the final output for structural integrity.
-    -   Command: `python d:\cc\Library\Tools\subtranslator\subtranslator.py validate <output.srt>`
+    -   Command: `python /Users/shanfu/cc/Library/Tools/subtranslator/subtranslator.py validate <output.srt>`
 
 ## Portability Note
-All commands should be run using absolute paths or from the skill directory. If running from the project root, use `python d:\cc\Library\Tools\subtranslator\subtranslator.py`.
+All commands should be run using absolute paths or from the skill directory. If running from the project root, use `python /Users/shanfu/cc/Library/Tools/subtranslator/subtranslator.py`.
 
 ## When to Use
 1.  Preparing raw English subtitles for translation.

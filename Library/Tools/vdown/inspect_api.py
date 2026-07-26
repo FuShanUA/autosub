@@ -27,7 +27,7 @@ def fetch_session_data(url):
         print(f"Fetching {url}...")
         response = session.get(url)
         print(f"Status: {response.status_code}")
-        
+
         try:
             data = response.json()
             with open("api_response.json", "w", encoding="utf-8") as f:

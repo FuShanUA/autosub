@@ -20,7 +20,7 @@ description: 转录音视频文件为字幕 (SRT) 使用 FastWhisper。支持 mp
 ## Usage
 
 ### 0. Task Setup (Recommended)
-Before starting, create a directory for your task: `d:\cc\tasks\[TaskName]`.
+Before starting, create a directory for your task: `/Users/shanfu/cc/tasks/[TaskName]`.
 This helps organize output files.
 
 ### 1. 估算时间 (Estimate)
@@ -28,7 +28,7 @@ This helps organize output files.
 在运行之前，**必须**先根据文件时长估算时间并告知用户。
 
 ```python
-python d:\cc\transcriber\transcribe_engine.py estimate <file_path>
+python /Users/shanfu/cc/transcriber/transcribe_engine.py estimate <file_path>
 ```
 
 Agent 应该读取 JSON 输出 `{"duration": ..., "estimated_seconds": ...}`，并将估算时间转换为易读格式（如 "大约 2 分钟"）告知用户。
@@ -38,7 +38,7 @@ Agent 应该读取 JSON 输出 `{"duration": ..., "estimated_seconds": ...}`，�
 告知用户后，使用 `run_command` 在后台运行转录任务。
 
 ```powershell
-python d:\cc\transcriber\transcribe_engine.py run <file_path> [--model <model_name>]
+python /Users/shanfu/cc/transcriber/transcribe_engine.py run <file_path> [--model <model_name>]
 ```
 
 **Parameters**:
@@ -57,6 +57,6 @@ python d:\cc\transcriber\transcribe_engine.py run <file_path> [--model <model_na
 **User**: "Help me transcribe video.mp4 using the v2 model."
 
 **Agent**: 
-1. Run `python d:\cc\transcriber\transcribe_engine.py estimate d:\cc\video.mp4`
+1. Run `python /Users/shanfu/cc/transcriber/transcribe_engine.py estimate /Users/shanfu/cc/video.mp4`
 2. Reply: "视频时长 10 分钟，预计需要 1 分钟。正在使用 large-v2 模型后台处理..."
-3. Run `python d:\cc\transcriber\transcribe_engine.py run d:\cc\video.mp4 --model faster-whisper-large-v2` (in background)
+3. Run `python /Users/shanfu/cc/transcriber/transcribe_engine.py run /Users/shanfu/cc/video.mp4 --model faster-whisper-large-v2` (in background)

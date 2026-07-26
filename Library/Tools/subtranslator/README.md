@@ -64,16 +64,48 @@ English subtitles often split sentences across blocks. You MUST align the Chines
 ## Screen Fit & Length Control (视觉适配)
 - **Max Width**: Chinese characters should ideally not exceed **18-20 per line**. 
 - **Split Strategy**: If a sentence is long, insert a hard line break (`\n`) to split it into two visual lines within the same timestamp block.
+- 🚫 **No Splitting English Phrases (严禁生硬切断英语)**: If a translation contains an English phrase (e.g., "Claude Code"), NEVER split the phrase across a line break (`\n`) and NEVER split it across two different subtitle blocks. Keep the full English phrase intact on the same line or in the same block.
 
 ## Domain Knowledge & ASR Correction
 ### Palantir Context
-- **FDE (Forward Deployed Engineer)**:
+- **FDE (Forward Deployed Engineer/Engineering)**:
     - **Common ASR Errors**: Often mis-transcribed as **"FD"**, **"FTE"**, **"FT"**, or **"FDA"**.
-    - **Logic**: If the context involves engineers, deployment, or Palantir operations, treat "FD/FTE" as "FDE".
-    - **Translation**: "前端驻场工程师" or "FDE". **NEVER** "全职员工" (Full Time Employee).
+    - **Logic**: Use context to determine if it refers to a person or a model/department.
+    - **Translation**: 
+        - If referring to a person or explicitly "Forward Deployed Engineer": "**前线部署工程师**".
+        - If referring to a model/pattern or explicitly "Forward Deployed Engineering": "**FDE模式**".
+        - **NEVER** use "全职员工" (Full Time Employee).
 
-### General AI Context
-- **Claude (Anthropic's AI)**:
-    - **Common ASR Errors**: Often mis-transcribed as **"Cloud"**, **"Clawed"**, or **"Clouds"**.
-    - **Logic**: If the context mentions "GPT", "Gemini", "Llama", "Anthropic", or "Reasoning Model", then "Cloud" usually refers to "Claude".
-    - **Translation**: "Claude" (Keep English). **NEVER** "云" (Cloud computing) in this specific context.
+- **Ondas (ASR Errors: Andas, OnDos)**:
+    - **Logic**: Ondas is the drone/autonomous systems company cooperating with Palantir and WorldView in this video. ASR frequently mis-transcribes it as **"Andas"** or **"OnDos"**.
+    - **Constraint**: ALWAYS translate **Ondas**, **Andas**, or **OnDos** as "**Ondas**" or "**奥恩达斯**". **NEVER** translate them as **"Anduril" (安杜里尔)**.
+
+### General AI Context (Cloud vs. Claw vs. Claude)
+Whisper ASR often mis-transcribes "Claude" or "Claw" as "Cloud", "Claws", "Clause", or "Clawed". You MUST use context to decide the correct term. No term has priority.
+
+#### 1. Claude (Anthropic's Model)
+- **Use when**: Context clearly mentions **Anthropic**, model versions (**3.5**, **Sonnet**, **Opus**, **Haiku**), or Anthropic tools (**Claude Code**, **Claude Coword**).
+- **Constraint**: Proximity to "Anthropic" is helpful but not absolute. Unless it's a direct reference to the model or its ecosystem, do not force-correct "Cloud" to "Claude".
+
+#### 2. Claw / Clawd (Agent Harness / Karpathy's Project)
+- **Use when**: Context mentions **Agent Harnesses**, **AutoResearch**, **Andrej Karpathy**, or building "claws" to take over a home/computer. 
+- **Variants**: Includes **OpenClaw** and its earlier version **Clawd**. Shorthand is often "Claw".
+- **Logic**: If the speaker is talking about a specific agent project they built or "claw-like entities", use **Claw**.
+
+#### 3. Cloud (Computing/Nature)
+- **Use when**: Context refers to **Azure**, **AWS**, **Google Cloud**, infrastructure, or literal clouds.
+- **Logic**: Default to "Cloud" (云) if neither of the above technical contexts is clearly established.
+
+#### Summary Matrix:
+| Target | Key Context Indicators |
+| :--- | :--- |
+| **Claude** | Anthropic, 3.5, Sonnet, Opus, Model, AI assistant |
+| **Claw** | Andrej Karpathy, Agent harness, OpenClaw, Clawd, "my claw" |
+| **Cloud** | Azure, AWS, Infrastructure, Server, Storage, Weather |
+
+## Multi-Speaker Formatting (关键: 多方插话处理)
+在极快语速或多人对话重叠的情况下，使用方括号 `[]` 标注短促的插入语或背景反馈。
+1. **Principle**: `[内容]` 表示插话的起止口。
+2. **Logic**: 插话部分加方括号；主发言人重新接回的部分**不加**。
+   - **好**: `谁会被血洗？是工人。[没错，历来如此。] 所以，`
+   - **坏**: `谁会被血洗？是工人。[没错，历来如此。][所以，]`

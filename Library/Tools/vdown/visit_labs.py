@@ -5,9 +5,9 @@ import sys
 def main():
     target_url = "https://labs.google"
     screenshot_path = os.path.join(os.getcwd(), "google_labs.png")
-    
+
     print(f"Connecting to Playwright to visit {target_url}...")
-    
+
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch()

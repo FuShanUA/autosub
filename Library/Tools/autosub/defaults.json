@@ -1,7 +1,7 @@
 {
     "whisper_model": "large-v2",
-    "llm_model": "gemini-3.1-pro-preview",
-    "style": "casual",
+    "llm_model": "gemini-3-flash-preview",
+    "style": "auto",
     "layout": "bilingual",
     "main_lang": "cn",
     "cn_font": "STKaiti",

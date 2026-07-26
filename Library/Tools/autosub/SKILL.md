@@ -17,12 +17,12 @@ A fully automated "zero-click" workflow to generate professional bilingual subti
 
 ### GUI Mode (Recommended)
 ```powershell
-python d:\cc\Library\Tools\autosub\autosub_gui.py
+python /Users/shanfu/cc/Library/Tools/autosub/autosub_gui.py
 ```
 
 ### Command Line Mode
 ```powershell
-python d:\cc\Library\Tools\autosub\autosub.py <URL|FILE> [options]
+python /Users/shanfu/cc/Library/Tools/autosub/autosub.py <URL|FILE> [options]
 ```
 
 ### Advanced Translation Strategy (IDE Mode)
@@ -66,4 +66,3 @@ The default values for all parameters are managed via external JSON files:
 ## Requirements
 *   `GEMINI_API_KEY` or `GOOGLE_API_KEY` in environment (or `.env`).
 *   `vdown`, `transcriber`, `hardsubber` skills installed.
-

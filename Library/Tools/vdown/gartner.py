@@ -42,7 +42,7 @@ def fetch_mux_url(event_id, session_id, cookies_file="cookies.txt"):
         except Exception as e:
             log(f"Warning: Failed to load cookies: {e}")
             return None
-    
+
     session = requests.Session()
     session.cookies = cj
     session.headers.update({
@@ -54,20 +54,20 @@ def fetch_mux_url(event_id, session_id, cookies_file="cookies.txt"):
     })
 
     api_url = f"https://api.bizzabo.com/api/v2/agenda/events/{event_id}/sessions/{session_id}/virtualSession/recording"
-    
+
     log(f"Fetching recording metadata from: {api_url}")
     try:
         response = session.get(api_url)
         if response.status_code != 200:
             log(f"API Error: Status {response.status_code}")
             return None
-        
+
         data = response.json()
         json_str = json.dumps(data)
-        
+
         mux_matches = re.findall(r'https://stream\.mux\.com/[a-zA-Z0-9\-\_]+\.m3u8', json_str)
         if mux_matches: return mux_matches[0]
-            
+
         pid_matches = re.findall(r'"playbackId"\s*:\s*"([a-zA-Z0-9\-\_]+)"', json_str)
         if pid_matches: return f"https://stream.mux.com/{pid_matches[0]}.m3u8"
 
@@ -86,10 +86,10 @@ def fetch_from_active_browser():
     except ImportError:
         log("Playwright not installed.")
         return None
-    
+
     log("Attempting to connect to your active Chrome browser...")
     log("(Make sure Chrome was started with: chrome.exe --remote-debugging-port=9222)")
-    
+
     try:
         with sync_playwright() as p:
             browser = p.chromium.connect_over_cdp("http://localhost:9222")
@@ -97,47 +97,47 @@ def fetch_from_active_browser():
             if not contexts:
                 log("No browser contexts found. Make sure a Chrome window is open.")
                 return None
-            
+
             context = contexts[0]
             pages = context.pages
             if not pages:
                 log("No pages found in browser.")
                 return None
-            
+
             # Find the Gartner page
             gartner_page = None
             for page in pages:
                 if "gartner.com" in page.url or "bizzabo.com" in page.url:
                     gartner_page = page
                     break
-            
+
             if not gartner_page:
                 log("No Gartner/Bizzabo page found in open tabs.")
                 return None
-            
+
             log(f"Found page: {gartner_page.url}")
-            
+
             # Listen for network requests
             found_urls = []
             def handle_request(request):
                 u = request.url
                 if ".m3u8" in u and "gartner" not in u:
                     found_urls.append(u)
-            
+
             gartner_page.on("request", handle_request)
-            
+
             log("Monitoring network traffic for 10 seconds...")
             log("(If video isn't playing, click Play now)")
             gartner_page.wait_for_timeout(10000)
-            
+
             browser.close()
-            
+
             if found_urls:
                 return found_urls[-1]
             else:
                 log("No .m3u8 URLs captured.")
                 return None
-                
+
     except Exception as e:
         log(f"CDP connection error: {e}")
         log("Make sure Chrome is running with: chrome.exe --remote-debugging-port=9222")
@@ -158,9 +158,9 @@ if __name__ == "__main__":
     page_url = sys.argv[1]
     event_id, session_id = get_session_details_from_url(page_url)
     if not event_id: sys.exit(1)
-    
+
     mux_url = fetch_mux_url(event_id, session_id)
-    
+
     if mux_url:
         download_stream(mux_url)
     else:
