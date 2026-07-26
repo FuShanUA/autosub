@@ -136,8 +136,14 @@ def detect_translation_style(blocks: List[Dict], model_name: str, provider=None)
     if not blocks:
         print("⚠️ No subtitle blocks found. Defaulting to CASUAL.")
         return "casual"
-    # Take a sample of the first 50 blocks
-    sample_blocks = blocks[:50]
+    # Sample blocks evenly across the entire transcript to avoid bias
+    # from intro ads/promos that only appear at the start
+    total = len(blocks)
+    if total <= 60:
+        sample_blocks = blocks
+    else:
+        step = max(1, total // 50)
+        sample_blocks = blocks[::step][:50]
     sample_text = "\n".join([" ".join(b['lines']).strip() for b in sample_blocks])
     
     prompt = f"""Analyze the following English video subtitle transcript and classify its tone/genre into exactly one of these three categories:
