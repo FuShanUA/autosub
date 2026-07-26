@@ -652,7 +652,15 @@ class AutoSubGUI:
                         self.root.after(0, self.log, f"⚠️ 无权限访问目录: {sd}，跳过")
                 if not hardsub_files:
                     self.root.after(0, self.log, f"⚠️ 未找到任何 hardsub 视频文件 (搜索了 {', '.join(search_dirs)})")
-                newest_video = max(hardsub_files, key=os.path.getmtime) if hardsub_files else None
+                # Prefer the hardsub that belongs to THIS job (its name is derived
+                # from the input video). Without this, a newer hardsub from a
+                # different project gets picked up and uploaded by mistake.
+                if hardsub_files:
+                    _in_base = os.path.splitext(os.path.basename(input_video))[0] if not str(input_video).startswith("http") else ""
+                    _preferred = [f for f in hardsub_files if _in_base and _in_base in os.path.basename(f)] if _in_base else []
+                    newest_video = max(_preferred or hardsub_files, key=os.path.getmtime)
+                else:
+                    newest_video = None
                 # Drive sync targets the job workdir (the folder holding the outputs).
                 # If no hardsub was found, skip the sync entirely rather than
                 # syncing the wrong directory (e.g. Desktop).
