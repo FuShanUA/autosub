@@ -174,6 +174,92 @@ Respond with ONLY the category name (`casual`, `formal`, or `edgy`) as a single 
         print(f"⚠️ Style detection failed ({e}). Defaulting to CASUAL.")
         return "casual"
 
+def detect_ad_segments(blocks: List[Dict], client, model: str, provider=None) -> List[Dict]:
+    """
+    Scans the FULL transcript to locate advertising / promotional segments
+    (intro sponsors, mid-roll ads, outro plugs). Unlike style detection,
+    this needs the whole transcript because ads are continuous spans that
+    can appear anywhere — sampling the head would miss mid-roll/outro ads.
+
+    Returns a list of segments, each with block range + timecodes:
+      {'start_block', 'end_block', 'start_time', 'end_time', 'type', 'reason'}
+    Also mutates blocks in-place to set b['is_ad'] = True for ad blocks,
+    so downstream steps (translation, slicing) can skip/handle them.
+    """
+    if not blocks:
+        return []
+
+    # Build an index-tagged transcript so the LLM can cite block numbers.
+    lines = []
+    for b in blocks:
+        text = " ".join(b.get('lines', [])).strip()
+        lines.append(f"[{b['index']}] {text}")
+    transcript = "\n".join(lines)
+
+    prompt = f"""Analyze the following subtitle transcript and identify any advertising or promotional segments.
+
+Look for:
+- "sponsor" — sponsor reads / brand integrations ("this video is sponsored by", "thanks to X for sponsoring")
+- "midroll" — promotional content inserted in the middle, unrelated to the main content
+- "outro" — end-of-video call-to-action, merchandise, Patreon/channel plugs
+- "intro" — pre-roll promotions before the main content starts
+
+Return ONLY a JSON array (no markdown fences, no explanation). Each element:
+{{"start": <first block index>, "end": <last block index>, "type": "sponsor"|"midroll"|"outro"|"intro", "reason": "<short reason>"}}
+If no ads are found, return [].
+
+### TRANSCRIPT:
+{transcript}
+"""
+    try:
+        raw = client.generate_content(prompt, model_name=model, fallback=True, provider=provider)
+        if not raw:
+            return []
+        # LLMs sometimes wrap output in ```json ... ```; extract the first array.
+        m = re.search(r'\[.*\]', raw, re.DOTALL)
+        if not m:
+            return []
+        segs_raw = json.loads(m.group(0))
+    except Exception as e:
+        print(f"⚠️ Ad detection failed ({e}). Skipping.")
+        return []
+
+    idx_map = {str(b['index']): b for b in blocks}
+    ad_segments: List[Dict] = []
+    ad_block_ids = set()
+    for seg in segs_raw:
+        try:
+            s = str(seg.get("start"))
+            e = str(seg.get("end"))
+            if s not in idx_map or e not in idx_map:
+                continue
+            sb = idx_map[s]
+            eb = idx_map[e]
+            ad_segments.append({
+                'start_block': sb['index'],
+                'end_block': eb['index'],
+                'start_time': sb.get('start', 0),
+                'end_time': eb.get('end', 0),
+                'type': seg.get('type', 'unknown'),
+                'reason': seg.get('reason', ''),
+            })
+            # Mark every block in the inclusive range
+            si = int(s) if s.isdigit() else None
+            ei = int(e) if e.isdigit() else None
+            if si is not None and ei is not None:
+                for i in range(si, ei + 1):
+                    ad_block_ids.add(str(i))
+        except Exception:
+            continue
+
+    # Mutate blocks in-place so translation / slicing can consult b['is_ad']
+    for b in blocks:
+        if str(b['index']) in ad_block_ids:
+            b['is_ad'] = True
+
+    return ad_segments
+
+
 def smart_translate_chunk(chunk_blocks: List[Dict], style: str = "casual", model_name: str = "gemini-3.1-pro-preview") -> List[Dict]:
     """
     Translates a chunk of subtitle blocks using context-aware prompting.
@@ -894,6 +980,24 @@ def main():
     if args.style == "auto":
         effective_style = detect_translation_style(blocks, args.model, provider=provider_enum)
     print(f"   Style: {effective_style} (Configured: {args.style}) | Chunk Size: {args.chunk_size}")
+
+    # 1.6 Ad / sponsor segment detection (full-transcript scan)
+    # Identifies ad spans so they can be skipped during translation and
+    # excluded when slicing clips. Result is also persisted to
+    # <name>.ad_segments.json for downstream tools (e.g. clipcraft).
+    print("📺 Detecting ad / sponsor segments...")
+    ad_segments = detect_ad_segments(blocks, client, args.model, provider=provider_enum)
+    if ad_segments:
+        ad_json_path = os.path.join(
+            os.path.dirname(input_path),
+            os.path.splitext(os.path.basename(input_path))[0] + ".ad_segments.json",
+        )
+        with open(ad_json_path, "w", encoding="utf-8") as f:
+            json.dump(ad_segments, f, ensure_ascii=False, indent=2)
+        ad_block_count = sum(1 for b in blocks if b.get('is_ad'))
+        print(f"   Found {len(ad_segments)} ad segment(s) covering {ad_block_count} blocks -> {os.path.basename(ad_json_path)}")
+    else:
+        print("   No ad segments detected.")
 
     total_chunks = math.ceil(len(blocks) / args.chunk_size)
     print(f"   Total Blocks: {len(blocks)} -> {total_chunks} Chunks")
