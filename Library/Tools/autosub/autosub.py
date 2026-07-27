@@ -512,9 +512,54 @@ def rename_workdir_safely(old_workdir, new_workdir, current_video_path, logger_i
         
     return resolved_workdir, resolved_video_path, new_logger
 
+def get_remote_duration(url, cookies=None):
+    """Fetch video duration (seconds) via yt-dlp --get-duration."""
+    try:
+        cmd = list(VDOWN_CMD) + [url, cookies or "", "", "--get-duration"]
+        result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', creationflags=CREATE_NO_WINDOW, timeout=15)
+        if result.returncode == 0:
+            raw = result.stdout.strip()
+            # yt-dlp returns seconds for --get-duration (e.g. "2938")
+            try:
+                return float(raw)
+            except ValueError:
+                # Fallback: parse "HH:MM:SS" format
+                parts = raw.split(':')
+                if len(parts) == 3:
+                    return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+                return 0
+    except Exception:
+        pass
+    return 0
+
 def download_video(url, workdir, cookies=None, quick=False, start_time=None, end_time=None, title=None):
     print(f"🎬 Downloading {url}...", flush=True)
     if not os.path.exists(workdir): os.makedirs(workdir)
+    # Skip download if a valid source video already exists in workdir (re-run
+    # of the same URL). Verify by comparing local video duration against the
+    # remote duration reported by yt-dlp, with a 5% tolerance. _hardsub outputs
+    # are never treated as source inputs.
+    if not start_time and not end_time:
+        existing = [f for f in os.listdir(workdir)
+                    if f.endswith(('.mp4', '.mkv', '.webm', '.mov', '.ts'))
+                    and not f.endswith('.part')
+                    and '_hardsub' not in f]
+        existing.sort(key=lambda x: os.path.getsize(os.path.join(workdir, x)), reverse=True)
+        for cand in existing:
+            candidate = os.path.join(workdir, cand)
+            local_dur = get_video_duration(candidate)
+            if local_dur <= 0:
+                continue
+            remote_dur = get_remote_duration(url, cookies)
+            if remote_dur > 0 and abs(local_dur - remote_dur) / remote_dur < 0.05:
+                print(f"✅ Found existing video matching remote duration ({local_dur:.0f}s vs {remote_dur:.0f}s): {os.path.basename(candidate)} (Skipping download)")
+                return candidate
+            elif remote_dur <= 0:
+                # yt-dlp could not fetch duration — fall back to size check
+                # (>10 MB to exclude stubs / partial downloads).
+                if os.path.getsize(candidate) > 10 * 1024 * 1024:
+                    print(f"✅ Found existing video (remote duration unknown, local {local_dur:.0f}s, {os.path.getsize(candidate)/(1024*1024):.0f}MB): {os.path.basename(candidate)} (Skipping download)")
+                    return candidate
     cmd = list(VDOWN_CMD) + [url, cookies or "", workdir]
     if title:
         cmd.extend(["--title", title])
@@ -536,9 +581,9 @@ def download_video(url, workdir, cookies=None, quick=False, start_time=None, end
         process.wait()
         
         # --- Robustness Check with Transparency ---
-        video_files = [f for f in os.listdir(workdir) if f.endswith(('.mp4', '.mkv', '.webm', '.mov', '.ts')) and not f.endswith('.part')]
+        # _hardsub outputs are excluded — they are burn results, not sources.
+        video_files = [f for f in os.listdir(workdir) if f.endswith(('.mp4', '.mkv', '.webm', '.mov', '.ts')) and not f.endswith('.part') and '_hardsub' not in f]
         if video_files:
-            # Pick the largest one and check if it's substantial (>1MB)
             video_files.sort(key=lambda x: os.path.getsize(os.path.join(workdir, x)), reverse=True)
             candidate = os.path.join(workdir, video_files[0])
             if os.path.getsize(candidate) > 1024 * 1024:
@@ -554,7 +599,6 @@ def download_video(url, workdir, cookies=None, quick=False, start_time=None, end
         print(f"❌ Error during download: {e}")
         return None
     return None
-
 def transcribe_video(video_path, workdir, model="large-v2", quick=False):
     print(f"🎙️ Transcribing {os.path.basename(video_path)}...", flush=True)
     cmd = list(TRANSCRIBER_CMD) + [video_path, "--model", model, "--output", workdir, "--no-gui"]
@@ -999,6 +1043,11 @@ def main():
             match = re.search(r'(?:v=|\/|embed\/|shorts\/)([a-zA-Z0-9_-]{11})', args.input)
             if match:
                 video_id = match.group(1)
+        elif "x.com" in args.input or "twitter.com" in args.input:
+            # X/Twitter status ID (numeric, variable length)
+            match = re.search(r'/status/(\d+)', args.input)
+            if match:
+                video_id = match.group(1)
         
         # Check if a folder ending with [{video_id}] already exists locally
         existing_dir = None
@@ -1113,7 +1162,9 @@ def main():
             except Exception as e:
                 print(f"⚠️  Clipping failed: {e}. Using full file instead.")
             
-    if not video_path or not os.path.exists(video_path): return print("❌ Invalid input")
+    if not video_path or not os.path.exists(video_path):
+        print("❌ Invalid input")
+        return 1
 
     vid_dur = get_video_duration(video_path)
     base = os.path.splitext(os.path.basename(video_path))[0]
@@ -1154,7 +1205,9 @@ def main():
     if not src_srt:
         src_srt = transcribe_video(video_path, workdir, args.model, quick=args.quick)
     
-    if not src_srt: return print("❌ Transcription failed")
+    if not src_srt:
+        print("❌ Transcription failed")
+        return 1
 
     # --- Integrated Acoustic Spellcheck Middleware ---
     has_translation = False
@@ -1236,7 +1289,9 @@ def main():
         except Exception as e:
             print(f"⚠️ Translation step error: {e}")
     
-    if not zh_srt: return print("❌ Translation failed")
+    if not zh_srt:
+        print("❌ Translation failed")
+        return 1
 
     # 3. Merge & Burn
     final_srt = zh_srt
@@ -1287,11 +1342,13 @@ def main():
     # --- Single Job Bilibili Upload ---
     if getattr(args, 'bili_upload', False):
         if trigger_bili_upload(workdir):
-            try:
-                with open(os.path.join(workdir, ".bili_uploaded"), "w") as f:
-                    f.write("1")
-            except Exception:
-                pass
+           try:
+               with open(os.path.join(workdir, ".bili_uploaded"), "w") as f:
+                   f.write("1")
+           except Exception:
+               pass
+
+    return 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

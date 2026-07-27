@@ -144,7 +144,7 @@ class AutoSubGUI:
             "input": "", "cookies": "chrome", "output_dir": "",
             "llm_vendor": "Google Vertex AI", "llm_model": "gemini-3-flash-preview",
             "api_key": "", "model": "large-v2", "style": "auto",
-            "trans_mode": "balanced", "quick": False, "quality": "high",
+            "trans_mode": "balanced", "quick": False, "remove_ads": False, "quality": "high",
             "layout": "bilingual", "main_lang": "cn",
             "cn_font": "STKaiti", "en_font": "Calibri",
             "cn_size": "60", "en_size": "36",
@@ -249,6 +249,8 @@ class AutoSubGUI:
 
         self.quick_var = tk.BooleanVar(value=bool(self.settings.get("quick", False)))
         ttk.Checkbutton(f2, text="快捷转录（大模型/网页视频实验性）", variable=self.quick_var).grid(row=4, column=0, columnspan=2, sticky="w", pady=5)
+        self.remove_ads_var = tk.BooleanVar(value=bool(self.settings.get("remove_ads", False)))
+        ttk.Checkbutton(f2, text="剪除广告片段", variable=self.remove_ads_var).grid(row=4, column=2, columnspan=2, sticky="w", pady=5)
 
         # 3. Subtitle Style (Parent: tab2)
         f3 = ttk.LabelFrame(self.tab2, text=" 字幕样式 ", padding=10)
@@ -319,6 +321,7 @@ class AutoSubGUI:
         f6.pack(fill="x", side="bottom")
         ttk.Button(f6, text="退出", command=self.root.destroy).pack(side="left", padx=5)
         ttk.Button(f6, text="保存设置", command=self.save_settings).pack(side="left", padx=5)
+        ttk.Button(f6, text="剪切广告", command=self.cut_ads_now).pack(side="left", padx=5)
         self.stop_btn = ttk.Button(f6, text="中止", state="disabled", command=self.stop_process)
         self.stop_btn.pack(side="right", padx=5)
         self.pause_btn = ttk.Button(f6, text="暂停", state="disabled", command=self.toggle_pause)
@@ -625,51 +628,54 @@ class AutoSubGUI:
                 # --- Parallel post-processing uploads ---
                 # GDrive sync and Bilibili upload only READ the finished hardsub
                 # video, so running them concurrently is safe; launch both at once.
-                # Build list of directories to search for the hardsub video.
-                # The hardsub may be in the input file's directory (when the
-                # video is inside the base output dir) OR in the output
-                # directory (when the pipeline created a new workdir there).
-                # Search all candidate locations.
-                search_dirs = []
-                if not input_video.startswith("http"):
+                from autosub import find_hardsub_video
+                base_out = output_dir or BASE_OUTPUT_DIR
+                # Resolve the job workdir: the folder actually holding the
+                # hardsub output for THIS run. For local inputs the workdir is
+                # the input file's directory when the input lives under base_out.
+                # For HTTP/X inputs the pipeline derives the folder from the video
+                # title (get_video_folder_name) which the GUI does not capture, so
+                # fall back to the most recently modified subfolder of base_out
+                # that contains a hardsub file (the pipeline just finished, so
+                # this run's workdir is newest).
+                workdir = None
+                if not str(input_video).startswith("http"):
                     vid_dir = os.path.dirname(input_video)
-                    if vid_dir and vid_dir not in search_dirs:
-                        search_dirs.append(vid_dir)
-                _base = output_dir or BASE_OUTPUT_DIR
-                if _base not in search_dirs:
-                    search_dirs.append(_base)
-                hardsub_files = []
-                for sd in search_dirs:
-                    self.root.after(0, self.log, f"🔍 在目录中搜索 hardsub 视频: {sd}")
+                    if vid_dir and os.path.isdir(vid_dir):
+                        workdir = vid_dir
+                if workdir is None:
+                    self.root.after(0, self.log, f"🔍 在目录中搜索 hardsub 视频: {base_out}")
+                    candidate_dirs = []
                     try:
-                        for root_dir, _, files in os.walk(sd):
-                            for f in files:
-                                if "hardsub" in f and f.endswith(VIDEO_EXTS):
-                                    fp = os.path.join(root_dir, f)
-                                    if fp not in hardsub_files:
-                                        hardsub_files.append(fp)
-                    except PermissionError:
-                        self.root.after(0, self.log, f"⚠️ 无权限访问目录: {sd}，跳过")
-                if not hardsub_files:
-                    self.root.after(0, self.log, f"⚠️ 未找到任何 hardsub 视频文件 (搜索了 {', '.join(search_dirs)})")
-                # Prefer the hardsub that belongs to THIS job (its name is derived
-                # from the input video). Without this, a newer hardsub from a
-                # different project gets picked up and uploaded by mistake.
-                if hardsub_files:
-                    _in_base = os.path.splitext(os.path.basename(input_video))[0] if not str(input_video).startswith("http") else ""
-                    _preferred = [f for f in hardsub_files if _in_base and _in_base in os.path.basename(f)] if _in_base else []
-                    newest_video = max(_preferred or hardsub_files, key=os.path.getmtime)
-                else:
-                    newest_video = None
-                # Drive sync targets the job workdir (the folder holding the outputs).
-                # If no hardsub was found, skip the sync entirely rather than
-                # syncing the wrong directory (e.g. Desktop).
+                        for item in os.listdir(base_out):
+                            ip = os.path.join(base_out, item)
+                            if os.path.isdir(ip):
+                                candidate_dirs.append(ip)
+                    except OSError:
+                        pass
+                    candidate_dirs.append(base_out)  # flat layout fallback
+                    best = None
+                    best_mtime = -1.0
+                    for cd in candidate_dirs:
+                        hv = find_hardsub_video(cd)
+                        if hv:
+                            try:
+                                mt = os.path.getmtime(hv)
+                            except OSError:
+                                continue
+                            if mt > best_mtime:
+                                best_mtime = mt
+                                best = cd
+                    workdir = best
+                # Locate the hardsub inside the resolved workdir.
+                newest_video = find_hardsub_video(workdir) if workdir else None
                 if newest_video:
-                    sync_dir = os.path.dirname(newest_video)
-                elif not input_video.startswith("http"):
-                    sync_dir = os.path.dirname(input_video) or output_dir or BASE_OUTPUT_DIR
+                    self.root.after(0, self.log, f"📺 定位到本任务 hardsub: {os.path.basename(newest_video)}")
                 else:
-                    sync_dir = None
+                    self.root.after(0, self.log, "⚠️ 未找到本任务对应的 hardsub 视频文件，跳过上传。")
+                # sync_dir is the workdir holding the hardsub; passed to GDrive
+                # sync and as the workdir arg to build_bili_cmd.
+                sync_dir = workdir if newest_video else None
 
                 upload_jobs = []  # (label, cmd) pairs launched concurrently below
                 # 1) Google Drive sync (mirrors autosub.py trigger_sync headless branch)
@@ -731,6 +737,23 @@ class AutoSubGUI:
                         t.start()
                     for t in upload_threads:
                         t.join()
+                # Auto ad-removal after pipeline + uploads (controlled by the checkbox)
+                if getattr(self, "remove_ads_var", None) and self.remove_ads_var.get() and sync_dir:
+                    self.root.after(0, self.log, "📺 主流程完成，开始剪除广告片段...")
+                    _ra_script = os.path.join(CURRENT_DIR, "remove_ads.py")
+                    _ra_model = self.llm_model_var.get() or "glm-5.2"
+                    _ra_prov = self.vendor_map.get(self.vendor_var.get(), "")
+                    _ra_cmd = [py_exe, _ra_script, sync_dir, "--model", _ra_model]
+                    if _ra_prov:
+                        _ra_cmd += ["--provider", _ra_prov]
+                    try:
+                        _ra_proc = subprocess.Popen(_ra_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1)
+                        if _ra_proc.stdout:
+                            for _ra_line in _ra_proc.stdout:
+                                self.root.after(0, self.log, _ra_line.strip())
+                        _ra_proc.wait()
+                    except Exception as _ra_e:
+                        self.root.after(0, self.log, f"❌ 广告剪除异常: {_ra_e}")
                 self.root.after(0, lambda: self.status_label.config(text="✅ 完成！"))
         except Exception as e: self.root.after(0, self.log, f"错误: {str(e)}")
         finally:
@@ -762,6 +785,63 @@ class AutoSubGUI:
             ProcessTree.kill(p.pid)
             self.log("🛑 任务已手动中止。")
 
+    def cut_ads_now(self):
+        """Standalone button: run ad-removal on the project dir from the input field."""
+        v = self.input_var.get().strip()
+        if not v:
+            return messagebox.showwarning("警告", "请在输入源填入项目目录或已完成视频的文件路径")
+        if v.startswith("http"):
+            return messagebox.showwarning("警告", "剪切广告需要本地项目目录。请先处理视频，再对已完成的项目剪切广告。")
+        target = v if os.path.isdir(v) else os.path.dirname(v)
+        if not target or not os.path.isdir(target):
+            return messagebox.showwarning("警告", f"找不到项目目录: {target}")
+        self.run_remove_ads(target)
+
+    def run_remove_ads(self, target):
+        """Launch remove_ads.py in a background thread, streaming logs to tab3."""
+        try:
+            self.notebook.select(self.tab3)
+        except Exception:
+            pass
+        self.progress_var.set(0)
+        self.status_label.config(text="📺 正在识别并剪除广告片段...")
+        self.log_text.config(state="normal"); self.log_text.delete(1.0, tk.END); self.log_text.config(state="disabled")
+        py_exe = sys.executable
+        venv_py = os.path.join(CURRENT_DIR, ".venv", "bin", "python" if sys.platform != "win32" else "python.exe")
+        if os.path.exists(venv_py):
+            py_exe = venv_py
+        script = os.path.join(CURRENT_DIR, "remove_ads.py")
+        model = self.llm_model_var.get() or "glm-5.2"
+        provider_id = self.vendor_map.get(self.vendor_var.get(), "")
+        cmd = [py_exe, script, target, "--model", model]
+        if provider_id:
+            cmd += ["--provider", provider_id]
+        print(f"📺 [GUI] Launching remove_ads: {' '.join(cmd)}")
+        self.start_btn.config(state="disabled")
+        self.stop_btn.config(state="normal")
+        threading.Thread(target=self._remove_ads_worker, args=(cmd,), daemon=True).start()
+
+    def _remove_ads_worker(self, cmd):
+        try:
+            self.current_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', bufsize=1)
+            self.root.after(0, lambda: self.pause_btn.config(state="normal"))
+            if self.current_process.stdout:
+                for line in self.current_process.stdout:
+                    self.root.after(0, self.log, line.strip())
+            ret = self.current_process.wait()
+            self.current_process = None
+            if ret == 0:
+                self.root.after(0, lambda: self.status_label.config(text="✅ 广告剪除完成"))
+            else:
+                self.root.after(0, lambda: self.status_label.config(text="❌ 广告剪除失败"))
+        except Exception as e:
+            self.root.after(0, lambda: self.log(f"❌ 广告剪除异常: {e}"))
+        finally:
+            self.current_process = None
+            self.root.after(0, lambda: self.start_btn.config(state="normal"))
+            self.root.after(0, lambda: self.stop_btn.config(state="disabled"))
+            self.root.after(0, lambda: self.pause_btn.config(state="disabled", text="暂停 (Pause)"))
+
     def save_settings(self):
         data = {
             "llm_vendor": self.vendor_var.get(),
@@ -781,6 +861,7 @@ class AutoSubGUI:
             "bg_box": self.bg_box_var.get(),
             "api_key": self.api_key_var.get(),
             "quick": self.quick_var.get(),
+            "remove_ads": self.remove_ads_var.get(),
             "sync_gdrive": self.sync_gdrive_var.get(),
             "gdrive_enabled": self.gdrive_enabled_var.get(),
             "bili_enabled": self.bili_enabled_var.get(),
