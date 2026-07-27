@@ -31,3 +31,9 @@ Library/Tools/vdown/screenshot_debug.png
 *_backup*.png
 *_backup*.ico
 Library/Tools/autosub/_backup_*
+
+# Runtime artifacts for sibling tools
+Library/Tools/vdown/network_log.txt
+Library/Tools/vdown/screenshot_debug.png
+Library/Tools/vdown/cookies.txt
+*.exe

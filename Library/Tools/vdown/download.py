@@ -331,12 +331,12 @@ def download_video(url, custom_cookies=None, out_dir=None, title=None, start_tim
             # Force 1080p search with fallback
             cmd.extend(["-f", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best"])
         else:
-            # For other platforms (Twitter/X, etc.), choose best compatible format.
-            # --format-sort ensures yt-dlp picks the highest resolution variant
-            # available (some platforms expose multiple progressive streams and
-            # "best" alone may not always prefer by height).
+            # For other platforms (Twitter/X, etc.), cap at 1080p. Without a
+            # height limit yt-dlp picks 2160p (4K) on X, which produces 3GB+
+            # files that routinely stall/timeout mid-download via HLS (see
+            # 2026-07-27 incident: failed at 71.8% on a 2.2GB partial).
             cmd.extend(["--format-sort", "res,vbr,abr"])
-            cmd.extend(["-f", "best/bestvideo+bestaudio"])
+            cmd.extend(["-f", "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best"])
 
         cmd.append(url)
 
