@@ -31,7 +31,7 @@ if getattr(sys, 'frozen', False):
     USER_DATA_DIR = os.path.join(os.path.expanduser("~"), "Documents", "AutoSub")
     ENV_PATH = os.path.join(USER_DATA_DIR, ".env")
 else:
-    TOOLS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    TOOLS_DIR = os.environ.get("AUTOSUB_TOOLS_DIR") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     ENV_PATH = os.path.join(os.path.dirname(os.path.dirname(TOOLS_DIR)), ".env")
 
 sys.path.append(os.path.join(TOOLS_DIR, "subtranslator", "lib"))
@@ -55,9 +55,22 @@ except ImportError as e:
 def load_skill_rules(tool_name):
     """
     Reads the README/SKILL.md of a tool to extract prompting rules.
+    Searches TOOLS_DIR first, then falls back to the parent Library/Tools
+    directory so skills that live outside the autosub package (e.g.
+    humanizer-zh, which is shared across tools) are still found.
     """
     skill_dir = os.path.join(TOOLS_DIR, tool_name)
     readme_path = os.path.join(skill_dir, "README.md")
+    if not os.path.exists(readme_path):
+        # Fallback: look in the shared Library/Tools directory one level up
+        # from the autosub package's own Library/Tools. This catches skills
+        # like humanizer-zh that are installed globally rather than bundled.
+        # TOOLS_DIR = .../autosub/Library/Tools. Go up 3 levels to reach
+        # the shared .../Library/Tools directory where humanizer-zh lives.
+        shared_tools = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(TOOLS_DIR))), tool_name)
+        alt_path = os.path.join(shared_tools, "README.md")
+        if os.path.exists(alt_path):
+            readme_path = alt_path
     content = ""
     if os.path.exists(readme_path):
         with open(readme_path, 'r', encoding='utf-8') as f:
@@ -69,24 +82,44 @@ def _extract_rules(content: str) -> str:
     Drop install/setup/usage/license preamble from a skill README so the real
     rules reach the LLM. Previously the prompt did RULES[:1500], which captured
     only the install instructions (npx / git clone / manual setup) and truncated
-    the actual de-AI / tone rules sitting further down the file. This extractor
-    splits on '## ' headers and drops sections whose titles match install/usage/
-    contributing/license patterns, keeping the rule-bearing sections intact.
+    the actual de-AI / tone rules sitting further down the file.
+
+    This extractor splits on ALL heading levels (##, ###, ####) and drops
+    sections whose titles clearly indicate install/setup/admin preamble.
+    The drop pattern uses full-match semantics on the title to avoid
+    false positives (e.g. '基本使用方法' contains '方法' but is a rule
+    section, while '方法一：通过npx安装' is install preamble).
     """
     if not content:
         return ""
-    drop_re = re.compile(
-        r"项目简介|安装|方法|验证安装|使用|使用场景|文件说明|手动使用|贡献|参考资源|许可|"
-        r"install|setup|usage|contributing|license|reference",
-        re.IGNORECASE,
+    # Match titles that are CLEARLY install/admin sections.
+    # Uses startswith logic so '方法一：...' and '方法三：...' are caught,
+    # but '基本使用方法' (a rules section) is not.
+    # Titles that indicate install/admin/usage preamble to drop.
+    # Uses startswith so "方法一：..." is caught, but "基本使用方法"
+    # (a rules section) is not.
+    drop_prefixes = (
+        "项目简介", "安装", "验证安装", "贡献", "参考资源", "许可",
+        "方法一", "方法二", "方法三",
+        "使用场景", "基礎用法", "基础用法",
+        "install", "setup", "contributing", "license", "reference",
     )
-    parts = re.split(r"\n(?=#{1,2}\s)", content)
+    # Also drop numbered sub-sections that are usage instructions
+    drop_patterns = re.compile(r"^(场景|\d+\.)", re.IGNORECASE)
+    parts = re.split(r"\n(?=#{1,4}\s)", content)
     kept = []
     for part in parts:
-        m = re.match(r"#{1,2}\s+(.+?)(\n|$)", part)
+        m = re.match(r"#{1,4}\s+(.+?)(\n|$)", part)
         title = m.group(1).strip() if m else ""
-        if title and drop_re.search(title):
-            continue
+        if title:
+            title_lower = title.lower()
+            if any(title_lower.startswith(p) for p in drop_prefixes):
+                continue
+            # Drop "使用" and its sub-sections (how to use the tool, not rules)
+            if title_lower.startswith("使用"):
+                continue
+            if drop_patterns.match(title):
+                continue
         kept.append(part)
     cleaned = "\n".join(kept).strip()
     return cleaned or content
@@ -1158,6 +1191,19 @@ def main():
 
             results = client.generate_batch(tasks, target_model, fallback=False, provider=provider_enum)
             sim_done = True
+
+            # If every chunk failed, the LLM provider is down — abort now
+            # instead of silently writing English as "translation".
+            total_failed = sum(1 for r in results if r.get('result') is None)
+            if total_failed == len(results) and results:
+                errors = [r.get('error', 'unknown') for r in results if r.get('error')]
+                err_detail = errors[0][:200] if errors else "No error details captured."
+                print(
+                    f"\n❌ FATAL: All {len(results)} translation chunks failed — "
+                    f"LLM provider is unreachable. Aborting.\n   Error: {err_detail}",
+                    flush=True,
+                )
+                sys.exit(1)
 
             # Sort results by index to ensure correct subtitle order
             results.sort(key=lambda x: x['index'])
