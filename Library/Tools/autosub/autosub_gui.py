@@ -55,6 +55,20 @@ if os.path.basename(_tmp_root).lower() == "library":
     PROJECT_ROOT = os.path.dirname(_tmp_root)
 else:
     PROJECT_ROOT = _tmp_root
+# Guard: the naive "library" heuristic under-walks when the package is
+# nested inside itself (cc/Library/Tools/autosub/Library/Tools/autosub).
+# Walk up until we find the real root, identified by CLAUDE.md or AGENTS.md
+# (the workspace root signature). We cannot use .env or .agents because the
+# autosub package has its own .env and a symlinked .agents.
+_walk = PROJECT_ROOT
+while True:
+    if os.path.exists(os.path.join(_walk, "CLAUDE.md")) or os.path.exists(os.path.join(_walk, "AGENTS.md")):
+        PROJECT_ROOT = _walk
+        break
+    parent = os.path.dirname(_walk)
+    if parent == _walk:
+        break
+    _walk = parent
 BASE_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "Projects")
 # Video extensions that hardsub files can have (matches download_video in autosub.py)
 VIDEO_EXTS = ('.mp4', '.mkv', '.webm', '.mov', '.ts')

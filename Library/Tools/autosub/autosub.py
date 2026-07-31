@@ -136,7 +136,7 @@ if getattr(sys, 'frozen', False):
 else:
     # Developer Mode (d:\cc)
     CURRENT_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-    TOOLS_DIR = os.path.dirname(CURRENT_SCRIPT_DIR)
+    TOOLS_DIR = os.environ.get("AUTOSUB_TOOLS_DIR") or os.path.dirname(CURRENT_SCRIPT_DIR)
     
     # Anchor to true repository root d:\cc
     tmp_root = os.path.dirname(TOOLS_DIR)
@@ -144,7 +144,22 @@ else:
         PROJECT_ROOT = os.path.dirname(tmp_root)
     else:
         PROJECT_ROOT = tmp_root
-        
+
+    # Guard: the naive "library" heuristic under-walks when the package is
+    # nested inside itself (cc/Library/Tools/autosub/Library/Tools/autosub).
+    # Walk up until we find the real root, identified by CLAUDE.md or AGENTS.md
+    # (the workspace root signature). We cannot use .env or .agents because the
+    # autosub package has its own .env and a symlinked .agents.
+    _walk = PROJECT_ROOT
+    while True:
+        if os.path.exists(os.path.join(_walk, "CLAUDE.md")) or os.path.exists(os.path.join(_walk, "AGENTS.md")):
+            PROJECT_ROOT = _walk
+            break
+        parent = os.path.dirname(_walk)
+        if parent == _walk:
+            break
+        _walk = parent
+
     BASE_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "Projects")
     env_path = os.path.join(PROJECT_ROOT, ".env")
     
