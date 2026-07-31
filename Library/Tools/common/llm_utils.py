@@ -164,7 +164,18 @@ class LLMClient:
         current_dir = os.path.dirname(os.path.abspath(__file__))
         postfdry_root = os.path.dirname(current_dir)
         library_dir = os.path.abspath(os.path.join(postfdry_root, "..", ".."))
-        cc_dir = os.path.abspath(os.path.join(library_dir, ".."))
+        # Walk up from library_dir to find the workspace root (the directory
+        # that contains .baoyu-skills/).  The autosub tool can be nested at
+        # varying depths depending on install layout (bundled vs. dev tree),
+        # so a fixed number of ".." segments is unreliable.
+        cc_dir = library_dir
+        for _ in range(8):
+            if os.path.isdir(os.path.join(cc_dir, ".baoyu-skills")):
+                break
+            parent = os.path.dirname(cc_dir)
+            if parent == cc_dir:  # reached filesystem root
+                break
+            cc_dir = parent
         env_cascade = [
             os.path.join(cc_dir, ".baoyu-skills", ".env"),
             os.path.join(cc_dir, ".env"),
@@ -727,13 +738,22 @@ class LLMClient:
     def generate_batch(self, tasks: List[Dict], model_name: str = "gemini-3.1-flash-preview", fallback: bool = False, provider: Optional[LLMProvider] = None) -> List[Dict]:
         results = []
         total = len(tasks)
-        print(f"🚀 Starting batch generation for {total} items (Workers: {self.max_workers}, Model: {model_name}, Fallback: {fallback})...")
+
+        # Adaptive concurrency: some providers (e.g. DashScope/Bailian) have
+        # aggressive burst-rate limits ("Request rate increased too quickly").
+        # Cap workers at 3 for these providers to avoid triggering 429s.
+        effective_workers = self.max_workers
+        burst_sensitive_providers = {LLMProvider.DASHSCOPE}
+        if provider in burst_sensitive_providers:
+            effective_workers = min(self.max_workers, 3)
+
+        print(f"🚀 Starting batch generation for {total} items (Workers: {effective_workers}, Model: {model_name}, Fallback: {fallback})...")
 
         # Per-task timeout: if a single chunk's LLM call hangs, skip it after this many
         # seconds instead of blocking the entire batch indefinitely.
         per_task_timeout = int(os.environ.get("LLM_BATCH_TIMEOUT", "180"))
 
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers)
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers)
         future_to_task = {
             executor.submit(self.generate_content, task['prompt'], model_name, fallback=fallback, provider=provider): task
             for task in tasks
