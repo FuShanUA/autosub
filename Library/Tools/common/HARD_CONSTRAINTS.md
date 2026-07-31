@@ -26,6 +26,8 @@ Rules are auto-classified by the post-processing script based on the replacement
 | Claw-like | `(?i)claw\s*-like` | `Claw-like` | Ensure consistent terminology |
 | Standalone Claw | `(?i)\b(claws?\|clause)\b` | `Claw` | Standardize Karpathy's agent term (cautious) |
 | Ondas ASR Fix | `(?i)\b(Andas\|OnDos)\b` | `Ondas` | Fix ASR typo for Ondas |
+| Spracks ASR Fix | `(?i)\bSpracks\b` | `Servers, racks` | Whisper merges "Servers, racks" into "Spracks" when spoken fast. Restore the two-word phrase. |
+| CompleteStack ASR Fix | `(?i)\bCompleteStack\b` | `complete stack` | Whisper merges "complete stack" into camelCase "CompleteStack", making the LLM treat it as a proper noun. Restore to lowercase two-word phrase so LLM translates it normally. |
 | Cloth→Claude ASR Fix | `(?i)\b(using\|at\|with)\s+cloth\b` | `\1 Claude` | Whisper mishears "Claude" as "cloth" in AI/agent contexts. Only fix after prepositions like using/at/with. |
 
 ## 2. Text Cleanup (Regex)
