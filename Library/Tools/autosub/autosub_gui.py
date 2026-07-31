@@ -156,7 +156,7 @@ class AutoSubGUI:
         # Default fallback values
         defaults = {
             "input": "", "cookies": "chrome", "output_dir": "",
-            "llm_vendor": "Google Vertex AI", "llm_model": "gemini-3-flash-preview",
+            "llm_vendor": "Alibaba (Bailian)", "llm_model": "glm-5.2",
             "api_key": "", "model": "large-v2", "style": "auto",
             "trans_mode": "balanced", "quick": False, "remove_ads": False, "quality": "high",
             "layout": "bilingual", "main_lang": "cn",
