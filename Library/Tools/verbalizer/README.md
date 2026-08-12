@@ -13,6 +13,16 @@ translated prose. Consumed by `smart_translate.py` via `load_skill_rules`.
   Match the speaker's energy — interview/casual = loose; keynote = tighter.
 - Drop filler only when it adds nothing; keep "you know", "I mean" as 对吧/就是说
   when the speaker leans on them for tone.
+- **Filler & Transition Words**: Do not translate spoken fillers and transitions
+  word-by-word. Common fillers (but, so, well, I just, you know, I mean, sorry,
+  look, I can tell you) should be absorbed into the sentence's natural flow:
+  - "I just, sorry. Is that not a contradiction?" -> "不好意思，这不矛盾吗？"
+    (NOT "我只是，抱歉。这不矛盾吗？")
+  - "but I can't use these products because I'm not getting value" -> "但我没法用这些产品，因为拿不到价值"
+    (NOT "但是我没法使用这些产品，因为我得不到价值")
+  - "look, I can tell you" -> "我告诉你" (NOT "听着，我可以告诉你")
+  The Chinese should sound like someone actually speaking, not a word-for-word
+  rendering of each English filler.
 
 ## Persona & Consistency
 - Keep the speaker's stance. A founder pitching is confident and concrete;

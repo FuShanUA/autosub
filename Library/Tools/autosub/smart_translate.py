@@ -138,7 +138,8 @@ ALIGNMENT_CONSTRAINTS = """### STEP 3.8: SYNCHRONIZATION & ALIGNMENT CONSTRAINTS
 - **Cross-Block Coherence**: When the same sentence spans 2-3 blocks, translate it as a coherent unit first, then split the Chinese across blocks at natural break points. Each block\'s Chinese should read as a natural continuation of the previous block, not as an isolated translation. The listener reads subtitles sequentially — each block should feel connected to the one before and after it.
 - **Natural Reorganization Within Sentences**: When a sentence spans multiple blocks, you may redistribute the Chinese across those blocks in a way that reads naturally. The key constraint is: each CN block must still correspond to roughly the same span of meaning as its EN block. Moving words between adjacent blocks for fluency is acceptable; wholesale replacing block N\'s content with block N+1\'s content is not.
 - **Output count rule**: Output exactly the same number of [ID] lines as the input. If the input has 20 blocks, output exactly 20 [ID] lines.
-- **Pronoun & Role Accuracy**: In business/interview contexts, pay close attention to who is paying whom, who is the buyer vs. the seller, and who "they/them/you" refers to. A phrase like "the person you're paying a lot of money to" means the vendor/lab you're paying, NOT your customer. Getting the direction of money/value transfer wrong completely reverses the meaning. Always resolve pronoun references against the conversational context before translating."""
+- **Pronoun & Role Accuracy**: In business/interview contexts, pay close attention to who is paying whom, who is the buyer vs. the seller, and who "they/them/you" refers to. A phrase like "the person you're paying a lot of money to" means the vendor/lab you're paying, NOT your customer. Getting the direction of money/value transfer wrong completely reverses the meaning. Always resolve pronoun references against the conversational context before translating.
+- **Context-Driven Word Sense**: When a word has multiple meanings, choose the sense that fits the speaker's context, not the most common dictionary sense. Examples: "highlighted" in a news segment means "特别指出/重点强调", not "提到"; "pain" for enterprises means "痛苦/困扰", not the business jargon "痛点"; "vulgar" for a blunt business complaint means "直来直去的/不客气的", not "粗俗的"; "world historic figure" means "划时代的人物", not "世界历史意义的人物". Always ask: what does the speaker actually mean here?"""
 
 
 # Retrieve API Keys from environment
@@ -1090,6 +1091,16 @@ def main():
                 # Fallback to general constraints if section not found (or just empty)
                 pass
 
+        # Pre-built glossary for common AI/tech terms that LLMs frequently
+        # mistranslate or leave in English. These are injected before the
+        # dynamic scan so they always reach the LLM.
+        PREBUILT_GLOSSARY = """
+### PRE-BUILT GLOSSARY (always apply)
+- Qwen: 通义千问 (Alibaba's LLM; use "千问" after first mention)
+- telemetry: 运行数据 (NOT "遥测"; in enterprise context means operational/usage data)
+"""
+        knowledge_snippet = (knowledge_snippet or "") + PREBUILT_GLOSSARY
+
         # Dynamic terminology scan: detect domain-specific phrases in the source
         # text and build a per-video glossary. This prevents mistranslations of
         # terms like "Primacy of Winning" -> "赢的首要地位" (too literal).
@@ -1102,7 +1113,7 @@ def main():
             trans_mode_snippet = """
     ### STEP 3.5: TRANSLATION BALANCE (SENSE-FOR-SENSE)
     - **Understand First, Then Compress**: Read 3-5 consecutive blocks as a unit to understand the speaker\'s full thought, then express it in concise, natural Chinese. Do NOT translate word-by-word or block-by-block in isolation — each block\'s Chinese should flow into the next.
-    - **Conciseness**: Keep the output sharp and direct. Drop redundant pronouns, filler words, and unnecessary conjunctions. But never sacrifice clarity for brevity — a 2-character shorter translation that changes the meaning is worse than a longer one that is accurate.
+    - **Fluency Over Brevity**: Control length so subtitles are readable in their on-screen time, but never sacrifice fluency for brevity. A translation that reads naturally and is a few characters longer is better than a telegraphic one that feels robotic. Do not mechanically drop pronouns or conjunctions if removing them makes the Chinese sound abrupt or disconnected.
     - **Example Constraint**: "As Anurag said, this is our fifth DevCon in about 15 months, and momentum is palpable, I think." -> "正如 Anurag 所说，15个月内第五届 DevCon，势头非常迅猛。"
     - **Metaphors & Terms**: Do not expand or explain (e.g., keep "DevCon", do not translate to "开发者大会" if it wastes space). Keep terms like "Gastown", "Ralph Wiggum" as direct translations or original English.
     - **Context Injection**: Strictly forbidden. Do not add any explanatory background.
