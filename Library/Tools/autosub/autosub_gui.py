@@ -342,6 +342,8 @@ class AutoSubGUI:
         self.pause_btn.pack(side="right", padx=5)
         self.start_btn = ttk.Button(f6, text="开始处理", command=self.start_process)
         self.start_btn.pack(side="right", padx=5)
+        self.upload_btn = ttk.Button(f6, text="只上传", command=self.start_upload_only)
+        self.upload_btn.pack(side="right", padx=5)
 
         # Adjust window height dynamically based on the tallest tab content
         self.root.update_idletasks()
@@ -625,8 +627,73 @@ class AutoSubGUI:
         print(f"🚀 [GUI] Launching: {' '.join(cmd)}")
         threading.Thread(target=self.run_worker, args=(cmd, v, self.output_dir_var.get(), gdrive_folder, py_exe), daemon=True).start()
 
+    def start_upload_only(self):
+        """Upload-only mode: skip the pipeline and just upload existing hardsub video."""
+        v = self.input_var.get().strip()
+        if not v: return messagebox.showwarning("警告", "请输入视频 URL 或文件路径（用于定位项目目录）")
+
+        try:
+            self.notebook.select(self.tab3)
+        except Exception:
+            pass
+
+        self.start_btn.config(state="disabled")
+        self.upload_btn.config(state="disabled")
+        self.stop_btn.config(state="normal")
+        self.progress_var.set(0)
+        self.status_label.config(text="📤 正在准备上传...")
+        self.log_text.config(state="normal"); self.log_text.delete(1.0, tk.END); self.log_text.config(state="disabled")
+
+        py_exe = sys.executable
+        venv_py = os.path.join(CURRENT_DIR, ".venv", "bin", "python" if sys.platform != "win32" else "python.exe")
+        if os.path.exists(venv_py):
+            py_exe = venv_py
+
+        cmd = [py_exe, AUTOSUB_SCRIPT, v, "--headless", "--upload-only"]
+        v_id_str = self.vendor_map.get(self.vendor_var.get(), "")
+        if v_id_str:
+            cmd.extend(["--llm-provider", v_id_str])
+        cmd.extend(["--llm-model", self.llm_model_var.get()])
+        gdrive_folder = self.sync_gdrive_var.get().strip() if self.gdrive_enabled_var.get() else ""
+        if gdrive_folder:
+            cmd.extend(["--sync-gdrive", gdrive_folder])
+        if self.bili_enabled_var.get():
+            cmd.append("--bili-upload")
+
+        print(f"📤 [GUI] Upload-only: {' '.join(cmd)}")
+        threading.Thread(target=self.run_worker, args=(cmd, v, self.output_dir_var.get(), gdrive_folder, py_exe), daemon=True).start()
+
     def run_worker(self, cmd, input_video, output_dir, gdrive_folder="", py_exe=None):
         import glob
+        # Open a workflow.log handle in the job's workdir so that post-pipeline
+        # upload logs are persisted alongside the autosub.py output. Without this,
+        # upload failures were invisible — they only showed in the GUI text panel
+        # and vanished when the app was closed.
+        _log_path = None
+        _log_file = None
+        try:
+            if not input_video.startswith("http"):
+                _vid_dir = os.path.dirname(input_video)
+            else:
+                _vid_dir = output_dir or BASE_OUTPUT_DIR
+            if _vid_dir:
+                _log_path = os.path.join(_vid_dir, "workflow.log")
+                _log_file = open(_log_path, "a", encoding="utf-8", errors="replace")
+                _log_file.write("\n--- 后续上传阶段 ---\n")
+                _log_file.flush()
+        except Exception:
+            pass
+
+        def _persist(msg):
+            """Write a message to both the GUI log panel and workflow.log."""
+            self.root.after(0, self.log, msg)
+            if _log_file:
+                try:
+                    _log_file.write(msg + "\n")
+                    _log_file.flush()
+                except Exception:
+                    pass
+
         try:
             self.current_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', bufsize=1)
             self.root.after(0, lambda: self.pause_btn.config(state="normal"))
@@ -702,7 +769,7 @@ class AutoSubGUI:
                         gdrive_cmd = [sync_py, sync_script, "--local-dir", sync_dir, "--remote-id", gdrive_folder, "--credentials", creds_path, "--token", token_path, "--wrap-folder", "--headless"]
                         upload_jobs.append(("☁️ [GDrive]", gdrive_cmd))
                     else:
-                        self.root.after(0, self.log, f"⚠️ 找不到 GDrive 同步脚本或凭证，跳过 Drive 同步: {sync_script}")
+                        _persist(f"⚠️ 找不到 GDrive 同步脚本或凭证，跳过 Drive 同步: {sync_script}")
                 # 2) Bilibili upload (cmd built by the canonical autosub.build_bili_cmd,
                 #    shared with the CLI and batch engine)
                 if self.bili_enabled_var.get():
@@ -723,27 +790,27 @@ class AutoSubGUI:
                         season=self.bili_season_var.get().strip() or None,
                     )
                     if bili_cmd:
-                        self.root.after(0, self.log, f"📺 找到生成的视频: {os.path.basename(bili_cmd[2])}")
+                        _persist(f"📺 找到生成的视频: {os.path.basename(bili_cmd[2])}")
                         upload_jobs.append(("📺 [Bilibili]", bili_cmd))
                     elif newest_video:
-                        self.root.after(0, self.log, "⚠️ Bilibili 上传跳过（未找到上传脚本或虚拟环境）。")
+                        _persist("⚠️ Bilibili 上传跳过（未找到上传脚本或虚拟环境）。")
                     else:
-                        self.root.after(0, self.log, "⚠️ 未找到生成的 hardsub 视频文件，跳过 Bilibili 上传。")
+                        _persist("⚠️ 未找到生成的 hardsub 视频文件，跳过 Bilibili 上传。")
                 # Launch all upload jobs concurrently, wait for all to finish
                 if upload_jobs:
                     self.root.after(0, lambda: self.status_label.config(text="📤 正在上传..."))
                     def run_upload(label, ucmd):
-                        self.root.after(0, self.log, f"{label} 开始上传...")
+                        _persist(f"{label} 开始上传...")
                         try:
                             proc = subprocess.Popen(ucmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', bufsize=1)
                             if proc.stdout:
                                 for line in proc.stdout:
-                                    self.root.after(0, self.log, f"{label} {line.strip()}")
+                                    _persist(f"{label} {line.strip()}")
                             proc.wait()
                             mark = "✅" if proc.returncode == 0 else "⚠️"
-                            self.root.after(0, self.log, f"{label} {mark} 上传结束 (code={proc.returncode})")
+                            _persist(f"{label} {mark} 上传结束 (code={proc.returncode})")
                         except Exception as ue:
-                            self.root.after(0, self.log, f"{label} ❌ 异常: {ue}")
+                            _persist(f"{label} ❌ 异常: {ue}")
                     upload_threads = []
                     for label, ucmd in upload_jobs:
                         t = threading.Thread(target=run_upload, args=(label, ucmd), daemon=True)
@@ -751,6 +818,8 @@ class AutoSubGUI:
                         t.start()
                     for t in upload_threads:
                         t.join()
+                else:
+                    _persist("⚠️ 没有可执行的上传任务。")
                 # Auto ad-removal after pipeline + uploads (controlled by the checkbox)
                 if getattr(self, "remove_ads_var", None) and self.remove_ads_var.get() and sync_dir:
                     self.root.after(0, self.log, "📺 主流程完成，开始剪除广告片段...")
@@ -768,11 +837,18 @@ class AutoSubGUI:
                         _ra_proc.wait()
                     except Exception as _ra_e:
                         self.root.after(0, self.log, f"❌ 广告剪除异常: {_ra_e}")
+                _persist("✅ 全部完成！")
                 self.root.after(0, lambda: self.status_label.config(text="✅ 完成！"))
-        except Exception as e: self.root.after(0, self.log, f"错误: {str(e)}")
+        except Exception as e:
+            _persist(f"错误: {str(e)}")
+            self.root.after(0, self.log, f"错误: {str(e)}")
         finally:
+            if _log_file:
+                try: _log_file.close()
+                except: pass
             self.current_process = None
             self.root.after(0, lambda: self.start_btn.config(state="normal"))
+            self.root.after(0, lambda: self.upload_btn.config(state="normal"))
             self.root.after(0, lambda: self.stop_btn.config(state="disabled"))
             self.root.after(0, lambda: self.pause_btn.config(state="disabled", text="暂停 (Pause)"))
             self.is_paused = False

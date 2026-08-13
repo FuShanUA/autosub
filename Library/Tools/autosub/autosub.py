@@ -1022,6 +1022,7 @@ def main():
     parser.add_argument("--start", help="Start time (e.g. 00:01:30 or 90)")
     parser.add_argument("--end", help="End time (e.g. 00:03:00 or 180)")
     parser.add_argument("--quality", default="high", choices=["standard", "high", "lossless"], help="Burn quality (standard, high, lossless)")
+    parser.add_argument("--upload-only", action="store_true", help="Skip transcription/translation/burn; only upload existing hardsub video to GDrive/Bilibili")
     args = parser.parse_args()
     
     # --- Intelligent Time Parsing ---
@@ -1110,6 +1111,33 @@ def main():
     logger = Logger(log_path)
     sys.stdout = logger
     sys.stderr = logger
+
+    # --- Upload-Only Mode ---
+    # Skip the entire pipeline (transcribe, translate, burn) and jump straight
+    # to GDrive sync / Bilibili upload. Use this when a previous run produced
+    # the hardsub video but the upload step was skipped or failed.
+    if getattr(args, 'upload_only', False):
+        print(f"📤 Upload-only mode: {args.input}", flush=True)
+        hardsub_path = None
+        for f in os.listdir(workdir):
+            if "hardsub" in f and f.endswith(('.mp4', '.mkv', '.webm', '.mov', '.ts')):
+                hardsub_path = os.path.join(workdir, f)
+                break
+        if not hardsub_path:
+            print(f"❌ No hardsub video found in {workdir}", flush=True)
+            return
+        print(f"✅ Found hardsub: {os.path.basename(hardsub_path)}", flush=True)
+        if getattr(args, 'sync_gdrive', None):
+            trigger_sync(workdir, args.sync_gdrive, headless=args.headless)
+        if getattr(args, 'bili_upload', False):
+            if trigger_bili_upload(workdir):
+                try:
+                    with open(os.path.join(workdir, ".bili_uploaded"), "w") as f:
+                        f.write("1")
+                except Exception:
+                    pass
+        print("✅ Upload-only complete!", flush=True)
+        return
 
     print(f"--- 任务启动: {args.input} ---")
     print(f"🏠 [DEV MODE] Root: {PROJECT_ROOT}")
