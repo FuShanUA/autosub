@@ -29,6 +29,8 @@ Rules are auto-classified by the post-processing script based on the replacement
 | Spracks ASR Fix | `(?i)\bSpracks\b` | `Servers, racks` | Whisper merges "Servers, racks" into "Spracks" when spoken fast. Restore the two-word phrase. |
 | CompleteStack ASR Fix | `(?i)\bCompleteStack\b` | `complete stack` | Whisper merges "complete stack" into camelCase "CompleteStack", making the LLM treat it as a proper noun. Restore to lowercase two-word phrase so LLM translates it normally. |
 | Cloth→Claude ASR Fix | `(?i)\b(using\|at\|with)\s+cloth\b` | `\1 Claude` | Whisper mishears "Claude" as "cloth" in AI/agent contexts. Only fix after prepositions like using/at/with. |
+| Quinn→Qwen ASR Fix | `(?i)Alibaba'?s\s+Quinn\b` | `Alibaba's Qwen` | Whisper mishears "Qwen" (Alibaba's LLM) as "Quinn". Fix in Alibaba context to prevent LLM treating it as a person name. |
+| Kimmy→Kimi ASR Fix | `(?i)the\s+Kimmy\b` | `the Kimi` | Whisper mishears "Kimi" (Moonshot AI's LLM) as "Kimmy". Fix after "the" (model reference, not person name). |
 
 ## 2. Text Cleanup (Regex)
 These regex patterns will be executed in order by the post-processing script.
