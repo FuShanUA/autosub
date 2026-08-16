@@ -139,7 +139,7 @@ ALIGNMENT_CONSTRAINTS = """### STEP 3.8: SYNCHRONIZATION & ALIGNMENT CONSTRAINTS
 - **Natural Reorganization Within Sentences**: When a sentence spans multiple blocks, you may redistribute the Chinese across those blocks in a way that reads naturally. The key constraint is: each CN block must still correspond to roughly the same span of meaning as its EN block. Moving words between adjacent blocks for fluency is acceptable; wholesale replacing block N\'s content with block N+1\'s content is not.
 - **Output count rule**: Output exactly the same number of [ID] lines as the input. If the input has 20 blocks, output exactly 20 [ID] lines.
 - **Pronoun & Role Accuracy**: In business/interview contexts, pay close attention to who is paying whom, who is the buyer vs. the seller, and who "they/them/you" refers to. A phrase like "the person you're paying a lot of money to" means the vendor/lab you're paying, NOT your customer. Getting the direction of money/value transfer wrong completely reverses the meaning. Always resolve pronoun references against the conversational context before translating.
-- **Context-Driven Word Sense**: When a word has multiple meanings, choose the sense that fits the speaker's context, not the most common dictionary sense. Examples: "highlighted" in a news segment means "特别指出/重点强调", not "提到"; "pain" for enterprises means "痛苦/困扰", not the business jargon "痛点"; "vulgar" for a blunt business complaint means "直来直去的/不客气的", not "粗俗的"; "world historic figure" means "划时代的人物", not "世界历史意义的人物". Always ask: what does the speaker actually mean here?"""
+- **Context-Driven Word Sense**: When a word has multiple meanings, choose the sense that fits the speaker's context, not the most common dictionary sense. Examples: "highlighted" in a news segment means "特别指出/重点强调", not "提到"; "pain" for enterprises means "痛苦/困扰", not the business jargon "痛点"; "vulgar" for a blunt business complaint means "直来直去的/不客气的", not "粗俗的"; "world historic figure" means "划时代的人物", not "世界历史意义的人物"; "no love" in business context (e.g. "no application layer, no love") means "不买账/免谈/没兴趣", not "不讲情怀". Always ask: what does the speaker actually mean here?"""
 
 
 # Retrieve API Keys from environment
@@ -670,9 +670,22 @@ def scan_source_terminology(blocks: List[Dict], client, model: str, provider=Non
     phrases_str = "\n".join(f"{i+1}. {p}" for i, p in enumerate(top_phrases))
     prompt = f"""You are preparing a terminology glossary for a video subtitle translation.
 Below are key phrases extracted from the source text. For each phrase, provide the
-preferred Simplified Chinese translation. If a phrase is a proper noun (company name,
-person name, product name), keep it in English. For conceptual phrases, provide a
-concise, natural Chinese translation that fits a subtitle context (short, punchy).
+preferred Simplified Chinese translation.
+
+KEEP IN ENGLISH ONLY for:
+- Company names (OpenAI, Palantir, Google)
+- Person names (Elon Musk, Brittany)
+- Product/brand names (ChatGPT, iPhone)
+
+TRANSLATE TO CHINESE for everything else, including:
+- Geographic regions (Silicon Valley -> 硅谷, Wall Street -> 华尔街)
+- Program/initiative names (American Tech Fellowship -> 美国科技奖学金)
+- Pop culture references (Iron Man -> 钢铁侠)
+- Conceptual phrases and terminology
+
+The translation should be concise and natural, fitting a subtitle context.
+If a phrase is genuinely a company/person/product name with no standard Chinese
+translation, keep it in English and output the English term as the translation.
 
 Phrases:
 {phrases_str}
@@ -937,7 +950,13 @@ def clean_untranslated_english(final_blocks: List[Dict], source_lines: Dict[str,
             return []
         words = re.findall(r"\b[a-z]{2,}\b", text)
         # drop filler we explicitly allow-list as low-risk? no — filler is the target.
-        return [w for w in words if w in filler or len(w) >= 3]
+        residual = [w for w in words if w in filler or len(w) >= 3]
+        # Also detect capitalized multi-word English phrases that should have been
+        # translated (e.g. "Silicon Valley", "American Tech Fellowship", "Iron Man").
+        # These are geographic/cultural/program names, not company/person/product names.
+        cap_phrases = re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,4}\b", text)
+        residual.extend(cap_phrases)
+        return residual
 
     flagged = [(i, str(b['index'])) for i, b in enumerate(final_blocks)
                if len(_residual_en(" ".join(b.get('lines', [])))) >= 2]
@@ -953,9 +972,12 @@ def clean_untranslated_english(final_blocks: List[Dict], source_lines: Dict[str,
         if not en_src:
             continue
         clean_prompt = f"""Translate this ONE subtitle fragment into Simplified Chinese.
-The output must be fully Chinese except for proper nouns / acronyms / brand names
-(keep those in English). Do NOT leave common English words like "actually", "you know",
-"so" untranslated. If the fragment is a partial sentence, translate just that part.
+The output must be fully Chinese except for company names, person names, and product
+names (keep those in English). Translate geographic regions (Silicon Valley -> 翍谷,
+Wall Street -> 华尔街), program names (American Tech Fellowship -> 美国科技奖学金),
+and pop culture references (Iron Man -> 钢铁侠) to Chinese. Do NOT leave common English
+words like "actually", "you know", "so" untranslated. If the fragment is a partial
+sentence, translate just that part.
 
 FRAGMENT: {en_src}
 
