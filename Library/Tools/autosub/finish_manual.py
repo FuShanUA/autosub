@@ -4,7 +4,10 @@ import sys
 import re
 
 # Add paths to tools
-TOOLS_DIR = r"/Users/shanfu/cc/Library/Tools"
+if getattr(sys, 'frozen', False):
+    TOOLS_DIR = os.path.join(getattr(sys, '_MEIPASS', ''), "Library", "Tools")
+else:
+    TOOLS_DIR = os.environ.get("AUTOSUB_TOOLS_DIR") or r"/Users/shanfu/cc/Library/Tools"
 srt_path = r"/Users/shanfu/cc/results/We_re_All_Addicted_To/We're All Addicted To Claude Code [qwmmWzPnhog].srt"
 video_path = r"/Users/shanfu/cc/download/We're All Addicted To Claude Code [qwmmWzPnhog].mp4"
 

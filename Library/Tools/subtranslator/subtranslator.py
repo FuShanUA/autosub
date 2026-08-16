@@ -30,7 +30,10 @@ if sys.platform == "win32":
         pass
 
 # Configuration
-TOOLS_DIR = r"/Users/shanfu/cc/Library/Tools"
+if getattr(sys, 'frozen', False):
+    TOOLS_DIR = os.path.join(getattr(sys, '_MEIPASS', ''), "Library", "Tools")
+else:
+    TOOLS_DIR = os.environ.get("AUTOSUB_TOOLS_DIR") or r"/Users/shanfu/cc/Library/Tools"
 sys.path.append(os.path.join(TOOLS_DIR, "common")) # For gemini_utils and srt_utils
 
 HAS_GENAI = False

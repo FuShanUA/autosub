@@ -8,7 +8,10 @@ from typing import List, Dict, Tuple, Optional
 
 # Setup paths for internal imports
 CURRENT_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-TOOLS_DIR = os.path.dirname(CURRENT_SCRIPT_DIR)
+if getattr(sys, 'frozen', False):
+    TOOLS_DIR = os.path.join(getattr(sys, '_MEIPASS', ''), "Library", "Tools")
+else:
+    TOOLS_DIR = os.environ.get("AUTOSUB_TOOLS_DIR") or os.path.dirname(CURRENT_SCRIPT_DIR)
 PROJECT_ROOT = os.path.dirname(TOOLS_DIR)
 
 sys.path.append(os.path.join(TOOLS_DIR, "common"))

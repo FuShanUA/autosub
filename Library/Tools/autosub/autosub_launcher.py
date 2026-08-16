@@ -20,7 +20,11 @@ from rich import box
 
 # Configuration
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-TOOLS_DIR = os.path.dirname(CURRENT_DIR)
+if getattr(sys, 'frozen', False):
+    TOOLS_DIR = os.path.join(getattr(sys, '_MEIPASS', ''), "Library", "Tools")
+else:
+    TOOLS_DIR = os.environ.get("AUTOSUB_TOOLS_DIR") or os.path.dirname(CURRENT_DIR)
+os.environ.setdefault("AUTOSUB_TOOLS_DIR", TOOLS_DIR)
 # --- Robust Tool Discovery ---
 def get_ytdlp_path():
     # 1. Check local tools folder
@@ -377,6 +381,55 @@ def is_project_running(project_path):
         except:
             pass
     return False, None
+
+
+# ---------------------------------------------------------------------------
+# Project Pause Helper
+# ---------------------------------------------------------------------------
+
+def pause_project(project_path):
+    """Mark all tasks in a project's batch_state.json as paused and set global_pause.
+    If the project engine is still running, the _pause_monitor thread inside
+    batch_pro will detect the state change within ~1 second and kill active
+    sub-processes, releasing GPU/CPU resources immediately."""
+    state_path = os.path.join(project_path, "batch_state.json")
+    if not os.path.exists(state_path):
+        return False
+    try:
+        with open(state_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        # Support both nested {"tasks": {...}} and flat {uid: {...}} formats
+        if isinstance(data, dict) and "tasks" in data:
+            tasks = data["tasks"]
+        else:
+            tasks = data
+        if isinstance(tasks, dict):
+            for key, val in tasks.items():
+                if key in ("global_pause", "time", "bili", "gdsync"):
+                    continue
+                if isinstance(val, dict):
+                    val["is_paused"] = True
+        data["global_pause"] = True
+        with open(state_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        console.print(f"[bold red]挂起项目时出错: {e}[/]")
+        return False
+
+
+def has_uncompleted_tasks(project_path):
+    """Check if a project directory has a batch_state.json with uncompleted tasks."""
+    state_path = os.path.join(project_path, "batch_state.json")
+    if not os.path.exists(state_path):
+        return False
+    try:
+        with open(state_path, "r", encoding="utf-8") as f:
+            state_data = json.load(f)
+        return not check_all_completed(state_data)
+    except Exception:
+        return False
+
 
 # ---------------------------------------------------------------------------
 # Model Selection Onboarding
@@ -780,13 +833,34 @@ def main():
             status_suffix = f" [bold green](运行中 🟢 PID {pid})[/]" if is_run else ""
             console.print(f"  [{i}] {name}{status_suffix}")
         
-        # Default option: continue the most recently modified or the single one
-        if len(uncompleted_projects) == 1:
-            proj_name, proj_path, state_data = uncompleted_projects[0]
+        # Build options for all cases
+        choices = [str(i) for i in range(1, len(uncompleted_projects) + 1)] + ["n", "q"]
+        console.print("  [n] 开始全新项目（挂起未完成的项目）")
+        console.print("  [q] 退出")
+        choice = Prompt.ask("\n请选择您要继续的项目或输入操作", choices=choices, default="1")
+        if choice == "q":
+            return
+
+        if choice == "n":
+            # User wants to start a new project. Pause any running projects first.
+            for name, proj_path, _ in uncompleted_projects:
+                is_run, pid = running_projects_status[name]
+                if is_run:
+                    console.print(f"\n⏸️  [bold yellow]正在挂起运行中的项目 [cyan]{name}[/] (PID {pid})...[/]")
+                    if pause_project(proj_path):
+                        console.print(f"✅ [bold green]项目 [cyan]{name}[/] 已挂起，进度已保留，可随时恢复。[/]")
+                        time.sleep(1.5)  # Give _pause_monitor a moment to kill sub-processes
+                    else:
+                        console.print(f"⚠️  [bold red]挂起项目 [cyan]{name}[/] 失败，请手动结束后重试。[/]")
+                        return
+            # Fall through to URL input below
+        else:
+            idx = int(choice) - 1
+            proj_name, proj_path, state_data = uncompleted_projects[idx]
             is_run, pid = running_projects_status[proj_name]
-            
+
             if is_run:
-                console.print(f"\n✨ [bold green]检测到项目 [cyan]{proj_name}[/] 正在后台高速运行 (PID {pid})。[/]")
+                console.print(f"\n✨ [bold green]检测到项目 [cyan]{proj_name}[/] 正在后台运行 (PID {pid})。[/]")
                 console.print("📈 [bold cyan]将自动为您唤醒【只读 Live 看板监控模式】，查看实时进度...[/]")
                 time.sleep(2.0)
                 cmd = [
@@ -797,121 +871,51 @@ def main():
                 ]
                 launch_engine(cmd)
                 return
-            
-            if Confirm.ask(f"\n是否要继续未完成的项目 [bold cyan]{proj_name}[/]?", default=True):
-                quality = "high"
-                cookies_path = None
-                browser = None
-                do_sync = True
-                no_sequence = False
-                
-                if isinstance(state_data, dict):
-                    # Robust state check: support both nested "tasks" structure and flat task list
-                    tasks = state_data.get("tasks", state_data) if "tasks" in state_data else state_data
-                    if tasks:
-                        # Find first actual task entry, skipping metadata keys like "global_pause", "time"
-                        first_task = next((v for k, v in tasks.items() if isinstance(v, dict) and k not in ("global_pause", "time")), None)
-                        quality = first_task.get("quality", "high") if isinstance(first_task, dict) else "high"
-                        cookies_path = state_data.get("cookies", first_task.get("cookies") if isinstance(first_task, dict) else None)
-                        browser = state_data.get("browser", first_task.get("browser") if isinstance(first_task, dict) else None)
-                        do_sync = state_data.get("gdsync", first_task.get("gdsync", True) if isinstance(first_task, dict) else True)
-                        # Auto deduct if previous project skipped sequence prefix
-                        workdir = first_task.get("workdir", "")
-                        if workdir:
-                            folder_name_only = os.path.basename(workdir)
-                            if not re.match(r'^\[\d+\]\s*-', folder_name_only):
-                                no_sequence = True
-                
-                cmd = [
-                    PYTHON_EXE,
-                    BATCH_SCRIPT,
-                    "--output", DEFAULT_OUTPUT_ROOT,
-                    "--sub-dir-name", proj_name,
-                    "--quality", quality
-                ]
-                if no_sequence:
-                    cmd.append("--no-sequence")
-                if cookies_path and os.path.exists(cookies_path):
-                    cmd.extend(["--cookies", cookies_path])
-                elif browser:
-                    cmd.extend(["--cookies-from-browser", browser])
-                do_bili = state_data.get("bili", True)
-                if do_sync:
-                    cmd.append("--gdsync")
-                if do_bili:
-                    cmd.append("--bili-upload")
-                
-                launch_engine(cmd)
-                return
-        else:
-            choices = [str(i) for i in range(1, len(uncompleted_projects) + 1)] + ["n", "q"]
-            console.print("  [n] 开始全新项目")
-            console.print("  [q] 退出")
-            choice = Prompt.ask("\n请选择您要继续的项目或输入操作", choices=choices, default="1")
-            if choice == "q":
-                return
-            elif choice != "n":
-                idx = int(choice) - 1
-                proj_name, proj_path, state_data = uncompleted_projects[idx]
-                is_run, pid = running_projects_status[proj_name]
-                
-                if is_run:
-                    console.print(f"\n✨ [bold green]检测到项目 [cyan]{proj_name}[/] 正在后台运行 (PID {pid})。[/]")
-                    console.print("📈 [bold cyan]将自动为您唤醒【只读 Live 看板监控模式】，查看实时进度...[/]")
-                    time.sleep(2.0)
-                    cmd = [
-                        PYTHON_EXE,
-                        BATCH_SCRIPT,
-                        "--output", DEFAULT_OUTPUT_ROOT,
-                        "--sub-dir-name", proj_name
-                    ]
-                    launch_engine(cmd)
-                    return
-                
-                quality = "high"
-                cookies_path = None
-                browser = None
-                do_sync = True
-                no_sequence = False
-                
-                if isinstance(state_data, dict):
-                    # Robust state check: support both nested "tasks" structure and flat task list
-                    tasks = state_data.get("tasks", state_data) if "tasks" in state_data else state_data
-                    if tasks:
-                        # Find first actual task entry, skipping metadata keys like "global_pause", "time"
-                        first_task = next((v for k, v in tasks.items() if isinstance(v, dict) and k not in ("global_pause", "time")), None)
-                        quality = first_task.get("quality", "high") if isinstance(first_task, dict) else "high"
-                        cookies_path = state_data.get("cookies", first_task.get("cookies") if isinstance(first_task, dict) else None)
-                        browser = state_data.get("browser", first_task.get("browser") if isinstance(first_task, dict) else None)
-                        do_sync = state_data.get("gdsync", first_task.get("gdsync", True) if isinstance(first_task, dict) else True)
-                        # Auto deduct if previous project skipped sequence prefix
-                        workdir = first_task.get("workdir", "")
-                        if workdir:
-                            folder_name_only = os.path.basename(workdir)
-                            if not re.match(r'^\[\d+\]\s*-', folder_name_only):
-                                no_sequence = True
-                
-                cmd = [
-                    PYTHON_EXE,
-                    BATCH_SCRIPT,
-                    "--output", DEFAULT_OUTPUT_ROOT,
-                    "--sub-dir-name", proj_name,
-                    "--quality", quality
-                ]
-                if no_sequence:
-                    cmd.append("--no-sequence")
-                if cookies_path and os.path.exists(cookies_path):
-                    cmd.extend(["--cookies", cookies_path])
-                elif browser:
-                    cmd.extend(["--cookies-from-browser", browser])
-                do_bili = state_data.get("bili", True)
-                if do_sync:
-                    cmd.append("--gdsync")
-                if do_bili:
-                    cmd.append("--bili-upload")
-                
-                launch_engine(cmd)
-                return
+
+            quality = "high"
+            cookies_path = None
+            browser = None
+            do_sync = True
+            no_sequence = False
+
+            if isinstance(state_data, dict):
+                # Robust state check: support both nested "tasks" structure and flat task list
+                tasks = state_data.get("tasks", state_data) if "tasks" in state_data else state_data
+                if tasks:
+                    # Find first actual task entry, skipping metadata keys like "global_pause", "time"
+                    first_task = next((v for k, v in tasks.items() if isinstance(v, dict) and k not in ("global_pause", "time")), None)
+                    quality = first_task.get("quality", "high") if isinstance(first_task, dict) else "high"
+                    cookies_path = state_data.get("cookies", first_task.get("cookies") if isinstance(first_task, dict) else None)
+                    browser = state_data.get("browser", first_task.get("browser") if isinstance(first_task, dict) else None)
+                    do_sync = state_data.get("gdsync", first_task.get("gdsync", True) if isinstance(first_task, dict) else True)
+                    # Auto deduct if previous project skipped sequence prefix
+                    workdir = first_task.get("workdir", "")
+                    if workdir:
+                        folder_name_only = os.path.basename(workdir)
+                        if not re.match(r'^\[\d+\]\s*-', folder_name_only):
+                            no_sequence = True
+
+            cmd = [
+                PYTHON_EXE,
+                BATCH_SCRIPT,
+                "--output", DEFAULT_OUTPUT_ROOT,
+                "--sub-dir-name", proj_name,
+                "--quality", quality
+            ]
+            if no_sequence:
+                cmd.append("--no-sequence")
+            if cookies_path and os.path.exists(cookies_path):
+                cmd.extend(["--cookies", cookies_path])
+            elif browser:
+                cmd.extend(["--cookies-from-browser", browser])
+            do_bili = state_data.get("bili", True)
+            if do_sync:
+                cmd.append("--gdsync")
+            if do_bili:
+                cmd.append("--bili-upload")
+
+            launch_engine(cmd)
+            return
 
     # 1. URL Input
     url_input = ""
@@ -1079,6 +1083,16 @@ def main():
         use_sequence = Confirm.ask("\n是否在视频文件夹前添加序列号 (原频道列表推荐 Yes，个人定制推荐 No)?", default=True)
 
     folder_name = Prompt.ask("\n项目保存文件夹名称", default=clean_title)
+
+    # Check for name collision with existing uncompleted projects
+    new_project_dir = os.path.join(DEFAULT_OUTPUT_ROOT, folder_name)
+    if has_uncompleted_tasks(new_project_dir):
+        console.print(f"\n[bold red]⚠️  警告：文件夹 [cyan]{folder_name}[/] 已存在且包含未完成的任务！[/]")
+        console.print("继续使用同名将触发断点恢复流程（旧的未完成任务状态会被保留并可恢复）。")
+        if not Confirm.ask("确定要使用这个文件夹名称吗？", default=False):
+            console.print("[dim]请重新输入一个不同的文件夹名称。[/]")
+            folder_name = Prompt.ask("\n项目保存文件夹名称", default=clean_title + "_new")
+
     do_sync = Confirm.ask("\n是否同步到 Google Drive?", default=True)
     do_bili = Confirm.ask("\n是否上传到 Bilibili? (分区/标签/简介/合集按视频自动生成)", default=True)
     quality = Prompt.ask("\n选择压制字幕画质 (standard: 标准质量, high: 高清原画, lossless: 无损超清)", choices=["standard", "high", "lossless"], default="high")

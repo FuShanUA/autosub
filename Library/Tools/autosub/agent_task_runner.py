@@ -11,7 +11,7 @@ if getattr(sys, 'frozen', False):
     BUNDLE_DIR = sys._MEIPASS
     TOOLS_DIR = os.path.join(BUNDLE_DIR, "Library", "Tools")
 else:
-    TOOLS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    TOOLS_DIR = os.environ.get("AUTOSUB_TOOLS_DIR") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 sys.path.append(os.path.join(TOOLS_DIR, "subtranslator", "lib"))
 sys.path.append(os.path.join(TOOLS_DIR, "common"))

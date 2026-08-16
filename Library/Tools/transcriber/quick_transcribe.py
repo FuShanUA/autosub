@@ -8,7 +8,10 @@ import subprocess
 from typing import List, Dict
 
 # Setup paths
-TOOLS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if getattr(sys, 'frozen', False):
+    TOOLS_DIR = os.path.join(getattr(sys, '_MEIPASS', ''), "Library", "Tools")
+else:
+    TOOLS_DIR = os.environ.get("AUTOSUB_TOOLS_DIR") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.join(TOOLS_DIR, "common"))
 
 try:

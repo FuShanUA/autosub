@@ -159,7 +159,13 @@ if sys.platform == "win32":
 
 # --- 路径配置 ---
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-TOOLS_DIR = os.path.dirname(CURRENT_DIR)
+if getattr(sys, 'frozen', False):
+    TOOLS_DIR = os.path.join(getattr(sys, '_MEIPASS', ''), "Library", "Tools")
+else:
+    TOOLS_DIR = os.environ.get("AUTOSUB_TOOLS_DIR") or os.path.dirname(CURRENT_DIR)
+# Propagate to child processes (smart_translate, transcriber, etc.) so they
+# resolve TOOLS_DIR the same way instead of relying on __file__ relative paths.
+os.environ.setdefault("AUTOSUB_TOOLS_DIR", TOOLS_DIR)
 _p = CURRENT_DIR
 for _ in range(3): _p = os.path.dirname(_p)
 PROJECT_ROOT = _p if os.path.basename(_p).lower() != "library" else os.path.dirname(_p)
@@ -186,7 +192,13 @@ SMART_TRANSLATE_CMD = [PYTHON_EXE, os.path.join(TOOLS_DIR, "autosub", "smart_tra
 SUBTRANSLATOR_CMD = [PYTHON_EXE, os.path.join(TOOLS_DIR, "subtranslator", "subtranslator.py")]
 SRT2ASS_CMD = [PYTHON_EXE, os.path.join(TOOLS_DIR, "hardsubber", "srt_to_ass.py")]
 BURNSUB_CMD = [PYTHON_EXE, os.path.join(TOOLS_DIR, "hardsubber", "burn_engine.py")]
-SYNC_SCRIPT = os.path.join(PROJECT_ROOT, ".agents", "skills", "google-drive-sync", "scripts", "sync.py")
+# Google Drive sync skill lives under the workspace root (cc), not PROJECT_ROOT
+_find_ws = CURRENT_DIR
+for _ in range(6):
+    if os.path.isdir(os.path.join(_find_ws, ".agents", "skills")):
+        break
+    _find_ws = os.path.dirname(_find_ws)
+SYNC_SCRIPT = os.path.join(_find_ws, ".agents", "skills", "google-drive-sync", "scripts", "sync.py")
 
 # --- 日志配置 ---
 LOG_DIR = os.path.join(DEFAULT_OUTPUT_ROOT, "logs")

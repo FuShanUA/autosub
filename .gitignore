@@ -22,6 +22,10 @@ yt-dlp.exe
 *.exe
 
 # 本地调试与运行时产物
+.DS_Store
+.venv
+.venv_broken_backup/
+Library/Tools/autosub/.venv
 Library/Tools/autosub/.hw_SS.json
 Library/Tools/autosub/*_state.json
 Library/Tools/autosub/gui_crash_report.txt
