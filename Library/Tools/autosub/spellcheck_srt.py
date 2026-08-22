@@ -115,6 +115,9 @@ def load_asr_corrections() -> List[Tuple[str, str]]:
                     pattern = m.group(1).strip()
                     replacement = m.group(2).strip()
                     if pattern and replacement:
+                        # Skip rules that inject CJK into English source text
+                        if re.search(r'[\u4e00-\u9fff]', replacement):
+                            continue
                         corrections.append((pattern, replacement))
         except Exception as e:
             print(f"⚠️ Failed to parse HARD_CONSTRAINTS.md: {e}")

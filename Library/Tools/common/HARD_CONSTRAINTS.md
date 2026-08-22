@@ -15,7 +15,7 @@ Rules are auto-classified by the post-processing script based on the replacement
 
 | Original (Regex or String) | Replacement | Notes |
 | :--- | :--- | :--- |
-| Claude ASR Fix (strong) | `(?i)(?<!in the )\bCloud\b(?!\s*(computing\|services?\|infrastructure\|storage\|platform\|provider\|server\|native\|sync\|migration\|deploym\|cluster\|instance\|bucket))` | `Claude` | ASR frequently mishears "Claude" as "Cloud". Fix unless preceded by "in the" (cloud idiom) or followed by cloud-computing terms. In AI/agent transcripts standalone Cloud is almost always Claude. |
+| Claude ASR Fix (conservative) | `(?i)\bCloud\b(?=\s*(?:3\.5\|Sonnet\|Haiku\|Opus\|Anthropic))` | `Claude` | Only fix when Cloud is directly followed by Claude model names or Anthropic. The previous aggressive negative-lookahead rule caused false positives on "cloud business", "AI cloud", "cloud spend", etc. The LLM spellcheck passes (1-2) already handle standalone Claude detection with full transcript context. |
 | Fix Antrophic Typo | `(?i)Antrophic` | `Anthropic` | Fix typo |
 | Fix Gemini Flash Casing | `(?i)Gemini\s*Flash` | `Gemini Flash` | Ensure consistent casing |
 | FDE Pattern | `(?i)Forward[\s-]*Deployed\s*Engineering\b` | `前线部署模式` | Must come BEFORE FDE Person to avoid substring match; concept/methodology |
@@ -31,6 +31,14 @@ Rules are auto-classified by the post-processing script based on the replacement
 | Cloth→Claude ASR Fix | `(?i)\b(using\|at\|with)\s+cloth\b` | `\1 Claude` | Whisper mishears "Claude" as "cloth" in AI/agent contexts. Only fix after prepositions like using/at/with. |
 | Quinn→Qwen ASR Fix | `(?i)Alibaba'?s\s+Quinn\b` | `Alibaba's Qwen` | Whisper mishears "Qwen" (Alibaba's LLM) as "Quinn". Fix in Alibaba context to prevent LLM treating it as a person name. |
 | Kimmy→Kimi ASR Fix | `(?i)the\s+Kimmy\b` | `the Kimi` | Whisper mishears "Kimi" (Moonshot AI's LLM) as "Kimmy". Fix after "the" (model reference, not person name). |
+| Kimmy K3→Kimi K3 Fix | `(?i)Kimmy\s+K3\b` | `Kimi K3` | Whisper mishears "Kimi" as "Kimmy". K3 is the latest Moonshot model (2025); do NOT downgrade to K2. |
+| Jensen Wang→Huang ASR Fix | `(?i)Jensen\s+Wang\b` | `Jensen Huang` | Whisper mishears "Huang" as "Wang" for NVIDIA CEO Jensen Huang (黄仁勋). Very common ASR error in tech interviews. |
+| Alex Karb→Karp ASR Fix | `(?i)Alex\s+Karb\b` | `Alex Karp` | Whisper mishears "Karp" as "Karb" for Palantir CEO Alex Karp. |
+| Dario Amadei→Amodei ASR Fix | `(?i)Dario\s+Amadei\b` | `Dario Amodei` | Whisper mishears "Amodei" as "Amadei" for Anthropic CEO Dario Amodei. |
+| Jensen Hwang→Huang ASR Fix | `(?i)Jensen\s+Hwang\b` | `Jensen Huang` | Whisper mishears "Huang" as "Hwang" for NVIDIA CEO Jensen Huang. |
+| Anthropics→Anthropic's ASR Fix | `(?i)\bAnthropics\b(?!\s+Fable\b)` | `Anthropic's` | Whisper drops apostrophe from "Anthropic's". Fix unless followed by "Fable" (handled by Fable rule below). |
+| Fable Model Protection | `(?i)Anthropic'?s?\s*(?:的\s*)?寓言` | `Anthropic 的 Fable` | Protect Anthropic's "Fable" model name from being translated to "寓言". |
+| Jensen Huang→黄仁勋 | `(?i)Jensen\s+Huang\b` | `黄仁勋` | NVIDIA CEO is universally known as 黄仁勋 in Chinese media. Translate in all contexts. |
 
 ## 2. Text Cleanup (Regex)
 These regex patterns will be executed in order by the post-processing script.

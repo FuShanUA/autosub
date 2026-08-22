@@ -1,7 +1,6 @@
 {
     "llm_vendor": "Alibaba (Bailian)",
     "llm_model": "glm-5.2",
-    "spellcheck_model": "glm-5.2",
     "model": "large-v2",
     "style": "auto",
     "trans_mode": "balanced",
@@ -17,6 +16,7 @@
     "bg_box": true,
     "api_key": "****************",
     "quick": false,
+    "remove_ads": false,
     "sync_gdrive": "18iAFFSuHQmZlxVN0dri1Gbje9SmpS96f",
     "gdrive_enabled": true,
     "bili_enabled": true,

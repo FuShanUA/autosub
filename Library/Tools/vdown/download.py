@@ -178,7 +178,7 @@ def get_title(url, cookies=None):
         YTDLP_EXE,
         "--get-title",
         "--no-playlist",
-        "--socket-timeout", "8",
+        "--socket-timeout", "30",
         "--quiet",
         "--no-warnings"
     ]
@@ -202,7 +202,7 @@ def get_title(url, cookies=None):
                 encoding='utf-8',
                 errors='replace',
                 creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000) if sys.platform == "win32" else 0,
-                timeout=8
+                timeout=35
             )
             if result.returncode == 0:
                 return result.stdout.strip()
@@ -217,7 +217,7 @@ def get_restricted_name(url, cookies=None):
         "--restrict-filenames",
         "-o", "%(title)s [%(id)s]",
         "--no-playlist",
-        "--socket-timeout", "8",
+        "--socket-timeout", "30",
         "--quiet",
         "--no-warnings"
     ]
@@ -241,7 +241,7 @@ def get_restricted_name(url, cookies=None):
                 encoding='utf-8',
                 errors='replace',
                 creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000) if sys.platform == "win32" else 0,
-                timeout=8
+                timeout=35
             )
             if result.returncode == 0:
                 return result.stdout.strip()
@@ -385,7 +385,12 @@ def download_video(url, custom_cookies=None, out_dir=None, title=None, start_tim
 
                 p = get_progress_from_line(line)
                 if p:
-                    print(f"Progress: {p}%", flush=True)
+                    # Only forward progress that is below 100% to avoid
+                    # yt-dlp fragment-level "100%" lines being mistaken
+                    # for overall download completion. The final 100% is
+                    # set by run_process when the process exits with code 0.
+                    if float(p) < 100.0:
+                        print(f"Progress: {p}%", flush=True)
                 else:
                     # Allow more platforms (twitter, x, etc.) and all error/warning msgs
                     if any(x in line for x in ["[youtube]", "[twitter]", "[x]", "[info]", "ERROR", "WARNING", "[debug]"]):
@@ -409,7 +414,8 @@ def download_video(url, custom_cookies=None, out_dir=None, title=None, start_tim
                         if not line: continue
                         p = get_progress_from_line(line)
                         if p:
-                            print(f"Progress: {p}%", flush=True)
+                            if float(p) < 100.0:
+                                print(f"Progress: {p}%", flush=True)
                         else:
                             if "[youtube]" in line or "[info]" in line or "ERROR" in line or "WARNING" in line:
                                 print(line, flush=True)
@@ -500,6 +506,7 @@ if __name__ == "__main__":
             YTDLP_EXE,
             "--get-duration",
             "--no-playlist",
+            "--socket-timeout", "30",
             "--quiet",
             "--no-warnings"
         ]

@@ -17,6 +17,7 @@ from rich.prompt import Prompt, Confirm
 from rich.table import Table
 from rich.panel import Panel
 from rich import box
+from rich.cells import cell_len
 
 # Configuration
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -123,29 +124,37 @@ def clean_title_text(title, playlist_title=None):
 
     return title
 
+_ZERO_WIDTH_RE = re.compile(
+    r'[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFE00-\uFE0F\u200D\u00AD]'
+)
+
+def sanitize_title(s: str) -> str:
+    """Strip zero-width and formatting characters that break grid alignment."""
+    return _ZERO_WIDTH_RE.sub('', str(s))
+
 def cjk_display_width(s: str) -> int:
-    """Calculate terminal display width of a string.
-    CJK characters (East Asian Wide/Fullwidth) occupy 2 cells, others 1."""
-    width = 0
-    for c in str(s):
-        ea = unicodedata.east_asian_width(c)
-        width += 2 if ea in ('F', 'W') else 1
-    return width
+    """Calculate terminal display width using rich's cell_len.
+    Ensures width calculation matches rich's internal table rendering."""
+    return cell_len(s)
 
 
 def cjk_truncate(s: str, max_width: int, ellipsis: str = '…') -> str:
-    """Truncate a string to fit within max_width terminal display cells."""
-    s = str(s)
-    if cjk_display_width(s) <= max_width:
+    """Truncate a string to fit within max_width terminal display cells.
+    Uses rich's cell_len for width calculation to match table rendering."""
+    s = sanitize_title(str(s))
+    if cell_len(s) <= max_width:
         return s
-    ellipsis_w = cjk_display_width(ellipsis)
+    ellipsis_w = cell_len(ellipsis)
     target = max_width - ellipsis_w
     if target <= 0:
         return ellipsis
     result = []
     w = 0
     for c in s:
-        cw = 2 if unicodedata.east_asian_width(c) in ('F', 'W') else 1
+        cw = cell_len(c)
+        if cw == 0:
+            result.append(c)
+            continue
         if w + cw > target:
             break
         result.append(c)
@@ -1045,9 +1054,10 @@ def main():
     # Print title separately to avoid Rich's CJK title-width bug
     console.print()
     title_content = f"内容预览: {playlist_title}"
+    title_content = sanitize_title(title_content)
     title_display_w = cjk_display_width(title_content)
     pad_left = max(0, (term_w - title_display_w) // 2)
-    console.print(' ' * pad_left + f"[bold cyan]内容预览:[/] {playlist_title}")
+    console.print(' ' * pad_left + f"[bold cyan]内容预览:[/] {sanitize_title(playlist_title)}")
 
     table = Table(
         box=box.SIMPLE_HEAD,

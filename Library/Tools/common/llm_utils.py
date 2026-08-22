@@ -122,6 +122,98 @@ class RateLimiter:
                 self.consecutive_429s = 0
                 self.interval = self.base_interval
 
+
+def _group_dashscope_models(models):
+    """Group DashScope (Bailian) models by sub-brand for display in a Combobox.
+    Returns a flat list with separator rows between groups.
+    Within each group, models are sorted newest-first (version descending).
+    """
+    import re as _re
+
+    # 1. Deduplicate: strip vendor/ prefix, prefer the shorter (no-prefix) form.
+    # Case-insensitive comparison so 'GLM-5.2' and 'glm-5.2' are recognized as the same model.
+    seen = {}  # lower(norm) -> model_id
+    for m in models:
+        norm = m.split('/')[-1] if '/' in m else m
+        key = norm.lower()
+        if key not in seen:
+            seen[key] = m
+        elif '/' in m and '/' not in seen[key]:
+            pass  # keep existing (shorter, no prefix)
+        elif '/' not in m and '/' in seen[key]:
+            seen[key] = m  # replace with shorter form
+    deduped = list(seen.values())
+
+    # 2. Filter out non-chat models and third-party vendor models
+    # (e.g. ZHIPU/GLM-*, vanchin/*, siliconflow/*, xiaomi/*) that require
+    # separate product activation on the Bailian platform.
+    chat = []
+    for m in deduped:
+        low = m.lower()
+        if any(x in low for x in ['embedding', 'vector', 'search', 'text-moderation',
+                                  'whisper', 'dall-e', 'tts', 'asr', 'image',
+                                  'video', 'wan', 'gui', 'sre', 'test', 'ocr',
+                                  'speech', 'audio', 'realtime']):
+            continue
+        # Skip third-party vendor prefixed models (require separate activation
+        # on the Bailian platform, e.g. ZHIPU/GLM-5.3, vanchin/*, siliconflow/*).
+        # After dedup, kimi/ prefixed models are already replaced by their
+        # shorter form, so filtering all / models is safe.
+        if '/' in m:
+            continue
+        chat.append(m)
+
+    # 3. Define brand groups in display order
+    brand_groups = [
+        ('Qwen3.x', lambda m: _re.match(r'^qwen3\.\d', m)),
+        ('Qwen3', lambda m: m.startswith('qwen3-') and not _re.match(r'^qwen3\.\d', m)),
+        ('Qwen2.x', lambda m: _re.match(r'^qwen2\.?\d', m) or _re.match(r'^qwen2-', m)),
+        ('Qwen1.x', lambda m: _re.match(r'^qwen1\.?\d', m)),
+        ('Qwen (legacy)', lambda m: m.startswith('qwen-') and not m.startswith('qwen3')
+                                and not _re.match(r'^qwen[123.]', m)),
+        ('CodeQwen', lambda m: m.startswith('codeqwen')),
+        ('Kimi', lambda m: m.startswith('kimi')),
+        ('DeepSeek', lambda m: m.startswith('deepseek')),
+        ('GLM', lambda m: m.startswith('glm')),
+        ('MiniMax', lambda m: m.lower().startswith('minimax')),
+        ('QwQ', lambda m: m.startswith('qwq')),
+        ('QvQ', lambda m: m.startswith('qvq')),
+        ('Tongyi', lambda m: m.startswith('tongyi')),
+    ]
+
+    def version_sort_key(name):
+        name_low = name.lower()
+        versions = _re.findall(r'\d+(?:\.\d+)?', name_low)
+        v = [float(x) for x in versions] if versions else [0]
+        while len(v) < 3:
+            v.append(0)
+        tier = 1
+        if any(x in name_low for x in ['pro', 'plus', 'max', 'ultra']):
+            tier = 0
+        elif any(x in name_low for x in ['mini', 'lite', 'flash', 'turbo', 'air']):
+            tier = 2
+        return (-v[0], -v[1], -v[2], tier, name_low)
+
+    result = []
+    matched = set()
+    for label, matcher in brand_groups:
+        group = [m for m in chat if matcher(m) and m not in matched]
+        if group:
+            matched.update(group)
+            group.sort(key=version_sort_key)
+            result.append('─── ' + label + ' ───')
+            result.extend(group)
+
+    # Remaining ungrouped (should be minimal after filtering)
+    remaining = [m for m in chat if m not in matched]
+    if remaining:
+        remaining.sort(key=version_sort_key)
+        result.append('─── 其他 ───')
+        result.extend(remaining)
+
+    return result
+
+
 class LLMClient:
     # Same-provider model cascade for Dashscope (Bailian / 百炼).
     # When the primary model fails, try these in order before crossing to other providers.
@@ -303,7 +395,18 @@ class LLMClient:
     def _get_provider(self, model_name: str) -> LLMProvider:
         model_name = model_name.lower()
         if "gpt" in model_name: return LLMProvider.OPENAI
-        if "moonshot" in model_name or "kimi" in model_name: return LLMProvider.MOONSHOT
+        if "moonshot" in model_name: return LLMProvider.MOONSHOT
+        if "kimi" in model_name:
+            # kimi-k3 etc. are available on Bailian (DashScope) as native models.
+            # Route to Moonshot only if the user has a Moonshot key but no DashScope key,
+            # or explicitly selected Moonshot as vendor.
+            active_vendor = os.environ.get("ACTIVE_LLM_VENDOR", "")
+            is_bailian = "alibaba" in active_vendor.lower() or "bailian" in active_vendor.lower()
+            has_dashscope = bool(self.api_keys.get(LLMProvider.DASHSCOPE))
+            has_moonshot = bool(self.api_keys.get(LLMProvider.MOONSHOT))
+            if is_bailian or (has_dashscope and not has_moonshot):
+                return LLMProvider.DASHSCOPE
+            return LLMProvider.MOONSHOT
         if "qwen" in model_name: return LLMProvider.DASHSCOPE
         
         # If user explicitly configured Bailian as active vendor, or Zhipu key is missing, route GLM models to Dashscope
@@ -393,7 +496,7 @@ class LLMClient:
         # long chain-of-thought. For deterministic tasks (e.g. spellcheck) this
         # turns a 19s call into 143s and blows the 90s read timeout.
         _mn = model_name.lower()
-        is_reasoning = any(x in _mn for x in ["o1", "o3", "reasoner", "k2.6", "k2.5", "glm-5", "glm5", "deepseek-v4-pro", "r1"])
+        is_reasoning = any(x in _mn for x in ["o1", "o3", "reasoner", "k2.6", "k2.5", "k3", "kimi-k3", "glm-5", "glm5", "deepseek-v4-pro", "r1"])
         data = {
             "model": model_name,
             "messages": [{"role": "user", "content": content_payload}]
@@ -910,6 +1013,10 @@ class LLMClient:
                 return (brand_group, -version_val[0], -version_val[1], tier, len(name_low), name_low)
 
             models.sort(key=sort_key)
+            # --- Grouped display for multi-brand providers (e.g. DashScope) ---
+            if provider == LLMProvider.DASHSCOPE:
+                models = _group_dashscope_models(models)
+
             return models
         except Exception as e:
             return curated_defaults.get(provider, [])

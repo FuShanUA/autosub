@@ -247,7 +247,11 @@ def extract_vid(url):
     # Support more patterns (YouTube, X, etc.)
     yt_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11}).*', url)
     if yt_match: return yt_match.group(1)
-    x_match = re.search(r'status/(\d+)', url)
+    # X/Twitter: extract status ID as a fallback hint. NOTE: the status ID
+    # in the URL is NOT the same as yt-dlp's video ID (%(id)s). The correct
+    # video ID should come from yt-dlp metadata (entry.get('id')); this
+    # function is only a last-resort fallback when metadata is unavailable.
+    x_match = re.search(r'/status/(\d+)', url)
     if x_match: return x_match.group(1)
     return url.split('/')[-1].split('?')[0]
 
@@ -273,29 +277,37 @@ def clean_title_text(title, playlist_title=None):
 
     return title
 
+_ZERO_WIDTH_RE = re.compile(
+    r'[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFE00-\uFE0F\u200D\u00AD]'
+)
+
+def sanitize_title(s: str) -> str:
+    """Strip zero-width and formatting characters that break grid alignment."""
+    return _ZERO_WIDTH_RE.sub('', str(s))
+
 def cjk_display_width(s: str) -> int:
-    """Calculate terminal display width of a string.
-    CJK characters (East Asian Wide/Fullwidth) occupy 2 cells, others 1."""
-    width = 0
-    for c in str(s):
-        ea = unicodedata.east_asian_width(c)
-        width += 2 if ea in ('F', 'W') else 1
-    return width
+    """Calculate terminal display width using rich's cell_len.
+    Ensures width calculation matches rich's internal table rendering."""
+    return cell_len(s)
 
 
 def cjk_truncate(s: str, max_width: int, ellipsis: str = '...') -> str:
-    """Truncate a string to fit within max_width terminal display cells."""
-    s = str(s)
-    if cjk_display_width(s) <= max_width:
+    """Truncate a string to fit within max_width terminal display cells.
+    Uses rich's cell_len for width calculation to match table rendering."""
+    s = sanitize_title(str(s))
+    if cell_len(s) <= max_width:
         return s
-    ellipsis_w = cjk_display_width(ellipsis)
+    ellipsis_w = cell_len(ellipsis)
     target = max_width - ellipsis_w
     if target <= 0:
         return ellipsis
     result = []
     w = 0
     for c in s:
-        cw = 2 if unicodedata.east_asian_width(c) in ('F', 'W') else 1
+        cw = cell_len(c)
+        if cw == 0:
+            result.append(c)
+            continue
         if w + cw > target:
             break
         result.append(c)
@@ -435,6 +447,11 @@ class ResourceManager:
         self.io_sem = threading.Semaphore(6)   # 下载/读取 (I/O密集)
         self.sync_sem = threading.Semaphore(4) # 同步 (I/O密集)
         self.bili_sem = threading.Semaphore(4) # B站上传 (I/O密集)
+        # Total concurrency limiter: caps how many workers can be actively
+        # running disk_truth / stage logic simultaneously (before stage-specific
+        # semaphores kick in). Prevents thundering-herd on startup when dozens
+        # of tasks all enter the worker loop at once.
+        self.worker_sem = threading.Semaphore(4)
 
         self.lock = threading.Lock()
         self.global_pause = False
@@ -905,6 +922,24 @@ class BatchEngine:
                 out = subprocess.check_output(cmd, creationflags=CREATE_NO_WINDOW, timeout=30).decode('utf-8', errors='ignore').strip()
                 if out and out != "未知":
                     task.duration = out
+
+            # 3. Fetch vid_id (for X/Twitter, the URL status ID != yt-dlp video ID)
+            # This is critical for folder lookup in disk_truth() to work correctly.
+            if not task.vid_id or task.vid_id == "UnknownID":
+                cmd = list(VDOWN_CMD) + [task.url, self.cookie_path, "", "--get-folder-name"]
+                out = subprocess.check_output(cmd, creationflags=CREATE_NO_WINDOW, timeout=40).decode('utf-8', errors='ignore').strip()
+                if out and "Error" not in out:
+                    # Folder name format: "title [vid_id]" — extract the ID
+                    lines = [l.strip() for l in out.splitlines() if l.strip()]
+                    if lines:
+                        folder_name = lines[-1]
+                        if "[" in folder_name and "]" in folder_name:
+                            real_vid_id = folder_name.split("[")[-1].rstrip("]")
+                            if real_vid_id and real_vid_id != task.vid_id:
+                                task.vid_id = real_vid_id
+                                # Update workdir with correct vid_id
+                                task.workdir = self.get_task_workdir(task)
+                                logger.info(f"Task {task.uid} | Fetched real vid_id: {real_vid_id}")
         except Exception as e:
             logger.error(f"Task {task.uid} | fetch_web_metadata error: {e}")
 
@@ -1173,6 +1208,9 @@ class BatchEngine:
                     logger.info(f"Task {task.uid} | {stage} | Process exited due to pause.")
                     return False
 
+                # 清除脏 100% 数据（分片级假 100% 会残留），保留真实部分进度
+                if task.pcts.get(stage, 0.0) >= 100.0:
+                    task.pcts[stage] = 0.0
                 task.status = f"失败 ({stage})"
                 task.error = f"Exit {p.returncode}"
                 last_out = "".join(output_lines[-10:]).strip()
@@ -1205,8 +1243,13 @@ class BatchEngine:
                     while (task.is_paused or self.res.global_pause) and not self.abort:
                         time.sleep(0.5)
 
-                # 2. 自动探测当前该干什么
-                self.disk_truth(task)
+                # Acquire worker_sem to limit concurrent disk_truth + stage execution
+                self.res.worker_sem.acquire()
+                try:
+                    # 2. 自动探测当前该干什么
+                    self.disk_truth(task)
+                finally:
+                    self.res.worker_sem.release()
                 if task.status == "完成": break
 
                 stage = ""
@@ -1216,8 +1259,41 @@ class BatchEngine:
 
                 workdir = task.workdir or ""
                 if "DL" in task.status:
-                    stage = "DL"
                     if workdir: os.makedirs(workdir, exist_ok=True)
+                    stage = "DL"
+                    # 清除脏 100% 数据（分片级假 100% 会残留），但保留真实的部分下载进度
+                    if task.pcts.get("DL", 0.0) >= 100.0:
+                        task.pcts["DL"] = 0.0
+                    # Pre-check: skip download if a valid source video already exists
+                    # in workdir (re-run or resume). Verify by comparing local video
+                    # duration against remote duration with 5% tolerance.
+                    dl_skip = False
+                    if workdir and os.path.exists(workdir):
+                        existing_vids = [f for f in os.listdir(workdir)
+                                         if f.endswith(('.mp4', '.mkv', '.webm', '.mov', '.ts'))
+                                         and not f.endswith('.part')
+                                         and '_hardsub' not in f]
+                        existing_vids.sort(key=lambda x: os.path.getsize(os.path.join(workdir, x)), reverse=True)
+                        for cand in existing_vids:
+                            candidate = os.path.join(workdir, cand)
+                            local_dur = self.get_duration(candidate)
+                            local_sec = parse_duration_to_seconds(local_dur)
+                            if local_sec <= 0:
+                                continue
+                            # Try remote duration; fall back to size check (>10MB)
+                            remote_sec = parse_duration_to_seconds(task.duration) if task.duration and task.duration != "未知" else 0
+                            if remote_sec > 0 and abs(local_sec - remote_sec) / remote_sec < 0.05:
+                                logger.info(f"Task {task.uid} | DL skip: existing video matches duration ({local_sec:.0f}s vs {remote_sec:.0f}s)")
+                                dl_skip = True
+                                break
+                            elif os.path.getsize(candidate) > 10 * 1024 * 1024:
+                                logger.info(f"Task {task.uid} | DL skip: existing video ({local_sec:.0f}s, {os.path.getsize(candidate)/(1024*1024):.0f}MB)")
+                                dl_skip = True
+                                break
+                    if dl_skip:
+                        task.pcts["DL"] = 100.0
+                        task.status = "排队中 (TR)"
+                        continue
                     cmd = list(VDOWN_CMD) + [task.url, self.cookie_path, workdir, "--title", task.title]
                 elif "TR" in task.status:
                     stage = "TR"
@@ -1454,6 +1530,7 @@ class Dashboard:
         # Title bar: separate line above table, padded to full terminal width.
         # Avoids Rich's title-in-border rendering which misaligns with CJK/emoji.
         title_content = f"  {self.engine.playlist_title}  "
+        title_content = sanitize_title(title_content)
         title_w = cjk_display_width(title_content)
         if title_w > term_width:
             title_content = cjk_truncate(title_content, term_width)

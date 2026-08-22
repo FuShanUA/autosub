@@ -232,8 +232,9 @@ class AutoSubGUI:
 
         ttk.Label(f2, text="选择模型:").grid(row=0, column=2, sticky="w", padx=10)
         self.llm_model_var = tk.StringVar(value=str(self.settings.get("llm_model", "")))
-        self.llm_combo = ttk.Combobox(f2, textvariable=self.llm_model_var, width=22)
+        self.llm_combo = ttk.Combobox(f2, textvariable=self.llm_model_var, width=30)
         self.llm_combo.grid(row=0, column=3, sticky="w")
+        self.llm_combo.bind("<<ComboboxSelected>>", self.on_model_select)
         ttk.Button(f2, text="设为默认", width=8, command=self.set_llm_model_default).grid(row=0, column=4, padx=5)
 
         self.api_key_label = ttk.Label(f2, text="API Key:")
@@ -481,6 +482,15 @@ class AutoSubGUI:
         threading.Thread(target=self.fetch_models_async, args=(v_name,), daemon=True).start()
         env_key = self.vendor_env_keys.get(v_name, "GEMINI_API_KEY")
         self.update_key_editor(v_name, env_key)
+
+    def on_model_select(self, event=None):
+        """Prevent selecting separator rows in the model dropdown."""
+        selected = self.llm_model_var.get()
+        if selected.startswith("─"):
+            prev = getattr(self, "_prev_model", "")
+            self.llm_model_var.set(prev)
+        else:
+            self._prev_model = selected
 
     def fetch_models_async(self, v_name):
         try:

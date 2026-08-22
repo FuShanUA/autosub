@@ -440,7 +440,7 @@ def get_video_title(url, cookies=None):
             encoding='utf-8', 
             errors='replace',
             creationflags=CREATE_NO_WINDOW,
-            timeout=10
+            timeout=40
         )
         if result.returncode == 0:
             title = result.stdout.strip()
@@ -463,7 +463,7 @@ def get_video_folder_name(url, cookies=None):
             encoding='utf-8', 
             errors='replace',
             creationflags=CREATE_NO_WINDOW,
-            timeout=10
+            timeout=40
         )
         if result.returncode == 0:
             folder_name = result.stdout.strip()
@@ -531,7 +531,7 @@ def get_remote_duration(url, cookies=None):
     """Fetch video duration (seconds) via yt-dlp --get-duration."""
     try:
         cmd = list(VDOWN_CMD) + [url, cookies or "", "", "--get-duration"]
-        result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', creationflags=CREATE_NO_WINDOW, timeout=15)
+        result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', creationflags=CREATE_NO_WINDOW, timeout=40)
         if result.returncode == 0:
             raw = result.stdout.strip()
             # yt-dlp returns seconds for --get-duration (e.g. "2938")
@@ -1060,7 +1060,12 @@ def main():
             if match:
                 video_id = match.group(1)
         elif "x.com" in args.input or "twitter.com" in args.input:
-            # X/Twitter status ID (numeric, variable length)
+            # X/Twitter status ID (numeric, variable length).
+            # NOTE: This is the TWEET STATUS ID, not the video ID that yt-dlp
+            # uses internally. yt-dlp's %(id)s is the X video ID, which differs
+            # from the status ID in the URL. We use the status ID only as a
+            # first-pass hint for folder lookup; if it fails, we fall through
+            # to yt-dlp --get-folder-name which returns the correct video ID.
             match = re.search(r'/status/(\d+)', args.input)
             if match:
                 video_id = match.group(1)
@@ -1074,12 +1079,25 @@ def main():
                     existing_dir = item_path
                     break
         
+        # For X/Twitter, the status ID from the URL != yt-dlp's video ID.
+        # If the folder lookup failed, try yt-dlp --get-folder-name which
+        # returns the correct video ID. This is slower (~15s for X) but
+        # essential to avoid re-downloading already-completed videos.
+        if not existing_dir and ("x.com" in args.input or "twitter.com" in args.input):
+            print(f"🔍 Folder lookup by status ID failed. Fetching real video ID from yt-dlp (timeout 35s)...", flush=True)
+            real_folder_name = get_video_folder_name(args.input, args.cookies)
+            if real_folder_name:
+                candidate_dir = os.path.join(effective_base_output_dir, real_folder_name)
+                if os.path.exists(candidate_dir) and os.path.isdir(candidate_dir):
+                    existing_dir = candidate_dir
+                    video_id = real_folder_name.split("[")[-1].rstrip("]") if "[" in real_folder_name else video_id
+        
         if existing_dir:
             workdir = existing_dir
             print(f"📁 Found existing Project Folder locally: {os.path.basename(workdir)}")
             title = get_video_title(args.input, args.cookies)
         else:
-            print(f"🔍 Fetching video details (timeout in 10s)...", flush=True)
+            print(f"🔍 Fetching video details (timeout in 35s)...", flush=True)
             folder_name = get_video_folder_name(args.input, args.cookies)
             title = get_video_title(args.input, args.cookies)
             if folder_name:

@@ -1,6 +1,7 @@
 
 yt-dlp
 faster-whisper
+mlx-whisper
 google-generativeai
 python-dotenv
 requests

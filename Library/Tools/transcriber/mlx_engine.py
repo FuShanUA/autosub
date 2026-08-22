@@ -54,11 +54,11 @@ def transcribe_mlx(file_path, model_name="large-v2", initial_prompt=None, clip_t
     kwargs = {
         "path_or_hf_repo": path_or_hf_repo,
         "initial_prompt": initial_prompt,
-       "verbose": True,  # Set verbose to True to print segments to stdout in real-time
-       "word_timestamps": True,
-        # Force language when provided; otherwise mlx-whisper auto-detects.
-        # Auto-detect is unreliable right after VAD trimming (often misfires
-        # to Russian on English speech), so callers should pass it explicitly.
+        "verbose": True,
+        "word_timestamps": True,
+        # NOTE: beam_size is NOT supported by mlx-whisper (Beam search decoder
+        # is not yet implemented). Omitting it avoids the MLX load failure
+        # that previously forced a fallback to the slower CPU engine.
         **({"language": language} if language else {}),
         # --- Anti-hallucination guards (fixes "it's the most" feedback loop) ---
         # Stop the previous window's text from seeding the next one over silence.
