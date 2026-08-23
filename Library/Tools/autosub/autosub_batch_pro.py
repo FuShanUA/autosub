@@ -1031,9 +1031,14 @@ class BatchEngine:
                     hardsub_files = [f for f in files if "_hardsub" in f and f.endswith((".mp4", ".mkv", ".webm"))]
                     if hardsub_files:
                         hardsub_path = os.path.join(task.workdir, hardsub_files[0])
-                        dur_orig = parse_duration_to_seconds(task.duration)
+                        # Prefer the actual video file duration over task.duration
+                        # (which comes from YouTube metadata and may be inaccurate)
+                        orig_vids = [f for f in files if f.endswith((".mp4", ".mkv", ".webm")) and "_hardsub" not in f and not re.search(r'\.f\d+\.', f) and not f.endswith(".part")]
+                        if orig_vids:
+                            dur_orig = parse_duration_to_seconds(self.get_duration(os.path.join(task.workdir, orig_vids[0])))
+                        else:
+                            dur_orig = parse_duration_to_seconds(task.duration)
                         dur_hard = parse_duration_to_seconds(self.get_duration(hardsub_path))
-                        
                         is_complete = False
                         if dur_orig > 0 and dur_hard > 0:
                             if abs(dur_orig - dur_hard) <= 3:

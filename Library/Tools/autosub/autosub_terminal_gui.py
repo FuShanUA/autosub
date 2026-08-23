@@ -240,9 +240,13 @@ class TerminalGUI:
         current_time = time.time()
         has_new_content = False
         
-        while not self.queue.empty():
+        # Process at most a few chunks per tick to avoid starving the Tkinter
+        # mainloop when the engine produces output faster than we can render.
+        chunks_this_tick = 0
+        while not self.queue.empty() and chunks_this_tick < 3:
             text_chunk = self.queue.get_nowait()
             has_new_content = True
+            chunks_this_tick += 1
             
             # Process each character in the chunk
             for char in text_chunk:
@@ -394,6 +398,13 @@ class TerminalGUI:
     
     def _flush_to_display(self, current_time):
         """Copy back-buffer to display and render to Tkinter widget."""
+        # Guard against back_lines growing unbounded in engine mode
+        if self.engine_started and len(self.back_lines) > 200:
+            self.back_lines = self.back_lines[-200:]
+            self.back_styles = self.back_styles[-200:]
+            if self.back_cursor_row >= len(self.back_lines):
+                self.back_cursor_row = len(self.back_lines) - 1
+
         # Clean up trailing unwritten lines in back-buffer
         if self.engine_started and self.written_rows:
             max_row = max(max(self.written_rows), self.back_cursor_row)
