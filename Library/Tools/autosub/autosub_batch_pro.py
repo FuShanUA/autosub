@@ -809,6 +809,17 @@ class BatchEngine:
                     t = SubTask.from_dict(d)
                     self.task_map[t.uid] = t
 
+                    # Marker-file truth: if .synced/.bili_uploaded exist on disk,
+                    # force pcts to 100% regardless of what the state file says.
+                    # This fixes the pcts-vs-reality mismatch after batch_pro restarts.
+                    if t.workdir:
+                        if os.path.exists(os.path.join(t.workdir, ".synced")):
+                            t.pcts["GD"] = 100.0
+                        if os.path.exists(os.path.join(t.workdir, ".bili_uploaded")):
+                            t.pcts["BI"] = 100.0
+                        if os.path.exists(os.path.join(t.workdir, ".burn_complete")):
+                            t.pcts["BR"] = 100.0
+
                     # 彻底自愈：不再解析可能损坏的 status 字符串，而是根据 pcts 数据重新推导
                     current_stage = "DL"
                     for s in ["DL", "TR", "TL", "MR", "BR", "GD", "BI"]:
@@ -1639,7 +1650,8 @@ class Dashboard:
                     Text(disp_status, style=row_style, justify="center")
                 ]
                 for s in active_stages:
-                    row.append(self.make_bar(t.pcts[s], s == active_stage, row_color))
+                    s_active = (s == active_stage) or (0 < t.pcts.get(s, 0.0) < 100.0)
+                    row.append(self.make_bar(t.pcts[s], s_active, row_color))
                 table.add_row(*row)
 
             if not visible_tasks:

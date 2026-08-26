@@ -283,7 +283,7 @@ def build_bili_cmd(workdir, title=None, tid=None, category_name=None, tags=None,
         return None
     if title is None:
         title = build_bili_title(hardsub_path)
-    cmd = [BILI_PYTHON, BILI_SCRIPT, hardsub_path, title]
+    cmd = [BILI_PYTHON, "-u", BILI_SCRIPT, hardsub_path, title]
     if tid:
         cmd.extend(["--tid", str(tid)])
     if category_name:
