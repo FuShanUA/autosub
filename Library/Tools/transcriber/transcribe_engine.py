@@ -375,7 +375,7 @@ def main():
                                                     clip_timestamps=kwargs.get("clip_timestamps"),
                                                     total_duration=total_duration,
                                                     checkpoint_path=checkpoint_path,
-                                                    language=None):
+                                                    language="zh" if has_chinese else None):
                                 segments_collected.append(s)
                         except Exception as e_thread:
                             thread_error.append(e_thread)

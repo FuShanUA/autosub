@@ -34,6 +34,7 @@ class TerminalGUI:
         self.ansi_running = False
         self.ansi_buffer = ""
         self.engine_started = False
+        self._needs_full_flush = False
         
         # Screen buffer for flicker-free double buffering
         self.virtual_lines = [[]]
@@ -122,6 +123,9 @@ class TerminalGUI:
         self.text_area.tag_configure("bold")
         self.text_area.tag_configure("normal", font=self.custom_font)
         
+        # Cache style tag names for fast tag_remove (avoids calling tag_names() per line)
+        self._style_tag_cache = [f"fg_{c}" for c in self.color_map] + [f"fg_{c}_bold" for c in self.color_map] + ["bold"]
+
         # Custom Scrollbar
         scrollbar = tk.Scrollbar(self.root, command=self.text_area.yview, bg="#0B0F19", borderwidth=0, highlightthickness=0)
         scrollbar.grid(row=0, column=1, sticky="ns")
@@ -234,11 +238,123 @@ class TerminalGUI:
             try:
                 self.root.after(100, self.on_close)
             except Exception:
+               pass
+
+    def _process_char(self, char):
+        """Process a single character through the ANSI state machine into back-buffer."""
+        if char == '\x1b':
+            self.ansi_running = True
+            self.ansi_buffer = '\x1b'
+            return
+        elif self.ansi_running:
+            self.ansi_buffer += char
+            if char.isalpha() and char != '[':
+                self.ansi_running = False
+                cmd = char
+                params = [int(x) for x in re.findall(r'\d+', self.ansi_buffer)]
+                val = params[0] if params else 1
+                if cmd in ('H', 'f'):
+                    if self.engine_started:
+                        self._swap_frame()
+                    self.back_cursor_row = 0
+                    self.written_rows.clear()
+                elif cmd == 'J':
+                    self.back_lines = [[]]
+                    self.back_styles = [[]]
+                    self.back_cursor_row = 0
+                    self.written_rows.clear()
+                elif cmd == 'A':
+                    self.back_cursor_row = max(0, self.back_cursor_row - val)
+                elif cmd == 'B':
+                    self.back_cursor_row += val
+                    while self.back_cursor_row >= len(self.back_lines):
+                        self.back_lines.append([])
+                        self.back_styles.append([])
+                elif cmd == 'K':
+                    if 0 <= self.back_cursor_row < len(self.back_lines):
+                        self.back_lines[self.back_cursor_row] = []
+                        self.back_styles[self.back_cursor_row] = []
+                elif cmd == 'm':
+                    if not params or params == [0]:
+                        self.current_style = "normal"
+                        self.current_fg = None
+                        self.current_bold = False
+                    else:
+                        for p in params:
+                            if p == 0:
+                                self.current_fg = None
+                                self.current_bold = False
+                            elif p == 1:
+                                self.current_bold = True
+                            elif p == 22:
+                                self.current_bold = False
+                            elif 30 <= p <= 37:
+                                self.current_fg = str(p)
+                            elif p == 39:
+                                self.current_fg = None
+                            elif 90 <= p <= 97:
+                                self.current_fg = str(p)
+                        if self.current_fg:
+                            if self.current_bold:
+                                self.current_style = f"fg_{self.current_fg}_bold"
+                            else:
+                                self.current_style = f"fg_{self.current_fg}"
+                        elif self.current_bold:
+                            self.current_style = "bold"
+                        else:
+                            self.current_style = "normal"
+                elif cmd == 'h' or cmd == 'l':
+                    pass
+                self.ansi_buffer = ""
+            elif char == '?' or char.isdigit() or char == ';':
                 pass
+            return
+        
+        if char == '\n':
+            self.back_cursor_row += 1
+            while self.back_cursor_row >= len(self.back_lines):
+                self.back_lines.append([])
+                self.back_styles.append([])
+            if len(self.back_lines) > 2000:
+                self.back_lines = self.back_lines[-2000:]
+                self.back_styles = self.back_styles[-2000:]
+                self.back_cursor_row = max(0, self.back_cursor_row - 1)
+        elif char == '\r':
+            if 0 <= self.back_cursor_row < len(self.back_lines):
+                self.back_lines[self.back_cursor_row] = []
+                self.back_styles[self.back_cursor_row] = []
+        else:
+            while self.back_cursor_row >= len(self.back_lines):
+                self.back_lines.append([])
+                self.back_styles.append([])
+            if self.engine_started:
+                if self.back_cursor_row not in self.written_rows:
+                    self.back_lines[self.back_cursor_row] = []
+                    self.back_styles[self.back_cursor_row] = []
+                    self.written_rows.add(self.back_cursor_row)
+            self.back_lines[self.back_cursor_row].append(char)
+            self.back_styles[self.back_cursor_row].append(self.current_style)
 
     def poll_queue(self):
         current_time = time.time()
         has_new_content = False
+        
+        # Skip rendering when window is not visible (minimized or background).
+        # Back-buffer still updates; we flush the latest frame on return.
+        is_visible = self.root.state() == "normal" and self.root.winfo_viewable()
+        if not is_visible:
+            self._needs_full_flush = True
+            while not self.queue.empty():
+                text_chunk = self.queue.get_nowait()
+                for char in text_chunk:
+                    self._process_char(char)
+            self.root.after(100, self.poll_queue)
+            return
+        
+        # Window just became visible again — flush latest frame immediately
+        if self._needs_full_flush:
+            self._needs_full_flush = False
+            self._flush_to_display(current_time)
         
         # Process at most a few chunks per tick to avoid starving the Tkinter
         # mainloop when the engine produces output faster than we can render.
@@ -250,122 +366,7 @@ class TerminalGUI:
             
             # Process each character in the chunk
             for char in text_chunk:
-                # Simple ANSI escape state machine to filter styles/colors on-the-fly
-                if char == '\x1b':
-                    self.ansi_running = True
-                    self.ansi_buffer = '\x1b'
-                    continue
-                elif self.ansi_running:
-                    self.ansi_buffer += char
-                    # Terminate escape sequence on letters (like m, H, J etc.), excluding [
-                    if char.isalpha() and char != '[':
-                        self.ansi_running = False
-                        
-                        cmd = char
-                        params = [int(x) for x in re.findall(r'\d+', self.ansi_buffer)]
-                        val = params[0] if params else 1
-                        
-                        if cmd in ('H', 'f'):
-                            # Cursor Home — this is the FRAME START marker from Rich Live.
-                            # The back-buffer now contains the PREVIOUS complete frame.
-                            if self.engine_started:
-                                # Swap completed frame to display buffer
-                                self._swap_frame()
-                            self.back_cursor_row = 0
-                            self.written_rows.clear()
-                        elif cmd == 'J':
-                            # Clear Screen
-                            self.back_lines = [[]]
-                            self.back_styles = [[]]
-                            self.back_cursor_row = 0
-                            self.written_rows.clear()
-                        elif cmd == 'A':
-                            # Cursor Up
-                            self.back_cursor_row = max(0, self.back_cursor_row - val)
-                        elif cmd == 'B':
-                            # Cursor Down
-                            self.back_cursor_row += val
-                            while self.back_cursor_row >= len(self.back_lines):
-                                self.back_lines.append([])
-                                self.back_styles.append([])
-                        elif cmd == 'K':
-                            # Clear Line
-                            if 0 <= self.back_cursor_row < len(self.back_lines):
-                                self.back_lines[self.back_cursor_row] = []
-                                self.back_styles[self.back_cursor_row] = []
-                        elif cmd == 'm':
-                            # ANSI SGR (Select Graphic Rendition)
-                            if not params or params == [0]:
-                                self.current_style = "normal"
-                                self.current_fg = None
-                                self.current_bold = False
-                            else:
-                                for p in params:
-                                    if p == 0:
-                                        self.current_fg = None
-                                        self.current_bold = False
-                                    elif p == 1:
-                                        self.current_bold = True
-                                    elif p == 22:
-                                        self.current_bold = False
-                                    elif 30 <= p <= 37:
-                                        self.current_fg = str(p)
-                                    elif p == 39:
-                                        self.current_fg = None
-                                    elif 90 <= p <= 97:
-                                        self.current_fg = str(p)
-                                
-                                # Construct style tag name
-                                if self.current_fg:
-                                    if self.current_bold:
-                                        self.current_style = f"fg_{self.current_fg}_bold"
-                                    else:
-                                        self.current_style = f"fg_{self.current_fg}"
-                                elif self.current_bold:
-                                    self.current_style = "bold"
-                                else:
-                                    self.current_style = "normal"
-                        elif cmd == 'h' or cmd == 'l':
-                            # Private mode sequences like ?1049h (alt screen) / ?25l (hide cursor)
-                            # Silently ignore — we handle screen management ourselves
-                            pass
-                        
-                        self.ansi_buffer = ""
-                    elif char == '?' or char.isdigit() or char == ';':
-                        # Part of a private-mode or parameterized sequence — keep buffering
-                        pass
-                    continue
-                
-                # Non-ANSI clean content insertion
-                if char == '\n':
-                    self.back_cursor_row += 1
-                    while self.back_cursor_row >= len(self.back_lines):
-                        self.back_lines.append([])
-                        self.back_styles.append([])
-                    # Keep scrollback limit
-                    if len(self.back_lines) > 2000:
-                        self.back_lines = self.back_lines[-2000:]
-                        self.back_styles = self.back_styles[-2000:]
-                        self.back_cursor_row = max(0, self.back_cursor_row - 1)
-                elif char == '\r':
-                    # Carriage return: reset current line
-                    if 0 <= self.back_cursor_row < len(self.back_lines):
-                        self.back_lines[self.back_cursor_row] = []
-                        self.back_styles[self.back_cursor_row] = []
-                else:
-                    while self.back_cursor_row >= len(self.back_lines):
-                        self.back_lines.append([])
-                        self.back_styles.append([])
-                    
-                    # Overwrite logic when cursor is moved up (e.g. during engine Live updates)
-                    if self.engine_started:
-                        if self.back_cursor_row not in self.written_rows:
-                            self.back_lines[self.back_cursor_row] = []
-                            self.back_styles[self.back_cursor_row] = []
-                            self.written_rows.add(self.back_cursor_row)
-                    
-                    self.back_lines[self.back_cursor_row].append(char)
-                    self.back_styles[self.back_cursor_row].append(self.current_style)
+                self._process_char(char)
         
         if has_new_content:
             self.last_data_time = current_time
@@ -443,7 +444,6 @@ class TerminalGUI:
         # Content Identity Check — skip rendering if nothing changed
         if new_text != current_displayed:
             current_displayed_lines = current_displayed.split("\n")
-            
             if len(self.virtual_lines) == len(current_displayed_lines):
                 # Surgical line-by-line updates for zero flicker
                 self.text_area.config(state="normal")
@@ -451,12 +451,9 @@ class TerminalGUI:
                     line_text = "".join(line_chars)
                     if line_text != current_displayed_lines[y]:
                         self.text_area.replace(f"{y+1}.0", f"{y+2}.0", line_text + "\n")
-                        
-                        # Clean up old style tags on this specific line
-                        for style_tag in list(self.text_area.tag_names()):
-                            if style_tag != "sel":
-                                self.text_area.tag_remove(style_tag, f"{y+1}.0", f"{y+2}.0")
-                        
+                        # Clean up old style tags on this specific line (batch)
+                        for style_tag in self._style_tag_cache:
+                            self.text_area.tag_remove(style_tag, f"{y+1}.0", f"{y+2}.0")
                         # Apply new style tags
                         line_styles = self.virtual_styles[y]
                         segments = get_style_segments(line_styles)
