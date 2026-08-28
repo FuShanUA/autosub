@@ -734,6 +734,11 @@ class AutoSubGUI:
                     vid_dir = os.path.dirname(input_video)
                     if vid_dir and os.path.isdir(vid_dir):
                         workdir = vid_dir
+                # If the local input dir has no hardsub, the pipeline copied the
+                # video to a project folder under base_out and burned there.
+                # Fall through to the subfolder search to find the real workdir.
+                if workdir is not None and not find_hardsub_video(workdir):
+                    workdir = None
                 if workdir is None:
                     self.root.after(0, self.log, f"🔍 在目录中搜索 hardsub 视频: {base_out}")
                     candidate_dirs = []
