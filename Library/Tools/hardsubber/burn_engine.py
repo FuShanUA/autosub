@@ -496,20 +496,45 @@ class BurnProgressApp:
         else:
             vf = f"ass=filename='{escaped_ass_path}'"
 
-        cmd = [
-            FFMPEG_PATH,
-            "-y",
-            "-i", os.path.abspath(self.video_path),
-            "-vf", vf,
-            "-c:a", "copy",
-            "-c:v", encoder_name
-        ]
-        cmd.extend(encoder_opts)
+        # Pipe mode: decode to rawvideo via a first ffmpeg process, then encode
+        # with VideoToolbox via a second. This bypasses the zero-copy decode path
+        # that fails on some sources with malformed SEI NAL units (ffmpeg 8.x bug).
+        use_pipe = getattr(self, "use_pipe_mode", False)
 
-        cmd.extend([
-            "-sn",
-            os.path.abspath(self.output_path)
-        ])
+        if use_pipe:
+            decode_cmd = [
+                FFMPEG_PATH, "-y",
+                "-i", os.path.abspath(self.video_path),
+                "-vf", vf,
+                "-c:v", "rawvideo",
+                "-c:a", "pcm_s16le",
+                "-f", "nut",
+                "-",
+            ]
+            encode_cmd = [
+                FFMPEG_PATH, "-y",
+                "-i", "-",
+                "-c:a", "aac", "-b:a", "128k",
+                "-c:v", encoder_name,
+            ]
+            encode_cmd.extend(encoder_opts)
+            encode_cmd.extend(["-sn", os.path.abspath(self.output_path)])
+            cmd = None  # signal pipe mode
+        else:
+            cmd = [
+                FFMPEG_PATH,
+                "-y",
+                "-i", os.path.abspath(self.video_path),
+                "-vf", vf,
+                "-c:a", "copy",
+                "-c:v", encoder_name
+            ]
+            cmd.extend(encoder_opts)
+
+            cmd.extend([
+                "-sn",
+                os.path.abspath(self.output_path)
+            ])
 
         self.temp_ass_path = temp_ass_path
         status_msg = f"Running {encoder_name}..."
@@ -528,16 +553,42 @@ class BurnProgressApp:
             startupinfo = None
 
         try:
-            self.process = subprocess.Popen(
-                cmd,
-                cwd=work_dir,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding='utf-8',
-                errors='ignore',
-                startupinfo=startupinfo
-            )
+            if cmd is None:
+                # Pipe mode: launch decode and encode processes, connect stdout->stdin
+                import subprocess as sp
+                self._decode_proc = sp.Popen(
+                    decode_cmd,
+                    cwd=work_dir,
+                    stdout=sp.PIPE,
+                    stderr=sp.PIPE,
+                    text=True,
+                    encoding='utf-8',
+                    errors='ignore',
+                )
+                self.process = sp.Popen(
+                    encode_cmd,
+                    cwd=work_dir,
+                    stdin=self._decode_proc.stdout,
+                    stdout=sp.PIPE,
+                    stderr=sp.STDOUT,
+                    text=True,
+                    encoding='utf-8',
+                    errors='ignore',
+                    startupinfo=startupinfo
+                )
+                # Close encode's copy of decode stdout so decode can get EOF
+                self._decode_proc.stdout.close()
+            else:
+                self.process = subprocess.Popen(
+                    cmd,
+                    cwd=work_dir,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding='utf-8',
+                    errors='ignore',
+                    startupinfo=startupinfo
+                )
         except Exception as e:
             self.update_status(f"Launch Error: {e}", "red")
             if hasattr(self, 'temp_ass_path') and os.path.exists(self.temp_ass_path):
@@ -606,8 +657,16 @@ class BurnProgressApp:
                 print(f"⚠️ FFmpeg (Hardware) failed with code {ret_code}. Wait 3s and retrying ({self.retry_count}/{self.max_hw_retries})...")
                 time.sleep(3)
                 self.run_ffmpeg(force_cpu=False) # Retry same hardware
-            elif encoder_name != "libx264" and self.retry_count >= self.max_hw_retries:
-                print("❌ All Hardware retries failed. Falling back to CPU for final attempt...")
+            elif encoder_name != "libx264" and self.retry_count >= self.max_hw_retries and not getattr(self, "use_pipe_mode", False):
+                # Try pipe mode (rawvideo bridge) before giving up on GPU entirely.
+                # This bypasses the zero-copy decode path that fails on some sources.
+                print("❌ All Hardware retries failed. Trying rawvideo pipe mode...")
+                self.use_pipe_mode = True
+                self.retry_count = 0
+                self.run_ffmpeg(force_cpu=False)
+            elif encoder_name != "libx264" and getattr(self, "use_pipe_mode", False):
+                print("❌ Pipe mode also failed. Falling back to CPU for final attempt...")
+                self.use_pipe_mode = False
                 self.run_ffmpeg(force_cpu=True)
             else:
                 self.update_status(f"Error Code: {ret_code}", "red")
