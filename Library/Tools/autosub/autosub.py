@@ -1146,9 +1146,14 @@ def main():
             return
         print(f"✅ Found hardsub: {os.path.basename(hardsub_path)}", flush=True)
         if getattr(args, 'sync_gdrive', None):
-            trigger_sync(workdir, args.sync_gdrive, headless=args.headless)
+            if os.path.exists(os.path.join(workdir, ".synced")):
+                print("☁️  GDrive: already synced (skipping)", flush=True)
+            else:
+                trigger_sync(workdir, args.sync_gdrive, headless=args.headless)
         if getattr(args, 'bili_upload', False):
-            if trigger_bili_upload(workdir):
+            if os.path.exists(os.path.join(workdir, ".bili_uploaded")):
+                print("📱 Bilibili: already uploaded (skipping)", flush=True)
+            elif trigger_bili_upload(workdir):
                 try:
                     with open(os.path.join(workdir, ".bili_uploaded"), "w") as f:
                         f.write("1")

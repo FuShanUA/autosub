@@ -222,7 +222,6 @@ def save_checkpoint(path, segments):
         os.replace(temp_path, path)
     except Exception as e:
         print(f"⚠️ Failed to save checkpoint: {e}")
-
 def main():
     print(f"🚀 Transcriber engine started (PID: {os.getpid()})")
     print(f"Progress: 0.1% (Initializing engine...)", flush=True)
@@ -354,65 +353,11 @@ def main():
         else:
             # --- Transcription Engine Selection ---
             skip_loop_progress = False
-            if HAS_MLX and is_apple_silicon() and (device == "cpu" or device is None):
-                # Apple Silicon + MLX installed
-                try:
-                    print(f"🚀 [MLX Mode] Igniting Apple Silicon GPU...", flush=True)
-                    
-                    import threading
-                    
-                    segments_collected = []
-                    thread_error = []
-                    def worker_func():
-                        try:
-                           # Detect if Chinese characters are in the file path to decide initial prompt language
-                            has_chinese = any('\u4e00' <= char <= '\u9fff' for char in file_path)
-                            prompt = "以下是视频的字幕转录：" if has_chinese else None
-                            
-                            # Iterate the generator fully to populate segments_collected
-                            for s in transcribe_mlx(file_path, model_name=raw_model_name, 
-                                                    initial_prompt=prompt,
-                                                    clip_timestamps=kwargs.get("clip_timestamps"),
-                                                    total_duration=total_duration,
-                                                    checkpoint_path=checkpoint_path,
-                                                    language="zh" if has_chinese else None):
-                                segments_collected.append(s)
-                        except Exception as e_thread:
-                            thread_error.append(e_thread)
-                    
-                    t_mlx = threading.Thread(target=worker_func)
-                    t_mlx.daemon = True
-                    t_mlx.start()
-                    
-                    resumed_pct = 0.0
-                    if total_duration > 0:
-                        resumed_pct = (clip_start / total_duration) * 100.0
-                        
-                    last_pct = round(resumed_pct, 1)
-                    if last_pct <= 0.0:
-                        last_pct = 0.1
-                    
-                    print(f"Progress: {last_pct}% (GPU Processing - Initializing MLX...)", flush=True)
-                    
-                    while t_mlx.is_alive():
-                        time.sleep(1.0)
-                            
-                    if thread_error:
-                        raise thread_error[0]
-                        
-                    segments = segments_collected
-                    info = None
-                    skip_loop_progress = True
-                except Exception as e:
-                    print(f"⚠️  MLX load failed: {e}. Falling back to Standard engine.")
-                    model = WhisperModel(raw_model_name, device=device, compute_type="auto", download_root=best_root)
-                    segments, info = model.transcribe(file_path, **kwargs)
-            else:
-                # Standard Path
-                print(f"Progress: 0.2% (Loading model {raw_model_name} on {device}...)", flush=True)
-                model = WhisperModel(raw_model_name, device=device, compute_type="auto", download_root=best_root)
-                print(f"Progress: 0.5% (Model loaded)", flush=True)
-                segments, info = model.transcribe(file_path, **kwargs)
+            # Standard Path: faster-whisper (CPU)
+            print(f"Progress: 0.2% (Loading model {raw_model_name} on {device}...)", flush=True)
+            model = WhisperModel(raw_model_name, device=device, compute_type="auto", download_root=best_root)
+            print(f"Progress: 0.5% (Model loaded)", flush=True)
+            segments, info = model.transcribe(file_path, **kwargs)
         detected_style = None
 
         for s in segments:

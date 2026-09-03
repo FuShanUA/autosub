@@ -15,7 +15,7 @@ Rules are auto-classified by the post-processing script based on the replacement
 
 | Original (Regex or String) | Replacement | Notes |
 | :--- | :--- | :--- |
-| Claude ASR Fix (conservative) | `(?i)\bCloud\b(?=\s*(?:3\.5\|Sonnet\|Haiku\|Opus\|Anthropic))` | `Claude` | Only fix when Cloud is directly followed by Claude model names or Anthropic. The previous aggressive negative-lookahead rule caused false positives on "cloud business", "AI cloud", "cloud spend", etc. The LLM spellcheck passes (1-2) already handle standalone Claude detection with full transcript context. |
+| Claude ASR Fix (conservative) | `(?i)\bCloud\b(?=\s*(?:3\.5\|Sonnet\|Haiku\|Opus\|Anthropic\|Code\|Force\|Tag\|Desktop\|API\|Pro\|Team\|Enterprise\|is\s+(?:the\|a\|an\|our\|best\|keeping)\|was\|within))` | `Claude` | Fix when Cloud is followed by Claude model names, product names (Code, Force, Tag, Desktop, API), or Anthropic. Also fix common sentence patterns like "Cloud is the best model". Excludes generic cloud computing contexts like "cloud business", "AI cloud", "cloud spend". |
 | Fix Antrophic Typo | `(?i)Antrophic` | `Anthropic` | Fix typo |
 | Fix Gemini Flash Casing | `(?i)Gemini\s*Flash` | `Gemini Flash` | Ensure consistent casing |
 | FDE Pattern | `(?i)Forward[\s-]*Deployed\s*Engineering\b` | `前线部署模式` | Must come BEFORE FDE Person to avoid substring match; concept/methodology |
@@ -39,6 +39,8 @@ Rules are auto-classified by the post-processing script based on the replacement
 | Anthropics→Anthropic's ASR Fix | `(?i)\bAnthropics\b(?!\s+Fable\b)` | `Anthropic's` | Whisper drops apostrophe from "Anthropic's". Fix unless followed by "Fable" (handled by Fable rule below). |
 | Fable Model Protection | `(?i)Anthropic'?s?\s*(?:的\s*)?寓言` | `Anthropic 的 Fable` | Protect Anthropic's "Fable" model name from being translated to "寓言". |
 | Jensen Huang→黄仁勋 | `(?i)Jensen\s+Huang\b` | `黄仁勋` | NVIDIA CEO is universally known as 黄仁勋 in Chinese media. Translate in all contexts. |
+| Enderlin→Anduril ASR Fix | `(?i)\bEnderlin\s+Palmer\b` | `Anduril, Palmer` | Whisper merges "Anduril, Palmer" into "Enderlin Palmer". Fix when Palmer Luckey context exists. |
+| Enderlin Standalone Fix | `(?i)\bEnderlin\b` | `Anduril` | Whisper mishears "Anduril" as "Enderlin" in tech/defense context. |
 
 ## 2. Text Cleanup (Regex)
 These regex patterns will be executed in order by the post-processing script.

@@ -297,14 +297,13 @@ class AutoSubGUI:
         self.bili_tid_var = tk.StringVar(value=str(self.settings.get("bili_tid", "智能识别 (Auto)")))
         bili_partitions = [
             "智能识别 (Auto)",
-            "人工智能-主分区 (1011)",
-            "人工智能-AI学习 (2096)",
-            "人工智能-AI资讯 (2097)",
-            "人工智能-AI杂谈 (2098)",
             "科技-计算机技术 (231)",
+            "科技-软件应用 (230)",
+            "科技-数码 (95)",
             "知识-科学科普 (201)",
-            "知识-职业职场 (209)",
             "知识-财经商业 (207)",
+            "知识-职业职场 (209)",
+            "知识-社科·法律·心理 (124)",
             "影视-AI影像 (259)",
             "音乐-AI音乐 (265)",
             "资讯-热点 (212)",
@@ -772,45 +771,50 @@ class AutoSubGUI:
                 # sync_dir is the workdir holding the hardsub; passed to GDrive
                 # sync and as the workdir arg to build_bili_cmd.
                 sync_dir = workdir if newest_video else None
-
                 upload_jobs = []  # (label, cmd) pairs launched concurrently below
                 # 1) Google Drive sync (mirrors autosub.py trigger_sync headless branch)
                 if gdrive_folder and sync_dir:
-                    sync_script = os.path.join(PROJECT_ROOT, ".agents", "skills", "google-drive-sync", "scripts", "sync.py")
-                    creds_path = os.path.join(PROJECT_ROOT, ".agents", "skills", "google-drive-sync", "credentials.json")
-                    token_path = os.path.join(PROJECT_ROOT, ".agents", "skills", "google-drive-sync", "token.json")
-                    sync_py = py_exe or sys.executable
-                    if os.path.exists(sync_script) and os.path.exists(creds_path):
-                        gdrive_cmd = [sync_py, sync_script, "--local-dir", sync_dir, "--remote-id", gdrive_folder, "--credentials", creds_path, "--token", token_path, "--wrap-folder", "--headless"]
-                        upload_jobs.append(("☁️ [GDrive]", gdrive_cmd))
+                    if os.path.exists(os.path.join(sync_dir, ".synced")):
+                        _persist("☁️ [GDrive] 已上传过 (跳过)")
                     else:
-                        _persist(f"⚠️ 找不到 GDrive 同步脚本或凭证，跳过 Drive 同步: {sync_script}")
+                        sync_script = os.path.join(PROJECT_ROOT, ".agents", "skills", "google-drive-sync", "scripts", "sync.py")
+                        creds_path = os.path.join(PROJECT_ROOT, ".agents", "skills", "google-drive-sync", "credentials.json")
+                        token_path = os.path.join(PROJECT_ROOT, ".agents", "skills", "google-drive-sync", "token.json")
+                        sync_py = py_exe or sys.executable
+                        if os.path.exists(sync_script) and os.path.exists(creds_path):
+                            gdrive_cmd = [sync_py, sync_script, "--local-dir", sync_dir, "--remote-id", gdrive_folder, "--credentials", creds_path, "--token", token_path, "--wrap-folder", "--headless"]
+                            upload_jobs.append(("☁️ [GDrive]", gdrive_cmd))
+                        else:
+                            _persist(f"⚠️ 找不到 GDrive 同步脚本或凭证，跳过 Drive 同步: {sync_script}")
                 # 2) Bilibili upload (cmd built by the canonical autosub.build_bili_cmd,
                 #    shared with the CLI and batch engine)
                 if self.bili_enabled_var.get():
-                    bili_tid_str = self.bili_tid_var.get().strip()
-                    bili_tid = bili_category = None
-                    if bili_tid_str and bili_tid_str != "智能识别 (Auto)":
-                        m = re.search(r'\((\d+)\)', bili_tid_str)
-                        if m:
-                            bili_tid = m.group(1)
-                        else:
-                            bili_category = bili_tid_str
-                    from autosub import build_bili_cmd
-                    bili_cmd = build_bili_cmd(
-                        sync_dir,
-                        tid=bili_tid,
-                        category_name=bili_category,
-                        tags=self.bili_tags_var.get().strip() or None,
-                        season=self.bili_season_var.get().strip() or None,
-                    )
-                    if bili_cmd:
-                        _persist(f"📺 找到生成的视频: {os.path.basename(bili_cmd[2])}")
-                        upload_jobs.append(("📺 [Bilibili]", bili_cmd))
-                    elif newest_video:
-                        _persist("⚠️ Bilibili 上传跳过（未找到上传脚本或虚拟环境）。")
+                    if sync_dir and os.path.exists(os.path.join(sync_dir, ".bili_uploaded")):
+                        _persist("📱 [Bilibili] 已上传过 (跳过)")
                     else:
-                        _persist("⚠️ 未找到生成的 hardsub 视频文件，跳过 Bilibili 上传。")
+                        bili_tid_str = self.bili_tid_var.get().strip()
+                        bili_tid = bili_category = None
+                        if bili_tid_str and bili_tid_str != "智能识别 (Auto)":
+                            m = re.search(r'\((\d+)\)', bili_tid_str)
+                            if m:
+                                bili_tid = m.group(1)
+                            else:
+                                bili_category = bili_tid_str
+                        from autosub import build_bili_cmd
+                        bili_cmd = build_bili_cmd(
+                            sync_dir,
+                            tid=bili_tid,
+                            category_name=bili_category,
+                            tags=self.bili_tags_var.get().strip() or None,
+                            season=self.bili_season_var.get().strip() or None,
+                        )
+                        if bili_cmd:
+                            _persist(f"📱 找到生成的视频: {os.path.basename(bili_cmd[2])}")
+                            upload_jobs.append(("📱 [Bilibili]", bili_cmd))
+                        elif newest_video:
+                            _persist("⚠️ Bilibili 上传跳过（未找到上传脚本或虚拟环境）。")
+                        else:
+                            _persist("⚠️ 未找到生成的 hardsub 视频文件，跳过 Bilibili 上传。")
                 # Launch all upload jobs concurrently, wait for all to finish
                 if upload_jobs:
                     self.root.after(0, lambda: self.status_label.config(text="📤 正在上传..."))
@@ -837,7 +841,7 @@ class AutoSubGUI:
                     _persist("⚠️ 没有可执行的上传任务。")
                 # Auto ad-removal after pipeline + uploads (controlled by the checkbox)
                 if getattr(self, "remove_ads_var", None) and self.remove_ads_var.get() and sync_dir:
-                    self.root.after(0, self.log, "📺 主流程完成，开始剪除广告片段...")
+                    self.root.after(0, self.log, "📱 主流程完成，开始剪除广告片段...")
                     _ra_script = os.path.join(CURRENT_DIR, "remove_ads.py")
                     _ra_model = self.llm_model_var.get() or "glm-5.2"
                     _ra_prov = self.vendor_map.get(self.vendor_var.get(), "")
@@ -869,90 +873,43 @@ class AutoSubGUI:
             self.is_paused = False
 
     def toggle_pause(self):
-        p = self.current_process
-        if not p: return
-        if not hasattr(self, "is_paused"): self.is_paused = False
-
+        if not self.current_process:
+            return
         if self.is_paused:
-            ProcessTree.resume(p.pid)
             self.is_paused = False
-            self.pause_btn.config(text="暂停 (Pause)")
-            self.log("▶️ 任务已继续...")
+            self.root.after(0, lambda: self.pause_btn.config(text="暂停 (Pause)"))
+            try:
+                ProcessTree.resume(self.current_process.pid)
+            except Exception:
+                pass
         else:
-            ProcessTree.suspend(p.pid)
             self.is_paused = True
-            self.pause_btn.config(text="继续 (Resume)")
-            self.log("⏸️ 任务已暂停...")
+            self.root.after(0, lambda: self.pause_btn.config(text="继续 (Resume)"))
+            try:
+                ProcessTree.suspend(self.current_process.pid)
+            except Exception:
+                pass
 
     def stop_process(self):
-        p = self.current_process
-        if p and messagebox.askyesno("中止", "确定停止当前任务及其所有关联进程？"):
-            ProcessTree.kill(p.pid)
-            self.log("🛑 任务已手动中止。")
-
-    def cut_ads_now(self):
-        """Standalone button: run ad-removal on the project dir from the input field."""
-        v = self.input_var.get().strip()
-        if not v:
-            return messagebox.showwarning("警告", "请在输入源填入项目目录或已完成视频的文件路径")
-        if v.startswith("http"):
-            return messagebox.showwarning("警告", "剪切广告需要本地项目目录。请先处理视频，再对已完成的项目剪切广告。")
-        target = v if os.path.isdir(v) else os.path.dirname(v)
-        if not target or not os.path.isdir(target):
-            return messagebox.showwarning("警告", f"找不到项目目录: {target}")
-        self.run_remove_ads(target)
-
-    def run_remove_ads(self, target):
-        """Launch remove_ads.py in a background thread, streaming logs to tab3."""
-        try:
-            self.notebook.select(self.tab3)
-        except Exception:
-            pass
-        self.progress_var.set(0)
-        self.status_label.config(text="📺 正在识别并剪除广告片段...")
-        self.log_text.config(state="normal"); self.log_text.delete(1.0, tk.END); self.log_text.config(state="disabled")
-        py_exe = sys.executable
-        venv_py = os.path.join(CURRENT_DIR, ".venv", "bin", "python" if sys.platform != "win32" else "python.exe")
-        if os.path.exists(venv_py):
-            py_exe = venv_py
-        script = os.path.join(CURRENT_DIR, "remove_ads.py")
-        model = self.llm_model_var.get() or "glm-5.2"
-        provider_id = self.vendor_map.get(self.vendor_var.get(), "")
-        cmd = [py_exe, script, target, "--model", model]
-        if provider_id:
-            cmd += ["--provider", provider_id]
-        print(f"📺 [GUI] Launching remove_ads: {' '.join(cmd)}")
-        self.start_btn.config(state="disabled")
-        self.stop_btn.config(state="normal")
-        threading.Thread(target=self._remove_ads_worker, args=(cmd,), daemon=True).start()
-
-    def _remove_ads_worker(self, cmd):
-        try:
-            self.current_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', bufsize=1)
-            self.root.after(0, lambda: self.pause_btn.config(state="normal"))
-            if self.current_process.stdout:
-                for line in self.current_process.stdout:
-                    self.root.after(0, self.log, line.strip())
-            ret = self.current_process.wait()
+        if self.current_process and self.current_process.poll() is None:
+            try:
+                ProcessTree.kill(self.current_process.pid)
+            except Exception:
+                pass
             self.current_process = None
-            if ret == 0:
-                self.root.after(0, lambda: self.status_label.config(text="✅ 广告剪除完成"))
-            else:
-                self.root.after(0, lambda: self.status_label.config(text="❌ 广告剪除失败"))
-        except Exception as e:
-            self.root.after(0, lambda: self.log(f"❌ 广告剪除异常: {e}"))
-        finally:
-            self.current_process = None
-            self.root.after(0, lambda: self.start_btn.config(state="normal"))
-            self.root.after(0, lambda: self.stop_btn.config(state="disabled"))
-            self.root.after(0, lambda: self.pause_btn.config(state="disabled", text="暂停 (Pause)"))
+        self.root.after(0, lambda: self.status_label.config(text="已停止"))
+        self.root.after(0, lambda: self.start_btn.config(state="normal"))
+        self.root.after(0, lambda: self.upload_btn.config(state="normal"))
+        self.root.after(0, lambda: self.stop_btn.config(state="disabled"))
+        self.root.after(0, lambda: self.pause_btn.config(state="disabled", text="暂停 (Pause)"))
+        self.is_paused = False
 
     def save_settings(self):
         data = {
-            "llm_vendor": self.vendor_var.get(),
+            "input": self.input_var.get(),
+            "output_dir": self.output_dir_var.get(),
+            "vendor": self.vendor_var.get(),
             "llm_model": self.llm_model_var.get(),
-            "model": self.whisper_var.get(),
-            "style": self.style_var.get(),
             "trans_mode": self.trans_mode_var.get(),
             "quality": self.quality_var.get(),
             "layout": self.layout_var.get(),
@@ -966,13 +923,8 @@ class AutoSubGUI:
             "bg_box": self.bg_box_var.get(),
             "api_key": self.api_key_var.get(),
             "quick": self.quick_var.get(),
-            "remove_ads": self.remove_ads_var.get(),
             "sync_gdrive": self.sync_gdrive_var.get(),
             "gdrive_enabled": self.gdrive_enabled_var.get(),
-            "bili_enabled": self.bili_enabled_var.get(),
-            "bili_tid": self.bili_tid_var.get(),
-            # bili_tags intentionally not persisted - dynamically generated per upload
-            "bili_season": self.bili_season_var.get(),
             "vendor_default_models": self.vendor_default_models
         }
         try:

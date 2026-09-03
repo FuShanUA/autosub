@@ -13,6 +13,10 @@ These specific strings will be replaced globally. Case-insensitive matching is p
 | Fix Antrophic Typo | `(?i)Antrophic` | `Anthropic` | Fix typo |
 | Fix Gemini Flash Casing | `(?i)Gemini\s*Flash` | `Gemini Flash` | Ensure consistent casing |
 
+| Fix Andrew to Anduril | `(?i)\bAndrew\b` | `Anduril` | ASR mishears "Anduril" as "Andrew" |
+| Fix Pot of Jazz to Pot of Jake | `(?i)Pot of Jazz` | `Pot of Jake` | ASR mishears "Jake" as "Jazz" |
+| Fix Philippi ad to Philippic | `(?i)Philippi ad` | `Philippic` | ASR mishears "Philippic" as "Philippi ad" |
+
 ## 2. Text Cleanup (Regex)
 These regex patterns will be executed in order.
 
