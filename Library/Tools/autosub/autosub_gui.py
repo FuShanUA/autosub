@@ -904,6 +904,64 @@ class AutoSubGUI:
         self.root.after(0, lambda: self.pause_btn.config(state="disabled", text="暂停 (Pause)"))
         self.is_paused = False
 
+
+    def cut_ads_now(self):
+        """Standalone button: run ad-removal on the project dir from the input field."""
+        v = self.input_var.get().strip()
+        if not v:
+            return messagebox.showwarning("警告", "请在输入源填入项目目录或已完成视频的文件路径")
+        if v.startswith("http"):
+            return messagebox.showwarning("警告", "剪切广告需要本地项目目录。请先处理视频，再对已完成的项目剪切广告。")
+        target = v if os.path.isdir(v) else os.path.dirname(v)
+        if not target or not os.path.isdir(target):
+            return messagebox.showwarning("警告", f"找不到项目目录: {target}")
+        self.run_remove_ads(target)
+
+    def run_remove_ads(self, target):
+        """Launch remove_ads.py in a background thread, streaming logs to tab3."""
+        try:
+            self.notebook.select(self.tab3)
+        except Exception:
+            pass
+        self.progress_var.set(0)
+        self.status_label.config(text="📺 正在识别并剪除广告片段...")
+        self.log_text.config(state="normal"); self.log_text.delete(1.0, tk.END); self.log_text.config(state="disabled")
+        py_exe = sys.executable
+        venv_py = os.path.join(CURRENT_DIR, ".venv", "bin", "python" if sys.platform != "win32" else "python.exe")
+        if os.path.exists(venv_py):
+            py_exe = venv_py
+        script = os.path.join(CURRENT_DIR, "remove_ads.py")
+        model = self.llm_model_var.get() or "glm-5.2"
+        provider_id = self.vendor_map.get(self.vendor_var.get(), "")
+        cmd = [py_exe, script, target, "--model", model]
+        if provider_id:
+            cmd += ["--provider", provider_id]
+        print(f"📺 [GUI] Launching remove_ads: {' '.join(cmd)}")
+        self.start_btn.config(state="disabled")
+        self.stop_btn.config(state="normal")
+        threading.Thread(target=self._remove_ads_worker, args=(cmd,), daemon=True).start()
+
+    def _remove_ads_worker(self, cmd):
+        try:
+            self.current_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', bufsize=1)
+            self.root.after(0, lambda: self.pause_btn.config(state="normal"))
+            if self.current_process.stdout:
+                for line in self.current_process.stdout:
+                    self.root.after(0, self.log, line.strip())
+            ret = self.current_process.wait()
+            self.current_process = None
+            if ret == 0:
+                self.root.after(0, lambda: self.status_label.config(text="✅ 广告剪除完成"))
+            else:
+                self.root.after(0, lambda: self.status_label.config(text="❌ 广告剪除失败"))
+        except Exception as e:
+            self.root.after(0, lambda: self.log(f"❌ 广告剪除异常: {e}"))
+        finally:
+            self.current_process = None
+            self.root.after(0, lambda: self.start_btn.config(state="normal"))
+            self.root.after(0, lambda: self.stop_btn.config(state="disabled"))
+            self.root.after(0, lambda: self.pause_btn.config(state="disabled", text="暂停 (Pause)"))
+
     def save_settings(self):
         data = {
             "input": self.input_var.get(),
