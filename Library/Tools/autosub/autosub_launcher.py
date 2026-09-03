@@ -224,7 +224,7 @@ def fetch_metadata(url: str, cookies_path: Optional[str] = None, browser: Option
 
         # Enhanced challenge solving for YouTube
         if "youtube.com" in url or "youtu.be" in url:
-            cmd.extend(["--extractor-args", "youtube:player-client=tv"])
+            cmd.extend(["--extractor-args", "youtube:player_client=web_safari"])
             cmd.extend(["--remote-components", "ejs:github"])
             if NODE_EXE != "node":
                 cmd.extend(["--js-runtime", f"node:{NODE_EXE}"])

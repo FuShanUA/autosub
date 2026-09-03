@@ -112,8 +112,8 @@ def load_asr_corrections() -> List[Tuple[str, str]]:
                     line.strip()
                 )
                 if m:
-                    pattern = m.group(1).strip()
-                    replacement = m.group(2).strip()
+                    pattern = m.group(1).strip().replace(r'\|', '|')
+                    replacement = m.group(2).strip().replace(r'\|', '|')
                     if pattern and replacement:
                         # Skip rules that inject CJK into English source text
                         if re.search(r'[\u4e00-\u9fff]', replacement):
@@ -187,7 +187,7 @@ If no misspellings are found, return: {{}}
 """
 
     try:
-        response_text = client.generate_content(prompt, model_name=model_name, fallback=True, provider=provider)
+        response_text = client.generate_content(prompt, model_name=model_name, fallback=True, provider=provider, disable_thinking=True)
         if not response_text:
             print("   ⚠️ Pass 1 returned no response. Skipping global scan.")
             return {}
@@ -292,7 +292,7 @@ Example:
 
     try:
         # Use fallback=True to ensure robust cascading if Vertex/primary provider fails or model is unsupported
-        response_text = client.generate_content(prompt, model_name=model_name, fallback=True, provider=provider)
+        response_text = client.generate_content(prompt, model_name=model_name, fallback=True, provider=provider, disable_thinking=True)
         if not response_text:
             return chunk_blocks
 
@@ -370,7 +370,7 @@ def run_spellcheck(srt_path: str, model_name: str = "gemini-3.1-flash-preview", 
         prompt = build_spellcheck_prompt(chunk, terms, global_corrections)
         tasks.append({'index': i // chunk_size, 'chunk': chunk, 'prompt': prompt})
 
-    results = client.generate_batch(tasks, model_name, fallback=True, provider=provider)
+    results = client.generate_batch(tasks, model_name, fallback=True, provider=provider, disable_thinking=True)
     results.sort(key=lambda x: x['index'])
 
     for res in results:

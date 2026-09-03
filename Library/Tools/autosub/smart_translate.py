@@ -195,7 +195,7 @@ Respond with ONLY the category name (`casual`, `formal`, or `edgy`) as a single 
 """
     try:
         # Use fallback=True to ensure robust cascading if Vertex/primary provider fails
-        detected = client.generate_content(prompt, model_name=model_name, fallback=True, provider=provider)
+        detected = client.generate_content(prompt, model_name=model_name, fallback=True, provider=provider, disable_thinking=True)
         detected = detected.strip().lower() if detected else "casual"
         if detected not in ["casual", "formal", "edgy"]:
             # Clean up if model added markdown or formatting
@@ -249,7 +249,7 @@ If no ads are found, return [].
 {transcript}
 """
     try:
-        raw = client.generate_content(prompt, model_name=model, fallback=True, provider=provider)
+        raw = client.generate_content(prompt, model_name=model, fallback=True, provider=provider, disable_thinking=True)
         if not raw:
             return []
         # LLMs sometimes wrap output in ```json ... ```; extract the first array.
@@ -480,15 +480,27 @@ def is_untranslated(block: Dict) -> bool:
         chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', text))
         english_words = len(re.findall(r'[a-zA-Z]+', text))
         # Partially translated: mostly English with a few Chinese chars
-        # (typically from terminology pre-replacement that injected Chinese)
-        if english_words >= 5 and chinese_chars < english_words:
+        # (typically from terminology pre-replacement that injected Chinese).
+        # Check both absolute count AND ratio: if English words outnumber CJK
+        # chars, or if English is >60% of the text, it's likely untranslated.
+        if english_words >= 3 and (chinese_chars < english_words or english_chars_ratio(text) > 0.6):
             return True
         return False
     alpha = [c for c in text if c.isalpha()]
     if not alpha:
         return False
     ascii_ratio = sum(1 for c in alpha if ord(c) < 128) / len(alpha)
-    return ascii_ratio > 0.7 and len(alpha) >= 8
+    # Lowered from 8 to 2 alpha chars to catch short untranslated fragments
+    # (e.g. "Yeah.", "OK.", "So.") that were previously slipping through.
+    return ascii_ratio > 0.7 and len(alpha) >= 2
+
+
+def english_chars_ratio(text: str) -> float:
+    """Returns the ratio of ASCII alpha chars to total alpha chars."""
+    alpha = [c for c in text if c.isalpha()]
+    if not alpha:
+        return 0.0
+    return sum(1 for c in alpha if ord(c) < 128) / len(alpha)
 
 
 def translate_blocks(blocks: List[Dict], client, model: str, style: str,
@@ -682,7 +694,7 @@ Phrase -> Translation
 """
 
     try:
-        result = client.generate_content(prompt, model_name=model, fallback=True, provider=provider)
+        result = client.generate_content(prompt, model_name=model, fallback=True, provider=provider, disable_thinking=True)
         if not result:
             return ""
         glossary_lines = []
@@ -1238,6 +1250,38 @@ def main():
                             content = match.group(2).strip()
                             if content:  # guard: reject empty translations
                                 translated_map_chunk[idx] = content
+
+                    # Detect missing blocks: LLM returned fewer [ID] lines than input.
+                    # Immediately retry the missing blocks with a single-block prompt
+                    # instead of relying solely on the post-processing loop.
+                    missing_ids = [str(b['index']) for b in chunk if str(b['index']) not in translated_map_chunk]
+                    if missing_ids:
+                        print(f"⚠️ Chunk {res['index'] + 1}: LLM skipped {len(missing_ids)} block(s) {missing_ids}. Retrying individually...", flush=True)
+                        for block in chunk:
+                            idx_str = str(block['index'])
+                            if idx_str not in translated_map_chunk:
+                                src = " ".join(block['lines']).replace("\n", " ").strip()
+                                if not src:
+                                    continue
+                                retry_prompt = (f"Translate this ONE subtitle fragment into Simplified Chinese. "
+                                                f"Use natural spoken Chinese, not written prose. "
+                                                f"No translationese. No em-dashes. "
+                                                f"Keep proper nouns/acronyms in English. "
+                                                f"Reply with ONLY one line in this exact format: [{idx_str}] <translation>\n\n"
+                                                f"[{idx_str}] {src}\n")
+                                try:
+                                    retry_out = client.generate_content(retry_prompt, model_name=target_model, provider=provider_enum)
+                                    if retry_out:
+                                        m = re.search(r'\[%s\]\s*(.+)' % re.escape(idx_str), retry_out)
+                                        if m:
+                                            cn = m.group(1).strip()
+                                            if cn and re.search(r'[\u4e00-\u9fff]', cn):
+                                                translated_map_chunk[idx_str] = cn
+                                                print(f"   ✔ block {idx_str}: single retry succeeded", flush=True)
+                                                continue
+                                    print(f"   ✗ block {idx_str}: single retry failed, will retry in post-processing", flush=True)
+                                except Exception as e:
+                                    print(f"   ✗ block {idx_str}: single retry error {e}", flush=True)
 
                     # Apply translations; keep original as fallback for missing/empty
                     for block in chunk:

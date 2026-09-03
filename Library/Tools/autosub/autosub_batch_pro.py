@@ -592,7 +592,7 @@ class BatchEngine:
                     continue
                 
                 cmdline_str = " ".join(cmdline)
-                is_child_engine = any(x in cmdline_str for x in ["transcribe_engine.py", "smart_translate.py", "burn_engine.py"])
+                is_child_engine = any(x in cmdline_str for x in ["transcribe_engine.py", "smart_translate.py", "burn_engine.py", "bili_upload.py", "sync.py"])
                 
                 if is_child_engine:
                     # Check if the process belongs to this project
@@ -764,6 +764,22 @@ class BatchEngine:
                 os.remove(self.lock_file)
         except:
             pass
+
+    def kill_children(self):
+        """Kill all child subprocesses on exit to prevent orphaned processes."""
+        import psutil
+        try:
+            parent = psutil.Process(os.getpid())
+            for child in parent.children(recursive=True):
+                try:
+                    cmdline = " ".join(child.cmdline())
+                    if any(x in cmdline for x in ["sync.py", "bili_upload.py", "transcribe_engine.py", "smart_translate.py", "burn_engine.py"]):
+                        logger.info(f"Killing child on exit: PID {child.pid} ({cmdline[:60]})")
+                        child.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+        except Exception as e:
+            logger.error(f"Error during child cleanup: {e}")
 
     def save_state(self):
         with self.lock:
@@ -1080,8 +1096,10 @@ class BatchEngine:
                 need_gd = self.do_gdsync and not os.path.exists(os.path.join(task.workdir, ".synced"))
                 need_bi = self.do_bili and not os.path.exists(os.path.join(task.workdir, ".bili_uploaded"))
                 if need_gd or need_bi:
-                    task.status = "排队中 (GD)"
-                    task.pcts.update({"DL": 100, "TR": 100, "TL": 100, "MR": 100, "BR": 100, "GD": 0.0, "BI": 0.0})
+                    task.status = "排队中 (GD)" if need_gd else "排队中 (BI)"
+                    _gd_pct = 100.0 if not need_gd else 0.0
+                    _bi_pct = 100.0 if not need_bi else 0.0
+                    task.pcts.update({"DL": 100, "TR": 100, "TL": 100, "MR": 100, "BR": 100, "GD": _gd_pct, "BI": _bi_pct})
                 else:
                     task.status = "完成"
                     for k in task.pcts: task.pcts[k] = 100.0
@@ -1179,11 +1197,12 @@ class BatchEngine:
             p = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding='utf-8', errors='replace',
-                cwd=task.workdir, creationflags=CREATE_NO_WINDOW
-            )
+               cwd=task.workdir, creationflags=CREATE_NO_WINDOW
+           )
             task.pid = p.pid
 
             if p.stdout:
+                _last_save = 0.0
                 for line in p.stdout:
                     if self.abort: p.kill(); break
                     output_lines.append(line)
@@ -1197,6 +1216,11 @@ class BatchEngine:
                         # 进度保护：仅允许向上增长，除非是重置
                         if mapped_val > task.pcts.get(stage, 0.0):
                             task.pcts[stage] = round(mapped_val, 1)
+                            # 节流写盘：最多每 2 秒存一次，让 TUI 能看到进度
+                            _now = time.time()
+                            if _now - _last_save > 2.0:
+                                self.save_state()
+                                _last_save = _now
 
                     # 3. 运行中的暂停检查 (秒级响应)
                     # 全局逻辑：如果任务被暂停，我们通过终止进程来“释放”信号量，让出资源
@@ -1394,16 +1418,20 @@ class BatchEngine:
                                 try:
                                     with open(os.path.join(workdir, ".synced"), "w") as f: f.write("1")
                                 except: pass
+                                task.pcts["GD"] = 100.0
+                                self.save_state()
                             if bili_result[0]:
                                 try:
                                     with open(os.path.join(workdir, ".bili_uploaded"), "w") as f: f.write("1")
                                 except: pass
+                                task.pcts["BI"] = 100.0
+                                self.save_state()
                             if gd_ok and bili_result[0]:
                                 self.disk_truth(task)
                             else:
                                 if task.retries < 3:
                                     task.retries += 1
-                                    task.status = "排队中 (GD)"
+                                    task.status = "排队中 (GD)" if not gd_ok else "排队中 (BI)"
                                     time.sleep(5)
                                     continue
                                 break
@@ -1736,6 +1764,7 @@ def main():
             logger.info(f"Final task count: {len(engine.task_map)}")
 
     atexit.register(engine.save_state) # 确保异常或正常退出时保存状态
+    atexit.register(engine.kill_children) # 退出时杀掉所有子进程，防止孤儿进程
 
     # 2. 物理真相全量同步 (启动瞬间完成)
     engine.full_physical_sync()
@@ -1766,9 +1795,9 @@ def main():
                     LOCAL_YTDLP = os.path.join(TOOLS_DIR, "vdown", "yt-dlp.exe" if sys.platform == "win32" else "yt-dlp")
                     YTDLP_EXE = LOCAL_YTDLP if os.path.exists(LOCAL_YTDLP) else os.path.join(VENV_BIN, "yt-dlp")
 
-                    cmd = [YTDLP_EXE, "--flat-playlist", "--dump-single-json", "--quiet"]
-                    # Fix: Bypass bot detection / PO Token blocks
-                    cmd.extend(["--extractor-args", "youtube:player-client=android,tv,web"])
+                   cmd = [YTDLP_EXE, "--flat-playlist", "--dump-single-json", "--quiet"]
+                   # Fix: Bypass bot detection / PO Token blocks
+                    cmd.extend(["--extractor-args", "youtube:player_client=web_safari"])
 
                     with engine.use_temp_cookies(engine.cookie_path) as temp_cookies:
                         if temp_cookies:

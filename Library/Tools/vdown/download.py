@@ -163,6 +163,11 @@ def get_youtube_args(url):
         return []
 
     args = [
+        # yt-dlp 2026.08+ defaults to web_embedded client, which YouTube
+        # marks UNPLAYABLE for many videos and then falls back to the web
+        # client where SABR streaming strips high-res format URLs (issue
+        # #12482). web_safari uses m3u8/HLS and returns all resolutions.
+        "--extractor-args", "youtube:player_client=web_safari",
         "--remote-components", "ejs:github",
         "--no-check-certificates"
     ]

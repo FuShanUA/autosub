@@ -360,12 +360,12 @@ class LLMClient:
         self._vertex_configured = False
         self._vertex_current_location = None
 
-    def generate_content_with_provider(self, prompt: str, provider: LLMProvider, model_name: str = "gemini-3.1-flash-preview", fallback: bool = True) -> tuple[bool, str]:
+    def generate_content_with_provider(self, prompt: str, provider: LLMProvider, model_name: str = "gemini-3.1-flash-preview", fallback: bool = True, disable_thinking: bool = False) -> tuple[bool, str]:
         """Generate content using specific provider and model. Returns (success, content/error)."""
         errors = []
         try:
             api_key = self.api_keys.get(provider)
-            res = self._execute_provider_call(provider, model_name, prompt, api_key)  # type: ignore
+            res = self._execute_provider_call(provider, model_name, prompt, api_key, disable_thinking=disable_thinking)  # type: ignore
             if res: return True, res
             errors.append(f"{provider.value}: No response")
         except Exception as e:
@@ -375,7 +375,7 @@ class LLMClient:
             for p, k, m in self.ordered_configs:
                 if p == provider: continue
                 try:
-                    res = self._execute_provider_call(p, m, prompt, k)
+                    res = self._execute_provider_call(p, m, prompt, k, disable_thinking=disable_thinking)
                     if res: return True, res
                 except Exception as e:
                     errors.append(f"{p.value}: {str(e)}")
@@ -455,10 +455,17 @@ class LLMClient:
                 return LLMProvider.VERTEX
         return LLMProvider.GEMINI
 
-    def _call_openai_compatible(self, model_name: str, prompt: Union[str, List], base_url: str, api_key: str) -> Optional[str]:
+    def _call_openai_compatible(self, model_name: str, prompt: Union[str, List], base_url: str, api_key: str, disable_thinking: bool = False) -> Optional[str]:
         if not api_key:
             print(f"❌ Error: API Key for {model_name} not found.")
             return None
+
+        # Allow callers (e.g. spellcheck) to explicitly disable thinking
+        # for reasoning models on DashScope/Bailian. Translation and other
+        # context-heavy tasks should NOT disable thinking — it degrades
+        # cross-block understanding (e.g. "mr." + "Rubenstein" split across
+        # blocks gets mistranslated when thinking is off).
+        _disable_thinking = disable_thinking
 
         headers = {
             "Authorization": f"Bearer {api_key}",
@@ -491,7 +498,7 @@ class LLMClient:
         else:
             content_payload = prompt
 
-       # Omit temperature for reasoning/thinking models (like o1, o3, reasoner, k2.5, k2.6) to avoid 400 Bad Request
+        # Omit temperature for reasoning/thinking models (like o1, o3, reasoner, k2.5, k2.6) to avoid 400 Bad Request
         # Broaden reasoning-model detection: glm-5.x / deepseek-v4-pro also do
         # long chain-of-thought. For deterministic tasks (e.g. spellcheck) this
         # turns a 19s call into 143s and blows the 90s read timeout.
@@ -503,10 +510,13 @@ class LLMClient:
         }
         if not is_reasoning:
             data["temperature"] = 0.3
-        # Disable thinking for reasoning models when the endpoint supports it
-        # (DashScope/Bailian OpenAI-compatible mode). Vastly reduces latency
-        # for deterministic tasks; ignored harmlessly by non-reasoning models.
-        if is_reasoning and "aliyuncs.com" in base_url:
+        # Disable thinking ONLY when the caller explicitly requests it (e.g.
+        # spellcheck). Translation and other context-heavy tasks need thinking
+        # to understand cross-block context (e.g. "mr." + "Rubenstein" split
+        # across blocks). Without thinking, GLM-5.2 mistranslates names and
+        # misses domain-specific word senses (foundation -> 粉底 instead of
+        # Foundry platform).
+        if is_reasoning and _disable_thinking and "aliyuncs.com" in base_url:
             data["enable_thinking"] = False
 
         self.limiter.wait()
@@ -522,7 +532,10 @@ class LLMClient:
         else:
             _post = requests.post
         try:
-            response = _post(f"{base_url}/chat/completions", headers=headers, json=data, timeout=90)
+            # Timeout: 180s to accommodate reasoning models with thinking enabled
+            # (GLM-5.2 with thinking can take 60-120s for complex translation chunks).
+            # The previous 90s timeout was calibrated for thinking-disabled calls.
+            response = _post(f"{base_url}/chat/completions", headers=headers, json=data, timeout=180)
             if response.status_code != 200:
                 try:
                     err_data = response.json()
@@ -668,36 +681,36 @@ class LLMClient:
             print(f"❌ Vertex API error: {e}")
             raise Exception(f"Vertex API Error: {e}")
 
-    def _execute_provider_call(self, provider: LLMProvider, model_name: str, content: Union[str, List], api_key: str) -> Optional[str]:
+    def _execute_provider_call(self, provider: LLMProvider, model_name: str, content: Union[str, List], api_key: str, disable_thinking: bool = False) -> Optional[str]:
         if provider == LLMProvider.GEMINI:
             return self._call_gemini(model_name, content, api_key)
         elif provider == LLMProvider.OPENAI:
             base_url = os.environ.get("OPENAI_API_BASE") or "https://api.openai.com/v1"
             if base_url.endswith("/v1/"): base_url = base_url[:-1]
-            return self._call_openai_compatible(model_name, content, base_url, api_key)
+            return self._call_openai_compatible(model_name, content, base_url, api_key, disable_thinking=disable_thinking)
         elif provider == LLMProvider.MOONSHOT:
-            return self._call_openai_compatible(model_name, content, "https://api.moonshot.cn/v1", api_key)
+            return self._call_openai_compatible(model_name, content, "https://api.moonshot.cn/v1", api_key, disable_thinking=disable_thinking)
         elif provider == LLMProvider.DASHSCOPE:
-            return self._call_openai_compatible(model_name, content, "https://dashscope.aliyuncs.com/compatible-mode/v1", api_key)
+            return self._call_openai_compatible(model_name, content, "https://dashscope.aliyuncs.com/compatible-mode/v1", api_key, disable_thinking=disable_thinking)
         elif provider == LLMProvider.ZHIPU:
-            return self._call_openai_compatible(model_name, content, "https://open.bigmodel.cn/api/paas/v4", api_key)
+            return self._call_openai_compatible(model_name, content, "https://open.bigmodel.cn/api/paas/v4", api_key, disable_thinking=disable_thinking)
         elif provider == LLMProvider.DEEPSEEK:
-            return self._call_openai_compatible(model_name, content, "https://api.deepseek.com", api_key)
+            return self._call_openai_compatible(model_name, content, "https://api.deepseek.com", api_key, disable_thinking=disable_thinking)
         elif provider == LLMProvider.SILICONFLOW:
-            return self._call_openai_compatible(model_name, content, "https://api.siliconflow.cn/v1", api_key)
+            return self._call_openai_compatible(model_name, content, "https://api.siliconflow.cn/v1", api_key, disable_thinking=disable_thinking)
         elif provider == LLMProvider.VERTEX:
             return self._call_vertex(model_name, content, api_key)
         elif provider == LLMProvider.MINIMAX:
-            return self._call_openai_compatible(model_name, content, "https://api.minimaxi.com/v1", api_key)
+            return self._call_openai_compatible(model_name, content, "https://api.minimaxi.com/v1", api_key, disable_thinking=disable_thinking)
         return None
 
-    def generate_content(self, content: Union[str, List], model_name: Optional[str] = None, fallback: bool = False, provider: Optional[LLMProvider] = None) -> Optional[str]:
+    def generate_content(self, content: Union[str, List], model_name: Optional[str] = None, fallback: bool = False, provider: Optional[LLMProvider] = None, disable_thinking: bool = False) -> Optional[str]:
         if model_name and "::" in model_name:
             vendor_str, model_name = model_name.split("::", 1)
             try:
-                provider = LLMProvider(vendor_str.lower())
+               provider = LLMProvider(vendor_str.lower())
             except ValueError:
-                pass # Fall back to normal detection if vendor string is invalid
+               pass # Fall back to normal detection if vendor string is invalid
                 
         targets = []
 
@@ -789,7 +802,7 @@ class LLMClient:
             attempt = 0
             while True:
                 try:
-                    result = self._execute_provider_call(provider, m_name, content, api_key)
+                    result = self._execute_provider_call(provider, m_name, content, api_key, disable_thinking=disable_thinking)
                     if result:
                         self.last_provider = provider
                         self.limiter.notify_success()
@@ -838,7 +851,7 @@ class LLMClient:
 
         raise Exception(f"❌ All LLM API fallbacks exhausted. Errors: {errors}")
 
-    def generate_batch(self, tasks: List[Dict], model_name: str = "gemini-3.1-flash-preview", fallback: bool = False, provider: Optional[LLMProvider] = None) -> List[Dict]:
+    def generate_batch(self, tasks: List[Dict], model_name: str = "gemini-3.1-flash-preview", fallback: bool = False, provider: Optional[LLMProvider] = None, disable_thinking: bool = False) -> List[Dict]:
         results = []
         total = len(tasks)
 
@@ -858,8 +871,8 @@ class LLMClient:
 
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers)
         future_to_task = {
-            executor.submit(self.generate_content, task['prompt'], model_name, fallback=fallback, provider=provider): task
-            for task in tasks
+           executor.submit(self.generate_content, task['prompt'], model_name, fallback=fallback, provider=provider, disable_thinking=disable_thinking): task
+           for task in tasks
         }
 
         import time as _time
