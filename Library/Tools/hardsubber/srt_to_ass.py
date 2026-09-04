@@ -55,8 +55,17 @@ def parse_srt(file_path):
             line = line.replace('\\n', '\n')
             sub_lines = line.split('\n')
             for sub in sub_lines:
-                # Heuristic: Contains Chinese char?
-                if re.search(r'[\u4e00-\u9fff]', sub):
+                # Heuristic: Contains Japanese kana (hiragana/katakana)?
+                # Kana is unique to Japanese — if present, this line is Japanese,
+                # not Chinese, even though it also contains kanji.
+                if re.search(r'[\u3040-\u30ff\u31f0-\u31ff]', sub):
+                    # Strip spaces between CJK characters (Whisper artifact).
+                    # Japanese ASR inserts spaces between every character;
+                    # remove them so text renders naturally. Keep spaces
+                    # around ASCII words (e.g. "LayerX", "AI").
+                    sub = re.sub(r'(?<=[\u3040-\u30ff\u31f0-\u31ff\u4e00-\u9fff\u3000-\u303f\uff00-\uffef])\s+(?=[\u3040-\u30ff\u31f0-\u31ff\u4e00-\u9fff\u3000-\u303f\uff00-\uffef])', '', sub)
+                    en_parts.append(sub)  # route Japanese to the EN track
+                elif re.search(r'[\u4e00-\u9fff]', sub):
                     cn_parts.append(sub)
                 elif has_cn_any:
                     # If this block contains Chinese elsewhere, this line without Chinese is English
@@ -223,6 +232,9 @@ class TkinterConfig:
         self.en_font = "Arial"
         self.en_color = "&H00FFFFFF"
         self.en_size = "middle"
+        # Japanese font: used for kana-bearing text. Shares color/size with EN.
+        # Hiragino Sans on macOS, Yu Gothic on Windows, fallback to en_font.
+        self.ja_font = "Hiragino Sans"
 
         self.bg_box = True # Default enabled
 
@@ -484,30 +496,45 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                  raw_wrapped = [auto_wrap(sub, wrap_cn, True) for sub in cn_with_tags.split('\\N')]
                  full_wrapped_str = "\\N".join(raw_wrapped)
 
-                 # 2. Apply English Font to English segments within the Chinese track
+                 # 2. Apply font overrides for non-Chinese segments within the CN track
                  final_parts = []
                  for line in full_wrapped_str.split('\\N'):
+                     # Wrap Japanese runs in JA font. Include spaces between
+                     # CJK chars so kana+kanji sequences are not split apart.
+                     # Must run BEFORE the English regex.
+                     def replace_ja(m):
+                         txt = m.group(0)
+                         if re.search(r'[\u3040-\u30ff\u31f0-\u31ff]', txt):
+                             return f"{{\\fn{config.ja_font}}}{txt}{{\\r}}"
+                         return txt
+                     processed = re.sub(r'[\u3040-\u30ff\u31f0-\u31ff\u4e00-\u9fff\u3000-\u303f\uff00-\uffef\s]+', replace_ja, line)
+
                      # Function to wrap English text in font tags
                      def replace_en(m):
                          txt = m.group(0)
-                         # Heuristic: apply only if it contains at least one letter to avoid formatting "123" or "..." differently unless part of a sentence
                          if re.search(r'[a-zA-Z]', txt):
                              return f"{{\\fn{config.en_font}}}{txt}{{\\r}}"
                          return txt
-
-                     # Regex matches continuous ASCII-like words/sentences
-                     # Expanded to include more symbols often found in tech/general text
-                     processed = re.sub(r'[a-zA-Z0-9\s\.,;:!?\'"%\-\(\)\[\]\/\*\+\=\&\$\#\@\<\>\_\`\^\|]+', replace_en, line)
+                     processed = re.sub(r'[a-zA-Z0-9\s\.,;:!?\'"%\-\(\)\[\]\/\*\+\=\&\$\#\@\<\>\_\`\^\|]+', replace_en, processed)
                      final_parts.append(processed)
-
                  cn_final_txt = "\\N".join(final_parts)
 
-            if config.mode != 'cn' and p['en']:
-                 en_with_tags = convert_markdown_to_ass(p['en'])
-                 parts = [auto_wrap(sub, wrap_en, False) for sub in en_with_tags.split('\\N')]
-                 en_final_txt = "\\N".join(parts)
+                 if config.mode != 'cn' and p['en']:
+                     en_with_tags = convert_markdown_to_ass(p['en'])
+                     parts = [auto_wrap(sub, wrap_en, False) for sub in en_with_tags.split('\\N')]
+                     # Wrap Japanese runs in JA font within the EN track
+                     en_processed_parts = []
+                     for part in parts:
+                         def replace_ja_en(m):
+                             txt = m.group(0)
+                             if re.search(r'[぀-ヿㇰ-ㇿ]', txt):
+                                return f"{{\\fn{config.ja_font}}}{txt}{{\\fn{config.en_font}}}"
+                             return txt
+                         part = re.sub(r'[\u3040-\u30ff\u31f0-\u31ff\u4e00-\u9fff\u3000-\u303f\uff00-\uffef\s]+', replace_ja_en, part)
+                         en_processed_parts.append(part)
+                     en_final_txt = "\\N".join(en_processed_parts)
 
-            final_content = ""
+                 final_content = ""
 
             # --- Layout Calculation ---
             # We need to know which lines are what to calc box sizes
@@ -642,6 +669,7 @@ if __name__ == "__main__":
     parser.add_argument("--main-lang", help="cn/en")
     parser.add_argument("--cn-font")
     parser.add_argument("--en-font")
+    parser.add_argument("--ja-font", help="Japanese font for kana-bearing text")
     parser.add_argument("--cn-size")
     parser.add_argument("--en-size")
     parser.add_argument("--cn-color")
@@ -660,6 +688,7 @@ if __name__ == "__main__":
     if args.main_lang: config.main_lang = args.main_lang
     if args.cn_font: config.cn_font = args.cn_font
     if args.en_font: config.en_font = args.en_font
+    if args.ja_font: config.ja_font = args.ja_font
     if args.cn_size: config.cn_size = args.cn_size
     if args.en_size: config.en_size = args.en_size
     if args.cn_color: config.cn_color = config.color_map.get(args.cn_color, args.cn_color)

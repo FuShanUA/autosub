@@ -674,20 +674,20 @@ def merge_bilingual(src_srt, zh_srt, main_lang="cn", llm_model="gemini-3.1-pro-p
         print(f"❌ Merge launch error: {e}")
         return None
 
-def burn_subtitle(video_path, srt_path, layout, main_lang, cn_font, en_font, cn_size, en_size, cn_color, en_color, bg_box=True, quality="high"):
+def burn_subtitle(video_path, srt_path, layout, main_lang, cn_font, en_font, ja_font, cn_size, en_size, cn_color, en_color, bg_box=True, quality="high"):
     print("🔥 Burning subtitles...", flush=True)
     base_srt, _ = os.path.splitext(srt_path)
     ass_path = base_srt + ".ass"
-    
+     
     # --- Get Video Dimensions for Styling ---
     width, height = get_video_dimensions(video_path)
     print(f"📐 Video Resolution: {width}x{height}")
-
+ 
     if not os.path.exists(ass_path):
-        cmd = list(SRT2ASS_CMD) + [srt_path, ass_path, "--layout", layout, "--main-lang", main_lang, "--cn-font", cn_font, "--en-font", en_font, "--cn-size", cn_size, "--en-size", en_size, "--cn-color", cn_color, "--en-color", en_color]
-        cmd += ["--width", str(width), "--height", str(height)]
-        if not bg_box: cmd.append("--no-bg-box")
-        subprocess.run(cmd, check=True, creationflags=CREATE_NO_WINDOW)
+         cmd = list(SRT2ASS_CMD) + [srt_path, ass_path, "--layout", layout, "--main-lang", main_lang, "--cn-font", cn_font, "--en-font", en_font, "--ja-font", ja_font, "--cn-size", cn_size, "--en-size", en_size, "--cn-color", cn_color, "--en-color", en_color]
+         cmd += ["--width", str(width), "--height", str(height)]
+         if not bg_box: cmd.append("--no-bg-box")
+         subprocess.run(cmd, check=True, creationflags=CREATE_NO_WINDOW)
         
     video_base = os.path.splitext(os.path.basename(video_path))[0]
     video_ext = os.path.splitext(video_path)[1]
@@ -790,7 +790,7 @@ def extract_cover_art(audio_path, out_path):
     return None
 
 
-def burn_audio_subtitles(audio_path, srt_path, layout, main_lang, cn_font, en_font, cn_size, en_size, cn_color, en_color, bg_box=True, quality="high"):
+def burn_audio_subtitles(audio_path, srt_path, layout, main_lang, cn_font, en_font, ja_font, cn_size, en_size, cn_color, en_color, bg_box=True, quality="high"):
     """Burn subtitles into an audio-only file by looping the embedded cover art
     into a video stream and rendering the ASS subtitles onto it. Output is an MP4
     (so the result is uploadable to Bilibili etc.). Returns output path or None."""
@@ -800,18 +800,18 @@ def burn_audio_subtitles(audio_path, srt_path, layout, main_lang, cn_font, en_fo
     workdir = os.path.dirname(srt_path)
     base_srt, _ = os.path.splitext(srt_path)
     ass_path = base_srt + ".ass"
-
+ 
     width, height = get_video_dimensions(audio_path)  # cover-art dims (e.g. 500x500)
     print(f"📐 Cover Resolution: {width}x{height}")
-
+ 
     if not os.path.exists(ass_path):
-        cmd = list(SRT2ASS_CMD) + [srt_path, ass_path, "--layout", layout, "--main-lang", main_lang,
-                                   "--cn-font", cn_font, "--en-font", en_font,
-                                   "--cn-size", cn_size, "--en-size", en_size,
-                                   "--cn-color", cn_color, "--en-color", en_color,
-                                   "--width", str(width), "--height", str(height)]
-        if not bg_box: cmd.append("--no-bg-box")
-        subprocess.run(cmd, check=True, creationflags=CREATE_NO_WINDOW)
+         cmd = list(SRT2ASS_CMD) + [srt_path, ass_path, "--layout", layout, "--main-lang", main_lang,
+                                    "--cn-font", cn_font, "--en-font", en_font, "--ja-font", ja_font,
+                                    "--cn-size", cn_size, "--en-size", en_size,
+                                    "--cn-color", cn_color, "--en-color", en_color,
+                                    "--width", str(width), "--height", str(height)]
+         if not bg_box: cmd.append("--no-bg-box")
+         subprocess.run(cmd, check=True, creationflags=CREATE_NO_WINDOW)
 
     cover_path = os.path.join(workdir, f"tmp_cover_{uid}.jpg")
     if not extract_cover_art(audio_path, cover_path):
@@ -1008,6 +1008,7 @@ def main():
     parser.add_argument("--main-lang", default=DEFAULTS.get("main_lang", "cn"))
     parser.add_argument("--cn-font", default=DEFAULTS.get("cn_font", "KaiTi"))
     parser.add_argument("--en-font", default=DEFAULTS.get("en_font", "Arial"))
+    parser.add_argument("--ja-font", default=DEFAULTS.get("ja_font", "Hiragino Sans"))
     parser.add_argument("--cn-size", default=DEFAULTS.get("cn_size", "60"))
     parser.add_argument("--en-size", default=DEFAULTS.get("en_size", "36"))
     parser.add_argument("--cn-color", default=DEFAULTS.get("cn_color", "Gold"))
@@ -1389,15 +1390,15 @@ def main():
         if os.path.exists(out_video) and os.path.getsize(out_video) > 1024 * 1024 and os.path.exists(marker_file):
             print(f"✅ Found existing hardsub: {os.path.basename(out_video)} (Skipping burn stage)")
         else:
-            burn_audio_subtitles(video_path, final_srt, args.layout, args.main_lang, args.cn_font, args.en_font, args.cn_size, args.en_size, args.cn_color, args.en_color, not args.no_bg_box, args.quality)
+            burn_audio_subtitles(video_path, final_srt, args.layout, args.main_lang, args.cn_font, args.en_font, args.ja_font, args.cn_size, args.en_size, args.cn_color, args.en_color, not args.no_bg_box, args.quality)
     else:
-        # Check if hardsub already exists (video path)
-        video_ext = os.path.splitext(video_path)[1]
-        out_video = os.path.join(workdir, video_base + "_hardsub" + video_ext)
-        if os.path.exists(out_video) and os.path.getsize(out_video) > 1024 * 1024 and os.path.exists(marker_file):
+       # Check if hardsub already exists (video path)
+       video_ext = os.path.splitext(video_path)[1]
+       out_video = os.path.join(workdir, video_base + "_hardsub" + video_ext)
+       if os.path.exists(out_video) and os.path.getsize(out_video) > 1024 * 1024 and os.path.exists(marker_file):
             print(f"✅ Found existing hardsub: {os.path.basename(out_video)} (Skipping burn stage)")
-        else:
-            burn_subtitle(video_path, final_srt, args.layout, args.main_lang, args.cn_font, args.en_font, args.cn_size, args.en_size, args.cn_color, args.en_color, not args.no_bg_box, args.quality)
+       else:
+            burn_subtitle(video_path, final_srt, args.layout, args.main_lang, args.cn_font, args.en_font, args.ja_font, args.cn_size, args.en_size, args.cn_color, args.en_color, not args.no_bg_box, args.quality)
     
     print("✅ All done!", flush=True)
 

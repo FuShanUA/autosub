@@ -66,13 +66,16 @@ class TerminalGUI:
         self.root.grid_columnconfigure(0, weight=1)
         
         # Select premium Mac monospace fonts
-        self.custom_font = font.Font(family="Courier", size=13)
+        self.custom_font = font.Font(family="Courier", size=15)
         if sys.platform == "darwin":
-            # We must use a loop because Tkinter's Font class does not support fallback tuples/lists.
-            # Menlo and Monaco are premium developer monospace fonts on macOS with perfect box drawing character alignment.
-            for f in ["Menlo", "Monaco", "Courier New", "Courier"]:
-                if f in font.families():
-                    self.custom_font = font.Font(family=f, size=13)
+            preferred_fonts = [
+                ("Sarasa Mono SC", 15), ("Sarasa Mono HC", 15), ("Sarasa Mono TC", 15),
+                ("Sarasa Mono J", 15), ("Menlo", 13), ("Monaco", 13), ("Courier New", 15)
+            ]
+            available = font.families()
+            for f_name, f_size in preferred_fonts:
+                if f_name in available:
+                    self.custom_font = font.Font(family=f_name, size=f_size)
                     break
         
         custom_font = self.custom_font
@@ -106,7 +109,7 @@ class TerminalGUI:
             "97": "#F8FAFC",  # Bright White (Pure Slate White)
         }
         
-        self.bold_font = font.Font(family=self.custom_font.actual()["family"], size=self.custom_font.actual()["size"], weight="bold")
+        self.bold_font = font.Font(family=self.custom_font.cget("family"), size=self.custom_font.cget("size"), weight="bold")
         
         # Configure tags in Text widget
         # NOTE: We intentionally do NOT attach font=self.bold_font to any tag.

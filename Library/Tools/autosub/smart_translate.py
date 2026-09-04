@@ -317,7 +317,8 @@ def smart_translate_chunk(chunk_blocks: List[Dict], style: str = "casual", model
 
     prompt = f"""
 You are an expert subtitle translator and editor.
-Translate the following English subtitles into Simplified Chinese.
+Translate the following subtitles into Simplified Chinese.
+The source language may be English, Japanese, or a mix of both.
 
 ### STEP 1: VERBALIZATION (Tone & Persona)
 {VERBALIZER_RULES}
@@ -476,6 +477,10 @@ def is_untranslated(block: Dict) -> bool:
     markers = ['[UNTRANSLATED]', '[TRANSLATION_FAILED]']
     if any(m in text for m in markers):
         return True
+    # Japanese kana detection: hiragana + katakana are uniquely Japanese.
+    # If present, the block is untranslated Japanese, not Chinese.
+    if re.search(r'[\u3040-\u30ff\u31f0-\u31ff]', text):
+        return True
     if re.search(r'[\u4e00-\u9fff]', text):
         chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', text))
         english_words = len(re.findall(r'[a-zA-Z]+', text))
@@ -527,7 +532,8 @@ def translate_blocks(blocks: List[Dict], client, model: str, style: str,
             input_text += f"[{block['index']}] {scrubbed_text}\n"
 
         prompt = f"""You are an expert subtitle translator and editor.
-Translate the following English subtitles into Simplified Chinese.
+Translate the following subtitles into Simplified Chinese.
+The source language may be English, Japanese, or a mix of both.
 
 ### STEP 1: VERBALIZATION (Tone & Persona)
 {verbalizer_snippet}...
@@ -907,7 +913,7 @@ If ALL pairs are correctly aligned, output exactly: ALL_ALIGNED"""
             context_str += f"NEXT BLOCK (for context only, DO NOT translate): {next_en}\n"
 
         strict_prompt = f"""You are translating ONE subtitle fragment into Simplified Chinese.
-The fragment below is marked as TARGET BLOCK. Translate ONLY that block's English text.
+The fragment below is marked as TARGET BLOCK. Translate ONLY that block's text.
 The PREVIOUS and NEXT blocks are provided for context only \u2014 do NOT translate them and
 do NOT include their content in your translation. The target may be a partial sentence;
 translate exactly that fragment so it aligns with this one subtitle block on the timeline.
@@ -1152,7 +1158,8 @@ def main():
 
             prompt = f"""
     You are an expert subtitle translator and editor.
-    Translate the following English subtitles into Simplified Chinese.
+    Translate the following subtitles into Simplified Chinese.
+    The source language may be English, Japanese, or a mix of both.
 
     ### STEP 1: VERBALIZATION (Tone & Persona)
     {verbalizer_snippet}...
@@ -1187,30 +1194,24 @@ def main():
             target_model = args.model
             print(f"🚀 Using LLM: {target_model}...")
 
-            # Start a background simulation thread for translation progress
+            # Progress tracker: prints real progress based on completed
+            # chunks instead of a fake time-based estimate. Reasoning
+            # models (glm-5.2 with thinking) can take 2-10 min per batch.
             import threading
-            
-            # Estimate total batch translation time:
-            # Each chunk is processed in parallel, so a typical batch takes about 10 seconds.
-            # Plus 0.4 seconds per chunk to account for provider queueing.
-            estimated_translate_seconds = 8.0 + len(tasks) * 0.4
-            if estimated_translate_seconds < 10.0:
-                estimated_translate_seconds = 10.0
-                
             sim_done = False
             def sim_worker():
                 start_time = time.time()
-                last_pct = 1.0
+                last_print = 0
                 while not sim_done:
-                    time.sleep(1.0)
+                    time.sleep(2.0)
                     if sim_done: break
                     elapsed = time.time() - start_time
-                    pct = (elapsed / estimated_translate_seconds) * 99.0
-                    if pct > 99.0: pct = 99.0
-                    if pct > last_pct + 0.5:
-                        last_pct = round(pct, 1)
-                        print(f"Progress: {last_pct}% (Translating chunks...)", flush=True)
-                        
+                    # Slow crawl to 95% based on elapsed time; the last 5%
+                    # jumps when generate_batch returns.
+                    pct = min(95.0, (elapsed / max(10.0, len(tasks) * 30)) * 100)
+                    if pct > last_print + 2:
+                        last_print = round(pct, 1)
+                        print(f"Progress: {last_print}% (Translating {len(tasks)} chunks...)", flush=True)
             t_sim = threading.Thread(target=sim_worker)
             t_sim.daemon = True
             t_sim.start()

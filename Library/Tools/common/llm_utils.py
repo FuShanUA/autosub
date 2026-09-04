@@ -532,10 +532,13 @@ class LLMClient:
         else:
             _post = requests.post
         try:
-            # Timeout: 180s to accommodate reasoning models with thinking enabled
-            # (GLM-5.2 with thinking can take 60-120s for complex translation chunks).
-            # The previous 90s timeout was calibrated for thinking-disabled calls.
-            response = _post(f"{base_url}/chat/completions", headers=headers, json=data, timeout=180)
+            # Adaptive timeout: reasoning models with thinking enabled can take
+            # 120-250s for large translation chunks (50 blocks + glossary + style).
+            # Use 300s to avoid premature read timeouts. Thinking-disabled calls
+            # (spellcheck, etc.) finish in <30s, so 180s is more than sufficient.
+            _is_thinking = is_reasoning and not _disable_thinking
+            _http_timeout = 300 if _is_thinking else 180
+            response = _post(f"{base_url}/chat/completions", headers=headers, json=data, timeout=_http_timeout)
             if response.status_code != 200:
                 try:
                     err_data = response.json()
@@ -865,9 +868,28 @@ class LLMClient:
 
         print(f"🚀 Starting batch generation for {total} items (Workers: {effective_workers}, Model: {model_name}, Fallback: {fallback})...")
 
-        # Per-task timeout: if a single chunk's LLM call hangs, skip it after this many
+        # Batch timeout: if a single chunk's LLM call hangs, skip it after this many
         # seconds instead of blocking the entire batch indefinitely.
-        per_task_timeout = int(os.environ.get("LLM_BATCH_TIMEOUT", "180"))
+        #
+        # This is an OVERALL timeout for the entire batch (not per-chunk). With
+        # N chunks and W workers, the worst-case wall time is ceil(N/W) * T_per_chunk.
+        # For reasoning models with thinking enabled, a single chunk can take
+        # 200-250s. Scale the timeout accordingly so large batches don't get
+        # killed prematurely.
+        _env_timeout = os.environ.get("LLM_BATCH_TIMEOUT")
+        if _env_timeout:
+            per_task_timeout = int(_env_timeout)
+        else:
+            # Auto-scale: 300s per chunk-wave (ceil(N/W) waves), min 300s.
+            # Thinking-disabled calls are fast (<30s), so the floor of 300s
+            # is generous for non-reasoning models too.
+            _mn = model_name.lower() if model_name else ''
+            _is_reasoning = any(x in _mn for x in ['o1', 'o3', 'reasoner', 'k2.6', 'k2.5', 'k3', 'kimi-k3', 'glm-5', 'glm5', 'deepseek-v4-pro', 'r1'])
+            _is_thinking = _is_reasoning and not disable_thinking
+            _per_chunk = 300 if _is_thinking else 60
+            import math as _math
+            _waves = _math.ceil(total / max(effective_workers, 1))
+            per_task_timeout = max(300, _waves * _per_chunk)
 
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers)
         future_to_task = {
@@ -879,21 +901,33 @@ class LLMClient:
         completed = 0
         batch_start = _time.time()
         pending = dict(future_to_task)
+        # Heartbeat: print status every 30s so the user knows the batch is
+        # still alive (reasoning models can take minutes per chunk).
+        import threading as _threading
+        _stop_hb = _threading.Event()
+        def _heartbeat():
+           while not _stop_hb.wait(30):
+               el = _time.time() - batch_start
+               done = total - len(pending)
+               inflight = len(pending)
+               print(f"   ⏳ {done}/{total} done, {inflight} in flight ({el:.0f}s elapsed)", flush=True)
+        _hb_thread = _threading.Thread(target=_heartbeat, daemon=True)
+        _hb_thread.start()
         # Iterate as chunks finish (out of order) so the user sees live progress
         # instead of a frozen screen while long LLM calls are in flight.
         try:
-            for future in concurrent.futures.as_completed(future_to_task, timeout=per_task_timeout):
-                task = future_to_task[future]
-                chunk_id = task.get('chunk_idx', '?')
-                try:
-                    result_text = future.result(timeout=0.1)
-                    results.append({**task, 'result': result_text})
-                    print(f"   ✅ Chunk {chunk_id} done ({completed + 1}/{total}, {_time.time()-batch_start:.0f}s elapsed)", flush=True)
-                except Exception as e:
-                    print(f"   ❌ Chunk {chunk_id} failed: {type(e).__name__}: {str(e)[:80]}", flush=True)
-                    results.append({**task, 'result': None, 'error': str(e)})
-                completed += 1
-                pending.pop(future, None)
+           for future in concurrent.futures.as_completed(future_to_task, timeout=per_task_timeout):
+               task = future_to_task[future]
+               chunk_id = task.get('chunk_idx', '?')
+               try:
+                   result_text = future.result(timeout=0.1)
+                   results.append({**task, 'result': result_text})
+                   print(f"   ✅ Chunk {chunk_id} done ({completed + 1}/{total}, {_time.time()-batch_start:.0f}s elapsed)", flush=True)
+               except Exception as e:
+                   print(f"   ❌ Chunk {chunk_id} failed: {type(e).__name__}: {str(e)[:80]}", flush=True)
+                   results.append({**task, 'result': None, 'error': str(e)})
+               completed += 1
+               pending.pop(future, None)
         except concurrent.futures.TimeoutError:
             # as_completed overall timeout: remaining chunks are still in flight.
             print(f"   ⏰ {len(pending)} chunk(s) still pending after {per_task_timeout}s — skipping them.", flush=True)
@@ -903,6 +937,7 @@ class LLMClient:
                 print(f"   ⏰ Chunk {chunk_id} skipped (will use original text).", flush=True)
             completed = total
 
+        _stop_hb.set()
         # Cancel any still-running futures (hung threads self-terminate when the
         # underlying requests.post timeout fires) and release the pool without waiting.
         for future in future_to_task:

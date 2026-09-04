@@ -1039,20 +1039,23 @@ class BatchEngine:
             # 前置检查：如果上传标记都已存在，直接判完成，无需检查中间产物
             has_bili_done = os.path.exists(os.path.join(task.workdir, ".bili_uploaded"))
             has_synced = os.path.exists(os.path.join(task.workdir, ".synced"))
-            # A task is complete when all ENABLED upload stages are done:
-            # - If bili upload is enabled, require .bili_uploaded
-            # - If gdsync is enabled, require .synced
-            # - If neither is enabled, hardsub+burn_complete is enough (checked below)
+            has_hardsub = any("_hardsub" in f and f.endswith((".mp4", ".mkv", ".webm")) for f in files)
+            has_burn_complete = os.path.exists(os.path.join(task.workdir, ".burn_complete"))
+            
+            # A task is complete when ALL enabled stages are done.
+            # Base requirement: hardsub is complete.
+            base_done = has_burn_complete
+            
+            # If upload stages are enabled, they must also be done.
             upload_done = (not self.do_bili or has_bili_done) and (not self.do_gdsync or has_synced)
-            if upload_done:
+            
+            if base_done and upload_done:
                 task.status = "完成"
                 for k in task.pcts: task.pcts[k] = 100.0
                 task.error = None
                 return
 
             # --- 优雅自愈与校验：如果存在 _hardsub 视频，校验其时长并维护 .burn_complete 状态 ---
-            has_hardsub = any("_hardsub" in f and f.endswith((".mp4", ".mkv", ".webm")) for f in files)
-            has_burn_complete = os.path.exists(os.path.join(task.workdir, ".burn_complete"))
             if has_hardsub:
                 try:
                     hardsub_files = [f for f in files if "_hardsub" in f and f.endswith((".mp4", ".mkv", ".webm"))]
@@ -1795,8 +1798,8 @@ def main():
                     LOCAL_YTDLP = os.path.join(TOOLS_DIR, "vdown", "yt-dlp.exe" if sys.platform == "win32" else "yt-dlp")
                     YTDLP_EXE = LOCAL_YTDLP if os.path.exists(LOCAL_YTDLP) else os.path.join(VENV_BIN, "yt-dlp")
 
-                   cmd = [YTDLP_EXE, "--flat-playlist", "--dump-single-json", "--quiet"]
-                   # Fix: Bypass bot detection / PO Token blocks
+                    cmd = [YTDLP_EXE, "--flat-playlist", "--dump-single-json", "--quiet"]
+                    # Fix: Bypass bot detection / PO Token blocks
                     cmd.extend(["--extractor-args", "youtube:player_client=web_safari"])
 
                     with engine.use_temp_cookies(engine.cookie_path) as temp_cookies:
