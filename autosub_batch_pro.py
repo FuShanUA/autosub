@@ -747,7 +747,7 @@ class BatchEngine:
             # For batch_state.json, embed global_pause alongside the flat task map.
             if "batch_state.json" in self.state_file:
                 flat_data = {**tasks_data, "global_pause": self.res.global_pause,
-                             "bili": self.do_bili, "gdsync": self.do_gdsync}
+                                "bili": self.do_bili, "gdsync": self.do_gdsync}
                 with open(self.state_file, "w", encoding="utf-8") as f:
                     json.dump(flat_data, f, ensure_ascii=False, indent=2)
             else:
@@ -961,7 +961,7 @@ class BatchEngine:
 
             # 4. 判定环节状态
             files = os.listdir(task.workdir)
-           
+            
             # 前置检查：如果上传标记都已存在，直接判完成，无需检查中间产物
             has_bili_done = os.path.exists(os.path.join(task.workdir, ".bili_uploaded"))
             has_synced = os.path.exists(os.path.join(task.workdir, ".synced"))
@@ -971,10 +971,15 @@ class BatchEngine:
             # - If neither is enabled, hardsub+burn_complete is enough (checked below)
             upload_done = (not self.do_bili or has_bili_done) and (not self.do_gdsync or has_synced)
             if upload_done:
-                task.status = "完成"
-                for k in task.pcts: task.pcts[k] = 100.0
-                task.error = None
-                return
+               task.status = "完成"
+               # Only mark enabled stages as 100%; disabled stages stay at 0 to avoid
+               # misleading the user into thinking an upload happened when it was skipped.
+               for k in task.pcts:
+                   if k == "GD" and not self.do_gdsync: continue
+                   if k == "BI" and not self.do_bili: continue
+                   task.pcts[k] = 100.0
+               task.error = None
+               return
 
             # --- 优雅自愈与校验：如果存在 _hardsub 视频，校验其时长并维护 .burn_complete 状态 ---
             has_hardsub = any("_hardsub" in f and f.endswith((".mp4", ".mkv", ".webm")) for f in files)
@@ -1210,11 +1215,18 @@ class BatchEngine:
                 elif "TR" in task.status:
                     stage = "TR"
                     vids = [f for f in os.listdir(workdir) if f.endswith((".mp4", ".mkv", ".webm")) and "_hardsub" not in f and not re.search(r'\.f\d+\.', f)]
+                    settings = self._load_global_settings()
                     cmd = list(TRANSCRIBER_CMD) + [os.path.join(workdir, vids[0]), "--output", workdir, "--no-gui"]
+                    if settings.get("language"):
+                        cmd += ["--language", settings["language"]]
+                    # Multi-language detection: per-task or global
+                    is_multilang = getattr(self, 'multilang', False)
+                    multilang_tasks = getattr(self, 'multilang_tasks', set())
+                    if is_multilang and (not multilang_tasks or str(task.uid) in multilang_tasks):
+                        cmd.append("--multilang")
                 elif "TL" in task.status:
                     stage = "TL"
                     srts = [f for f in os.listdir(workdir) if f.endswith(".srt") and not re.search(r'(\.zh|\.cn|\.bi)\.srt$', f)]
-                    settings = self._load_global_settings()
                     model = settings.get("llm_model", "gemini-3-flash-preview")
                     style = settings.get("style", "auto")
                     cmd = list(SMART_TRANSLATE_CMD) + [os.path.join(workdir, srts[0]), "--model", model, "--style", style]
@@ -1237,8 +1249,10 @@ class BatchEngine:
                     if settings.get("main_lang"): ass_cmd += ["--main-lang", settings["main_lang"]]
                     if settings.get("cn_font"): ass_cmd += ["--cn-font", settings["cn_font"]]
                     if settings.get("en_font"): ass_cmd += ["--en-font", settings["en_font"]]
+                    if settings.get("jp_font"): ass_cmd += ["--ja-font", settings["jp_font"]]
                     if settings.get("cn_size"): ass_cmd += ["--cn-size", settings["cn_size"]]
                     if settings.get("en_size"): ass_cmd += ["--en-size", settings["en_size"]]
+                    if settings.get("jp_size"): ass_cmd += ["--ja-size", settings["jp_size"]]
                     if settings.get("cn_color"): ass_cmd += ["--cn-color", settings["cn_color"]]
                     if settings.get("en_color"): ass_cmd += ["--en-color", settings["en_color"]]
                     if settings.get("bg_box") is False: ass_cmd += ["--no-bg-box"]
@@ -1590,6 +1604,8 @@ def main():
     parser.add_argument("--state-file", help="Path to state file")
     parser.add_argument("--quality", choices=["standard", "high", "lossless"], default="high", help="压制字幕画质 (standard, high, lossless)")
     parser.add_argument("--no-sequence", action="store_true", help="不要在视频文件夹名称前加序列号")
+    parser.add_argument("--multilang", action="store_true", help="启用多语言检测（混合语言视频自动分段检测语言）")
+    parser.add_argument("--multilang-tasks", default="", help="仅对指定任务启用多语言检测 (逗号分隔的 UID, 默认全部)")
     args = parser.parse_args()
 
     engine = BatchEngine(output_dir=args.output, sub_dir_name=args.sub_dir_name, state_file=args.state_file)
@@ -1597,6 +1613,10 @@ def main():
     engine.do_gdsync = args.gdsync
     engine.do_bili = args.bili_upload
     engine.no_sequence = args.no_sequence
+    engine.multilang = args.multilang
+    engine.multilang_tasks = set()
+    if args.multilang_tasks:
+        engine.multilang_tasks = {t.strip() for t in args.multilang_tasks.split(",") if t.strip()}
     if args.cookies:
         engine.cookie_path = args.cookies
 

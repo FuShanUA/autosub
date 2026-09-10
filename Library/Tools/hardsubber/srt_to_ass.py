@@ -43,6 +43,13 @@ def parse_srt(file_path):
             s, e = time_line.split(' --> ')
             start = srt_timestamp_to_ass(s.strip())
             end = srt_timestamp_to_ass(e.split(' ')[0].strip())
+            # Safety: if Start > End (can happen with speaker diarization
+            # overlapping segments), swap them. Only affects invalid blocks.
+            def _ass_to_seconds(ts):
+                parts = ts.split(':')
+                return int(parts[0])*3600 + int(parts[1])*60 + float(parts[2])
+            if _ass_to_seconds(start) > _ass_to_seconds(end):
+                start, end = end, start
         except: continue
 
         cn_parts = []
@@ -670,6 +677,7 @@ if __name__ == "__main__":
     parser.add_argument("--cn-font")
     parser.add_argument("--en-font")
     parser.add_argument("--ja-font", help="Japanese font for kana-bearing text")
+    parser.add_argument("--ja-size", help="Japanese font size")
     parser.add_argument("--cn-size")
     parser.add_argument("--en-size")
     parser.add_argument("--cn-color")

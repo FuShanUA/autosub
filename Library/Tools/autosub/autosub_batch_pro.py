@@ -1368,6 +1368,8 @@ class BatchEngine:
                     if settings.get("main_lang"): ass_cmd += ["--main-lang", settings["main_lang"]]
                     if settings.get("cn_font"): ass_cmd += ["--cn-font", settings["cn_font"]]
                     if settings.get("en_font"): ass_cmd += ["--en-font", settings["en_font"]]
+                    if settings.get("jp_font"): ass_cmd += ["--ja-font", settings["jp_font"]]
+                    if settings.get("jp_size"): ass_cmd += ["--ja-size", settings["jp_size"]]
                     if settings.get("cn_size"): ass_cmd += ["--cn-size", settings["cn_size"]]
                     if settings.get("en_size"): ass_cmd += ["--en-size", settings["en_size"]]
                     if settings.get("cn_color"): ass_cmd += ["--cn-color", settings["cn_color"]]

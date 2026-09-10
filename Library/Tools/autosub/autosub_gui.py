@@ -79,8 +79,10 @@ class AutoSubGUI:
     layout_var: tk.StringVar
     main_lang_var: tk.StringVar
     cn_font_var: tk.StringVar
+    jp_font_var: tk.StringVar
     en_font_var: tk.StringVar
     cn_size_var: tk.StringVar
+    jp_size_var: tk.StringVar
     en_size_var: tk.StringVar
     cn_color_var: tk.StringVar
     en_color_var: tk.StringVar
@@ -161,6 +163,7 @@ class AutoSubGUI:
             "trans_mode": "balanced", "quick": False, "remove_ads": False, "quality": "high",
             "layout": "bilingual", "main_lang": "cn",
             "cn_font": "STKaiti", "en_font": "Calibri",
+            "jp_font": "Hiragino Maru Gothic ProN", "jp_size": "36",
             "cn_size": "60", "en_size": "36",
             "cn_color": "Gold", "en_color": "White",
             "bg_box": True,
@@ -266,6 +269,8 @@ class AutoSubGUI:
         ttk.Checkbutton(f2, text="快捷转录（大模型/网页视频实验性）", variable=self.quick_var).grid(row=4, column=0, columnspan=2, sticky="w", pady=5)
         self.remove_ads_var = tk.BooleanVar(value=bool(self.settings.get("remove_ads", False)))
         ttk.Checkbutton(f2, text="剪除广告片段", variable=self.remove_ads_var).grid(row=4, column=2, columnspan=2, sticky="w", pady=5)
+        self.multilang_var = tk.BooleanVar(value=bool(self.settings.get("multilang", False)))
+        ttk.Checkbutton(f2, text="多语言检测（混合语言视频自动分段检测）", variable=self.multilang_var).grid(row=5, column=0, columnspan=4, sticky="w", pady=5)
 
         # 3. Subtitle Style (Parent: tab2)
         f3 = ttk.LabelFrame(self.tab2, text=" 字幕样式 ", padding=10)
@@ -273,10 +278,11 @@ class AutoSubGUI:
         self.create_style_row(f3, "布局模式:", "layout_var", ["bilingual", "cn", "en"], "首选语言:", "main_lang_var", ["cn", "en"], 0)
         self.create_style_row(f3, "中文样式:", "cn_font_var", ["STKaiti", "PingFang SC"], "字号:", "cn_size_var", None, 1)
         self.create_style_row(f3, "英文样式:", "en_font_var", ["Arial", "Calibri"], "字号:", "en_size_var", None, 2)
-        self.create_style_row(f3, "中文颜色:", "cn_color_var", ["Gold", "White", "Yellow"], "英文颜色:", "en_color_var", ["White", "Gold", "Gray"], 3)
+        self.create_style_row(f3, "日文样式:", "jp_font_var", ["Hiragino Maru Gothic ProN", "YuMincho", "STKaiti"], "字号:", "jp_size_var", None, 3)
+        self.create_style_row(f3, "中文颜色:", "cn_color_var", ["Gold", "White", "Yellow"], "原语言颜色:", "en_color_var", ["White", "Gold", "Gray"], 4)
 
         self.bg_box_var = tk.BooleanVar(value=bool(self.settings.get("bg_box", True)))
-        ttk.Checkbutton(f3, text="启用背景框", variable=self.bg_box_var).grid(row=4, column=0, columnspan=2, sticky="w", pady=5)
+        ttk.Checkbutton(f3, text="启用背景框", variable=self.bg_box_var).grid(row=5, column=0, columnspan=2, sticky="w", pady=5)
 
         # 4. Cloud Sync (Parent: tab2)
         f4 = ttk.LabelFrame(self.tab2, text=" 云端同步 ", padding=10)
@@ -622,9 +628,12 @@ class AutoSubGUI:
         cmd.extend(["--style", s_style, "--trans-mode", t_mode, "--quality", self.quality_var.get()])
         cmd.extend(["--layout", self.layout_var.get(), "--main-lang", self.main_lang_var.get()])
         cmd.extend(["--cn-font", self.cn_font_var.get(), "--en-font", self.en_font_var.get()])
+        cmd.extend(["--ja-font", self.jp_font_var.get()])
         cmd.extend(["--cn-size", self.cn_size_var.get(), "--en-size", self.en_size_var.get()])
+        cmd.extend(["--ja-size", self.jp_size_var.get()])
         if not self.bg_box_var.get(): cmd.append("--no-bg-box")
         if self.quick_var.get(): cmd.append("--quick")
+        if self.multilang_var.get(): cmd.append("--multilang")
         c_val = self.cookies_var.get().strip()
         if c_val:
             cmd.extend(["--cookies", c_val])
@@ -973,6 +982,8 @@ class AutoSubGUI:
             "layout": self.layout_var.get(),
             "main_lang": self.main_lang_var.get(),
             "cn_font": self.cn_font_var.get(),
+            "jp_font": self.jp_font_var.get(),
+            "jp_size": self.jp_size_var.get(),
             "en_font": self.en_font_var.get(),
             "cn_size": self.cn_size_var.get(),
             "en_size": self.en_size_var.get(),
@@ -981,6 +992,7 @@ class AutoSubGUI:
             "bg_box": self.bg_box_var.get(),
             "api_key": self.api_key_var.get(),
             "quick": self.quick_var.get(),
+            "multilang": self.multilang_var.get(),
             "sync_gdrive": self.sync_gdrive_var.get(),
             "gdrive_enabled": self.gdrive_enabled_var.get(),
             "vendor_default_models": self.vendor_default_models

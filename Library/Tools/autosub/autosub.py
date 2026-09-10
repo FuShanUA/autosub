@@ -614,11 +614,13 @@ def download_video(url, workdir, cookies=None, quick=False, start_time=None, end
         print(f"❌ Error during download: {e}")
         return None
     return None
-def transcribe_video(video_path, workdir, model="large-v2", quick=False):
+def transcribe_video(video_path, workdir, model="large-v2", quick=False, multilang=False):
     print(f"🎙️ Transcribing {os.path.basename(video_path)}...", flush=True)
     cmd = list(TRANSCRIBER_CMD) + [video_path, "--model", model, "--output", workdir, "--no-gui"]
     if quick:
         cmd.append("--quick")
+    if multilang:
+        cmd.append("--multilang")
     try:
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', bufsize=1, creationflags=CREATE_NO_WINDOW)
         for line in process.stdout or []:
@@ -674,7 +676,7 @@ def merge_bilingual(src_srt, zh_srt, main_lang="cn", llm_model="gemini-3.1-pro-p
         print(f"❌ Merge launch error: {e}")
         return None
 
-def burn_subtitle(video_path, srt_path, layout, main_lang, cn_font, en_font, ja_font, cn_size, en_size, cn_color, en_color, bg_box=True, quality="high"):
+def burn_subtitle(video_path, srt_path, layout, main_lang, cn_font, en_font, ja_font, cn_size, en_size, cn_color, en_color, bg_box=True, quality="high", ja_size=None):
     print("🔥 Burning subtitles...", flush=True)
     base_srt, _ = os.path.splitext(srt_path)
     ass_path = base_srt + ".ass"
@@ -685,6 +687,7 @@ def burn_subtitle(video_path, srt_path, layout, main_lang, cn_font, en_font, ja_
  
     if not os.path.exists(ass_path):
          cmd = list(SRT2ASS_CMD) + [srt_path, ass_path, "--layout", layout, "--main-lang", main_lang, "--cn-font", cn_font, "--en-font", en_font, "--ja-font", ja_font, "--cn-size", cn_size, "--en-size", en_size, "--cn-color", cn_color, "--en-color", en_color]
+         if ja_size: cmd += ["--ja-size", str(ja_size)]
          cmd += ["--width", str(width), "--height", str(height)]
          if not bg_box: cmd.append("--no-bg-box")
          subprocess.run(cmd, check=True, creationflags=CREATE_NO_WINDOW)
@@ -790,7 +793,7 @@ def extract_cover_art(audio_path, out_path):
     return None
 
 
-def burn_audio_subtitles(audio_path, srt_path, layout, main_lang, cn_font, en_font, ja_font, cn_size, en_size, cn_color, en_color, bg_box=True, quality="high"):
+def burn_audio_subtitles(audio_path, srt_path, layout, main_lang, cn_font, en_font, ja_font, cn_size, en_size, cn_color, en_color, bg_box=True, quality="high", ja_size=None):
     """Burn subtitles into an audio-only file by looping the embedded cover art
     into a video stream and rendering the ASS subtitles onto it. Output is an MP4
     (so the result is uploadable to Bilibili etc.). Returns output path or None."""
@@ -810,6 +813,7 @@ def burn_audio_subtitles(audio_path, srt_path, layout, main_lang, cn_font, en_fo
                                     "--cn-size", cn_size, "--en-size", en_size,
                                     "--cn-color", cn_color, "--en-color", en_color,
                                     "--width", str(width), "--height", str(height)]
+         if ja_size: cmd += ["--ja-size", str(ja_size)]
          if not bg_box: cmd.append("--no-bg-box")
          subprocess.run(cmd, check=True, creationflags=CREATE_NO_WINDOW)
 
@@ -1011,6 +1015,7 @@ def main():
     parser.add_argument("--ja-font", default=DEFAULTS.get("ja_font", "Hiragino Sans"))
     parser.add_argument("--cn-size", default=DEFAULTS.get("cn_size", "60"))
     parser.add_argument("--en-size", default=DEFAULTS.get("en_size", "36"))
+    parser.add_argument("--ja-size", default=DEFAULTS.get("ja_size", "36"), help="Japanese font size")
     parser.add_argument("--cn-color", default=DEFAULTS.get("cn_color", "Gold"))
     parser.add_argument("--en-color", default=DEFAULTS.get("en_color", "White"))
     parser.add_argument("--no-bg-box", action="store_true")
@@ -1024,6 +1029,7 @@ def main():
     parser.add_argument("--end", help="End time (e.g. 00:03:00 or 180)")
     parser.add_argument("--quality", default="high", choices=["standard", "high", "lossless"], help="Burn quality (standard, high, lossless)")
     parser.add_argument("--upload-only", action="store_true", help="Skip transcription/translation/burn; only upload existing hardsub video to GDrive/Bilibili")
+    parser.add_argument("--multilang", action="store_true", help="Enable per-segment language detection for mixed-language videos")
     args = parser.parse_args()
     
     # --- Intelligent Time Parsing ---
@@ -1270,7 +1276,7 @@ def main():
                 break
     
     if not src_srt:
-        src_srt = transcribe_video(video_path, workdir, args.model, quick=args.quick)
+        src_srt = transcribe_video(video_path, workdir, args.model, quick=args.quick, multilang=args.multilang)
     
     if not src_srt:
         print("❌ Transcription failed")
@@ -1346,11 +1352,16 @@ def main():
             cmd = [py_exe, SMART_TRANSLATE_CMD[1], src_srt, "--style", args.style, "--model", args.llm_model, "--trans-mode", getattr(args, "trans_mode", "balanced")]
             if getattr(args, "llm_provider", None):
                 cmd.extend(["--provider", args.llm_provider])
-            res = subprocess.run(cmd, check=True, creationflags=CREATE_NO_WINDOW, capture_output=True, text=True, encoding="utf-8", errors="replace")
-            if res.stdout:
-                print(res.stdout.strip())
-            if res.stderr:
-                print(res.stderr.strip(), file=sys.stderr)
+            # Stream output in real-time so the user sees progress
+            # (translation can take several minutes with reasoning models)
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', bufsize=1, creationflags=CREATE_NO_WINDOW)
+            for line in proc.stdout or []:
+                line = line.rstrip('\n')
+                if line:
+                    print(line, flush=True)
+            proc.wait()
+            if proc.returncode != 0:
+                print(f"⚠️ Translation exited with code {proc.returncode}")
             if os.path.exists(expected_cn): zh_srt = expected_cn
             elif os.path.exists(expected_zh): zh_srt = expected_zh
         except Exception as e:
@@ -1390,7 +1401,7 @@ def main():
         if os.path.exists(out_video) and os.path.getsize(out_video) > 1024 * 1024 and os.path.exists(marker_file):
             print(f"✅ Found existing hardsub: {os.path.basename(out_video)} (Skipping burn stage)")
         else:
-            burn_audio_subtitles(video_path, final_srt, args.layout, args.main_lang, args.cn_font, args.en_font, args.ja_font, args.cn_size, args.en_size, args.cn_color, args.en_color, not args.no_bg_box, args.quality)
+            burn_audio_subtitles(video_path, final_srt, args.layout, args.main_lang, args.cn_font, args.en_font, args.ja_font, args.cn_size, args.en_size, args.cn_color, args.en_color, not args.no_bg_box, args.quality, args.ja_size)
     else:
        # Check if hardsub already exists (video path)
        video_ext = os.path.splitext(video_path)[1]
@@ -1398,7 +1409,7 @@ def main():
        if os.path.exists(out_video) and os.path.getsize(out_video) > 1024 * 1024 and os.path.exists(marker_file):
             print(f"✅ Found existing hardsub: {os.path.basename(out_video)} (Skipping burn stage)")
        else:
-            burn_subtitle(video_path, final_srt, args.layout, args.main_lang, args.cn_font, args.en_font, args.ja_font, args.cn_size, args.en_size, args.cn_color, args.en_color, not args.no_bg_box, args.quality)
+            burn_subtitle(video_path, final_srt, args.layout, args.main_lang, args.cn_font, args.en_font, args.ja_font, args.cn_size, args.en_size, args.cn_color, args.en_color, not args.no_bg_box, args.quality, args.ja_size)
     
     print("✅ All done!", flush=True)
 

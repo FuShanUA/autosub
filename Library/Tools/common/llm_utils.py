@@ -534,10 +534,12 @@ class LLMClient:
         try:
             # Adaptive timeout: reasoning models with thinking enabled can take
             # 120-250s for large translation chunks (50 blocks + glossary + style).
-            # Use 300s to avoid premature read timeouts. Thinking-disabled calls
-            # (spellcheck, etc.) finish in <30s, so 180s is more than sufficient.
+            # Use (10s connect, 300s read) for thinking, (10s, 90s) for non-thinking.
+            # The 10s connect timeout ensures fast failure on unreachable proxies;
+            # the 300s read timeout accommodates genuine long reasoning calls.
+            # The connect timeout of 10s ensures fast failure on unreachable proxies.
             _is_thinking = is_reasoning and not _disable_thinking
-            _http_timeout = 300 if _is_thinking else 180
+            _http_timeout = (10, 300) if _is_thinking else (10, 90)
             response = _post(f"{base_url}/chat/completions", headers=headers, json=data, timeout=_http_timeout)
             if response.status_code != 200:
                 try:
@@ -801,7 +803,10 @@ class LLMClient:
             # With a multi-model cascade, retrying each model 3x is too slow
             # (4 models × 3 retries × 90s timeout = 18 min per chunk).
             # Scale down retries so the cascade can actually reach later models.
-            max_retries = 1 if len(targets) > 2 else (2 if len(targets) > 1 else 3)
+            # Also cap at 1 retry for single-target no-fallback calls to avoid
+            # 15-minute hangs when a proxy intercepts the connection (300s × 3
+            # retries = 900s). With the reduced 120s timeout, 1 retry = ~240s max.
+            max_retries = 1 if len(targets) > 2 else (2 if len(targets) > 1 else 2)
             attempt = 0
             while True:
                 try:
@@ -881,8 +886,9 @@ class LLMClient:
             per_task_timeout = int(_env_timeout)
         else:
             # Auto-scale: 300s per chunk-wave (ceil(N/W) waves), min 300s.
-            # Thinking-disabled calls are fast (<30s), so the floor of 300s
-            # is generous for non-reasoning models too.
+            # Thinking models can take 120-250s per chunk; with 1 retry that's
+            # up to 600s per wave. The 300s floor is generous for non-reasoning
+            # models too (they typically finish in <30s).
             _mn = model_name.lower() if model_name else ''
             _is_reasoning = any(x in _mn for x in ['o1', 'o3', 'reasoner', 'k2.6', 'k2.5', 'k3', 'kimi-k3', 'glm-5', 'glm5', 'deepseek-v4-pro', 'r1'])
             _is_thinking = _is_reasoning and not disable_thinking

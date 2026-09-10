@@ -428,7 +428,7 @@ _PROVIDER_CATALOG = [
     {
         "name": "Google Gemini / Vertex AI",
         "keys": ["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_CLOUD_PROJECT",
-                 "VERTEX_SA_KEY_PATH", "GOOGLE_APPLICATION_CREDENTIALS"],
+                    "VERTEX_SA_KEY_PATH", "GOOGLE_APPLICATION_CREDENTIALS"],
         "models": [
             "gemini-2.5-flash",
             "gemini-2.5-pro",
@@ -671,13 +671,17 @@ def main():
                         cookies_path = state_data.get("cookies", first_task.get("cookies") if isinstance(first_task, dict) else None)
                         browser = state_data.get("browser", first_task.get("browser") if isinstance(first_task, dict) else None)
                         do_sync = state_data.get("gdsync", first_task.get("gdsync", True) if isinstance(first_task, dict) else True)
+                        # Ask user to confirm GD sync on resume (state may have it disabled)
+                        if not do_sync:
+                            do_sync = Confirm.ask("\n是否同步到 Google Drive?", default=True)
+                            state_data["gdsync"] = do_sync
                         # Auto deduct if previous project skipped sequence prefix
                         workdir = first_task.get("workdir", "")
                         if workdir:
                             folder_name_only = os.path.basename(workdir)
                             if not re.match(r'^\[\d+\]\s*-', folder_name_only):
                                 no_sequence = True
-                
+
                 cmd = [
                     PYTHON_EXE,
                     BATCH_SCRIPT,
@@ -696,7 +700,7 @@ def main():
                     cmd.append("--gdsync")
                 if do_bili:
                     cmd.append("--bili-upload")
-                
+
                 launch_engine(cmd)
                 return
         else:
@@ -740,13 +744,17 @@ def main():
                         cookies_path = state_data.get("cookies", first_task.get("cookies") if isinstance(first_task, dict) else None)
                         browser = state_data.get("browser", first_task.get("browser") if isinstance(first_task, dict) else None)
                         do_sync = state_data.get("gdsync", first_task.get("gdsync", True) if isinstance(first_task, dict) else True)
+                        # Ask user to confirm GD sync on resume (state may have it disabled)
+                        if not do_sync:
+                            do_sync = Confirm.ask("\n是否同步到 Google Drive?", default=True)
+                            state_data["gdsync"] = do_sync
                         # Auto deduct if previous project skipped sequence prefix
                         workdir = first_task.get("workdir", "")
                         if workdir:
                             folder_name_only = os.path.basename(workdir)
                             if not re.match(r'^\[\d+\]\s*-', folder_name_only):
                                 no_sequence = True
-                
+               
                 cmd = [
                     PYTHON_EXE,
                     BATCH_SCRIPT,
@@ -765,11 +773,11 @@ def main():
                     cmd.append("--gdsync")
                 if do_bili:
                     cmd.append("--bili-upload")
-                
+
                 launch_engine(cmd)
                 return
 
-    # 1. URL Input
+   # 1. URL Input
     url_input = ""
     while not url_input:
         url_input = Prompt.ask("\n[bold yellow]请输入播放列表/视频 URL 或 .txt 文件路径[/]").strip().strip('"')
@@ -934,6 +942,19 @@ def main():
     do_bili = Confirm.ask("\n是否上传到 Bilibili? (分区/标签/简介/合集按视频自动生成)", default=True)
     quality = Prompt.ask("\n选择压制字幕画质 (standard: 标准质量, high: 高清原画, lossless: 无损超清)", choices=["standard", "high", "lossless"], default="high")
 
+    # 3.4 Multi-language detection (for mixed-language videos)
+    multilang = False
+    multilang_tasks = ""
+    settings = _load_settings()
+    if settings.get("multilang", False):
+        multilang = True
+        console.print("\n[bold green]🌐 多语言检测已启用（来自 GUI 设置）[/]")
+    elif Confirm.ask("\n是否启用多语言检测? (适用于英日/中英等混合语言视频，自动分段检测语言)", default=False):
+        multilang = True
+    if multilang and not is_single_video and len(entries) > 1:
+        console.print(f"\n共 {len(entries)} 个视频，可选择对部分视频启用多语言检测。")
+        multilang_tasks = Prompt.ask("要对哪些视频启用? (如 1,3,5; 默认全部)", default="")
+
     # 3.5 Model Selection (optional, default: no change)
     onboard_model_selection()
 
@@ -945,6 +966,7 @@ def main():
         elif current_browser: cmd.extend(["--cookies-from-browser", current_browser])
         if do_sync: cmd.extend(["--sync-gdrive", GDRIVE_FOLDER_ID])
         if do_bili: cmd.append("--bili-upload")
+        if multilang: cmd.append("--multilang")
     else:
         # Pre-seed the batch_state.json to avoid redundant yt-dlp fetch in batch_v4
         project_dir = os.path.join(DEFAULT_OUTPUT_ROOT, folder_name)
@@ -1050,6 +1072,10 @@ def main():
                 cmd.extend(["--exclude", sel])
         if do_sync: cmd.append("--gdsync")
         if do_bili: cmd.append("--bili-upload")
+        if multilang:
+            cmd.append("--multilang")
+            if multilang_tasks:
+                cmd.extend(["--multilang-tasks", multilang_tasks])
 
     console.print(f"\n[bold green]🚀 启动 {'单视频处理' if is_single_video else '批处理'} 引擎...[/]")
     launch_engine(cmd)
