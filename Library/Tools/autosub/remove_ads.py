@@ -123,6 +123,199 @@ def merge_ad_segments(ad_segments):
     return merged
 
 
+def expand_ad_boundaries(merged, blocks, gap_threshold=3.0):
+    """Extend each ad span outward to absorb silent ad visuals (B-roll,
+    transition cards) that have no subtitle text.
+
+    Ad reads are often surrounded by a few seconds of sponsor visuals with
+    no voiceover.  The LLM detects ad *blocks* (which have subtitles), but the
+    gap between the last content block and the first ad block -- or between
+    the last ad block and the next content block -- is also part of the ad.
+
+    For each ad span we look at the neighbouring content blocks.  If the time
+    gap between the ad edge and the neighbour exceeds *gap_threshold* seconds,
+    we extend the ad edge to the neighbour's boundary, effectively absorbing
+    the silent gap into the cut.
+    """
+    return _expand_ad_boundaries_impl(merged, blocks, gap_threshold, padding=3.0)
+
+
+def _expand_ad_boundaries_impl(merged, blocks, gap_threshold=3.0, padding=0.0):
+    """Implementation with optional padding (seconds added to each side)."""
+    if not merged or not blocks:
+        return merged
+
+    # Build a sorted list of (start, end) for every block.
+    blk_times = sorted(
+        ((float(b.get("start", 0)), float(b.get("end", 0))) for b in blocks),
+        key=lambda x: x[0],
+    )
+
+    expanded = []
+    for ad_s, ad_e in merged:
+        new_s = ad_s
+        new_e = ad_e
+
+        # --- Extend start backward ---
+        # Find the last content block that ends before the ad starts.
+        prev_end = None
+        for bs, be in blk_times:
+            if be <= ad_s:
+                prev_end = be  # keep updating; we want the closest one
+            elif bs >= ad_s:
+                break
+        if prev_end is not None and (ad_s - prev_end) > gap_threshold:
+            new_s = prev_end
+
+        # --- Extend end forward ---
+        # Find the first content block that starts after the ad ends.
+        next_start = None
+        for bs, be in blk_times:
+            if bs >= ad_e:
+                next_start = bs
+                break
+        if next_start is not None and (next_start - ad_e) > gap_threshold:
+            new_e = next_start
+
+        # --- Apply padding ---
+        # Start padding: clamp to prev_end so we never cut dialogue audio.
+        if prev_end is not None:
+            new_s = max(new_s - padding, prev_end)
+        else:
+            new_s = max(new_s - padding, 0.0)
+
+        # End padding: ad visuals (B-roll, transition cards) often linger
+        # past the first post-ad subtitle block.  We extend the cut forward
+        # but NEVER past the SECOND post-ad block's start -- that block is
+        # guaranteed pure content, so cutting into it would drop dialogue.
+        # This lets us absorb ad visuals from the first post-ad block
+        # (which is often a mixed ad-cleanup + content-resume block) while
+        # protecting real content.
+        if next_start is not None:
+            # Find the second post-ad block start.
+            next_next_start = None
+            found_first = False
+            for bs, be in blk_times:
+                if bs >= ad_e:
+                    if not found_first:
+                        found_first = True
+                        continue
+                    next_next_start = bs
+                    break
+            if next_next_start is not None:
+                new_e = min(new_e + padding, next_next_start)
+            else:
+                new_e = new_e + padding
+        else:
+            new_e = new_e + padding
+
+        expanded.append((new_s, new_e))
+
+    # Re-merge in case expansion caused overlaps.
+    expanded.sort(key=lambda x: x[0])
+    final = []
+    for s, e in expanded:
+        if final and s <= final[-1][1]:
+            final[-1] = (final[-1][0], max(final[-1][1], e))
+        else:
+           final.append((s, e))
+    return final
+
+
+def refine_boundaries_with_vad(merged, media_path, search_window=15.0):
+    """Use Voice Activity Detection to snap ad boundaries to speech edges.
+
+    Stream-copy cutting is limited to keyframe positions, but the real
+    problem is knowing *where* speech resumes after an ad and *where* it
+    ends before one.  VAD gives us exact speech timestamps, so we can:
+
+    - For ad START: find the last speech segment that ends before the ad,
+      and snap the cut to just after it (protecting the last word of dialogue).
+    - For ad END: find the first speech segment that starts after the ad,
+      and snap the cut to just before it (protecting the first word of
+      resumed dialogue, while cutting any silent ad visuals before it).
+
+    This keeps the gap between content and ad at <1s of silence instead
+    of the 3-6s of ad B-roll that subtitle-based boundaries leave behind.
+    """
+    if not merged or not media_path:
+        return merged
+    try:
+        from faster_whisper.audio import decode_audio
+        from faster_whisper.vad import get_speech_timestamps, VadOptions
+    except ImportError:
+        print("   ⚠️ faster_whisper VAD not available, skipping boundary refinement")
+        return merged
+
+    # Decode the full audio once (16kHz mono, as expected by Silero VAD).
+    try:
+        audio = decode_audio(media_path)
+    except Exception as e:
+        print(f"   ⚠️ VAD audio decode failed ({e}), skipping refinement")
+        return merged
+
+    SR = 16000  # sample rate used by decode_audio
+    vad_opts = VadOptions(min_silence_duration_ms=300, speech_pad_ms=200,
+                          max_speech_duration_s=30)
+    try:
+        vad_segs = get_speech_timestamps(audio, vad_opts)
+    except Exception as e:
+        print(f"   ⚠️ VAD failed ({e}), skipping refinement")
+        return merged
+
+    # Convert VAD segments (sample offsets) to seconds.
+    speech = []
+    for seg in vad_segs:
+        s = seg.get("start", 0) / SR
+        e = seg.get("end", 0) / SR
+        if e - s >= 0.3:  # ignore tiny blips
+            speech.append((s, e))
+
+    if not speech:
+        print("   ⚠️ VAD found no speech, skipping refinement")
+        return merged
+
+    print(f"   🎙️ VAD: {len(speech)} speech segments. Refining {len(merged)} ad boundary(ies)...")
+
+    refined = []
+    for ad_s, ad_e in merged:
+        new_s = ad_s
+        new_e = ad_e
+
+        # --- Refine START: snap to last speech ending before ad ---
+        # Find speech segments in [ad_s - search_window, ad_s + 2]
+        last_speech_end = None
+        for ss, se in speech:
+            if se <= ad_s + 2 and ss >= ad_s - search_window:
+                last_speech_end = se  # closest one before ad
+        if last_speech_end is not None and last_speech_end < ad_s:
+            # Cut just after the last speech ends, with 0.3s safety margin
+            new_s = last_speech_end + 0.3
+
+        # --- Refine END: snap to first speech start after ad ---
+        # Find speech segments in [ad_e - 2, ad_e + search_window]
+        first_speech_start = None
+        for ss, se in speech:
+            if ss >= ad_e - 2 and ss <= ad_e + search_window:
+                first_speech_start = ss
+                break
+        if first_speech_start is not None and first_speech_start > ad_e:
+            # Cut just before speech resumes, with 0.3s safety margin
+            new_e = first_speech_start - 0.3
+
+        refined.append((new_s, new_e))
+
+    # Re-merge
+    refined.sort(key=lambda x: x[0])
+    final = []
+    for s, e in refined:
+        if final and s <= final[-1][1]:
+            final[-1] = (final[-1][0], max(final[-1][1], e))
+        else:
+            final.append((s, e))
+    return final
+
+
 def build_remap(merged):
     """Return (remap_fn, total_removed). remap_fn(t) collapses ad spans out of t."""
     total = sum(e - s for s, e in merged)
@@ -456,6 +649,10 @@ def main():
         print(f"   Saved -> {os.path.basename(ad_json)}")
 
     merged = merge_ad_segments(ad_segments)
+    merged = expand_ad_boundaries(merged, blocks)
+    media_for_vad = find_media(project_dir, args.media)
+    if media_for_vad:
+        merged = refine_boundaries_with_vad(merged, media_for_vad)
     remap, total_removed = build_remap(merged)
 
     print(f"\nAd report: {len(merged)} segment(s), {total_removed:.1f}s (~{int(total_removed // 60)}m{int(total_removed % 60)}s) to cut.")

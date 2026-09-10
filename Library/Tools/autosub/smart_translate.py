@@ -74,7 +74,7 @@ def load_skill_rules(tool_name):
     content = ""
     if os.path.exists(readme_path):
         with open(readme_path, 'r', encoding='utf-8') as f:
-           content = f.read()
+            content = f.read()
     return content
 
 def _extract_rules(content: str) -> str:
@@ -139,7 +139,10 @@ ALIGNMENT_CONSTRAINTS = """### STEP 3.8: SYNCHRONIZATION & ALIGNMENT CONSTRAINTS
 - **Natural Reorganization Within Sentences**: When a sentence spans multiple blocks, you may redistribute the Chinese across those blocks in a way that reads naturally. The key constraint is: each CN block must still correspond to roughly the same span of meaning as its EN block. Moving words between adjacent blocks for fluency is acceptable; wholesale replacing block N\'s content with block N+1\'s content is not.
 - **Output count rule**: Output exactly the same number of [ID] lines as the input. If the input has 20 blocks, output exactly 20 [ID] lines.
 - **Pronoun & Role Accuracy**: In business/interview contexts, pay close attention to who is paying whom, who is the buyer vs. the seller, and who "they/them/you" refers to. A phrase like "the person you're paying a lot of money to" means the vendor/lab you're paying, NOT your customer. Getting the direction of money/value transfer wrong completely reverses the meaning. Always resolve pronoun references against the conversational context before translating.
-- **Context-Driven Word Sense**: When a word has multiple meanings, choose the sense that fits the speaker's context, not the most common dictionary sense. Examples: "highlighted" in a news segment means "特别指出/重点强调", not "提到"; "pain" for enterprises means "痛苦/困扰", not the business jargon "痛点"; "vulgar" for a blunt business complaint means "直来直去的/不客气的", not "粗俗的"; "world historic figure" means "划时代的人物", not "世界历史意义的人物". Always ask: what does the speaker actually mean here?"""
+- **Context-Driven Word Sense**: When a word has multiple meanings, choose the sense that fits the speaker's context, not the most common dictionary sense. Examples: "highlighted" in a news segment means "特别指出/重点强调", not "提到"; "pain" for enterprises means "痛苦/困扰", not the business jargon "痛点"; "vulgar" for a blunt business complaint means "直来直去的/不客气的", not "粗俗的"; "world historic figure" means "划时代的人物", not "世界历史意义的人物". Always ask: what does the speaker actually mean here?
+- **Proper Noun vs Common Word (CRITICAL)**: Some English words are BOTH a proper noun (company/fund name) and a common word. You MUST distinguish by context. "Conviction" as Sarah Guo\'s venture fund name stays in English ("Conviction内部最大的分歧"); "conviction" as a personal belief/investment thesis is translated as "确信" or "信念" ("leap of conviction" -> "纵身一跃的确信"). "Apple" the company stays "Apple"; "apple" the fruit is "苹果". When a company name appears in a sentence that also uses the same word as a common noun, keep the company name in English and translate the common noun.
+- **Idioms, Slang & Cultural References (CRITICAL)**: English idioms and cultural references MUST be translated by their MEANING, not word-for-word, and must NOT be confused with other idioms. "the cat is out of the bag" means "秘密已经泄露了/事情已经公开了" — do NOT confuse it with "the genie is out of the bottle" (which means something similar but is a DIFFERENT idiom — use the correct one). "reverse dog years" means time feels compressed (opposite of dog years where 1 year = 7), translate as "时间过得比狗年还快" or explain the meaning naturally. "leap of faith" -> "纵身一跃的信念". Always: (1) identify the idiom, (2) understand its actual meaning, (3) express that meaning in natural Chinese. Never substitute one English idiom for another in the translation.
+- **No Residual English (CRITICAL)**: Every English word in a block MUST be translated into Chinese, with ONLY these exceptions: (1) proper nouns — person names (Sarah, Mike, Andrej Karpathy), company/org names (OpenAI, DeepMind, Toyota Research, Greylock, Conviction), product names (ChatGPT, Cursor, Felix); (2) widely-used acronyms (AI, LP, VC, GPU, SSO, API); (3) brand/term names with no standard Chinese equivalent (DevCon, WorkOS). Common English words like "hopefully", "creativity", "genie", "actually", "so", "like" must ALWAYS be translated — never leave them embedded in a Chinese sentence. When in doubt about whether a word is a proper noun, translate it rather than keeping it in English."""
 
 
 # Retrieve API Keys from environment
@@ -339,7 +342,7 @@ TARGET STYLE: {style}
 2. **Context-Driven Meaning**: Use the 'Context Lines' to understand the full sentence, but only translate the specific 'Target Line'.
 3. **Synchronization Constraint (CRITICAL)**: Do not significantly restructure sentences across time boundaries. Ensure the meaning of each segment is self-contained enough to be understood at that specific moment. NEVER merge the content of consecutive blocks or skip block IDs in your output. Every input ID in `[ID]` format MUST have its exact corresponding translated line in the output. If a sentence spans across block boundaries (e.g., block N ends with a conjunction and block N+1 starts a clause), translate the fragments strictly into their corresponding blocks to prevent timeline shifts.
 4. **Glossary Consistency**: Strictly follow the terms provided in the 'ARTICLE ANALYSIS'.
-   - NOTE: Pre-translated terms like "前线部署工程师" (person) and "前线部署模式" (concept) may already appear in the input. When "前线部署模式" is used in a verbal/active context (e.g. "doing 前线部署模式 for X"), naturally adjust to "前线部署" for fluent Chinese.
+    - NOTE: Pre-translated terms like "前线部署工程师" (person) and "前线部署模式" (concept) may already appear in the input. When "前线部署模式" is used in a verbal/active context (e.g. "doing 前线部署模式 for X"), naturally adjust to "前线部署" for fluent Chinese.
 
 INPUT BLOCK:
 {input_text}
@@ -862,6 +865,7 @@ If ALL pairs are correctly aligned, output exactly: ALL_ALIGNED"""
         return final_blocks
 
     print(f"\U0001f50d LLM alignment check: verifying {total} blocks in {len(tasks)} batches...")
+    print(f"Progress: 97.5% (LLM alignment check: {len(tasks)} batches)", flush=True)
     results = client.generate_batch(tasks, model, fallback=False)
 
     misaligned_positions = []
@@ -958,7 +962,7 @@ def clean_untranslated_english(final_blocks: List[Dict], source_lines: Dict[str,
         return [w for w in words if w in filler or len(w) >= 3]
 
     flagged = [(i, str(b['index'])) for i, b in enumerate(final_blocks)
-               if len(_residual_en(" ".join(b.get('lines', [])))) >= 2]
+                if len(_residual_en(" ".join(b.get('lines', [])))) >= 1]
     if not flagged:
         print("✅ Residual-English check passed: no partially-translated blocks.")
         return final_blocks
@@ -1032,16 +1036,42 @@ def main():
         except ValueError:
             pass
 
+    # --- Early cache check: skip expensive pre-translation LLM scans when
+    # most blocks are already cached from a previous run. These scans
+    # (style detection, ad detection, terminology scan) each make an LLM
+    # call that can hang for 15+ minutes if the network routes through a
+    # proxy. When >50% of blocks are cached, the style and terminology
+    # were already determined in the previous run.
+    cache_path = os.path.join(os.path.dirname(input_path), os.path.splitext(os.path.basename(input_path))[0] + ".translation_cache.json")
+    _early_cached_count = 0
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                _early_cache = json.load(f)
+            _early_cached_count = len(_early_cache)
+        except:
+            pass
+    _cache_ratio = _early_cached_count / len(blocks) if blocks else 0
+    _skip_pre_scan = _cache_ratio > 0.5
+
     if args.style == "auto":
-        effective_style = detect_translation_style(blocks, args.model, provider=provider_enum)
+        if _skip_pre_scan:
+            effective_style = "casual"
+            print(f"⏩ {_early_cached_count}/{len(blocks)} blocks cached — skipping style detection (defaulting to {effective_style}).")
+        else:
+            effective_style = detect_translation_style(blocks, args.model, provider=provider_enum)
     print(f"   Style: {effective_style} (Configured: {args.style}) | Chunk Size: {args.chunk_size}")
 
     # 1.6 Ad / sponsor segment detection (full-transcript scan)
     # Identifies ad spans so they can be skipped during translation and
     # excluded when slicing clips. Result is also persisted to
     # <name>.ad_segments.json for downstream tools (e.g. clipcraft).
-    print("📺 Detecting ad / sponsor segments...")
-    ad_segments = detect_ad_segments(blocks, client, args.model, provider=provider_enum)
+    if _skip_pre_scan:
+        print(f"⏩ Skipping ad detection (cached run).")
+        ad_segments = []
+    else:
+        print("📺 Detecting ad / sponsor segments...")
+        ad_segments = detect_ad_segments(blocks, client, args.model, provider=provider_enum)
     if ad_segments:
         ad_json_path = os.path.join(
             os.path.dirname(input_path),
@@ -1057,8 +1087,6 @@ def main():
     total_chunks = math.ceil(len(blocks) / args.chunk_size)
     print(f"   Total Blocks: {len(blocks)} -> {total_chunks} Chunks")
 
-    # --- Cache Logic ---
-    cache_path = os.path.join(os.path.dirname(input_path), os.path.splitext(os.path.basename(input_path))[0] + ".translation_cache.json")
     translated_map = {}
     if os.path.exists(cache_path):
         try:
@@ -1116,16 +1144,22 @@ def main():
 ### PRE-BUILT GLOSSARY (always apply)
 - Qwen: 通义千问 (Alibaba's LLM; use "千问" after first mention)
 - telemetry: 运行数据 (NOT "遥测"; in enterprise context means operational/usage data)
+- Conviction: Keep in English when referring to Sarah Guo's venture capital FUND/FIRM (e.g. "inside of Conviction", "when you started Conviction", "Conviction内部最大的分歧"). Translate as "确信" or "信念" when used as a common noun meaning personal belief or investment conviction (e.g. "leap of conviction" -> "纵身一跃的确信", "climb to conviction" -> "慢慢建立确信", "behind conviction" -> "在确信的背后", "what conviction looks like" -> "确信是什么样的"). Context determines which sense applies.
 """
         knowledge_snippet = (knowledge_snippet or "") + PREBUILT_GLOSSARY
 
         # Dynamic terminology scan: detect domain-specific phrases in the source
         # text and build a per-video glossary. This prevents mistranslations of
         # terms like "Primacy of Winning" -> "赢的首要地位" (too literal).
-        print("📖 Scanning source text for domain-specific terminology...")
-        dynamic_glossary = scan_source_terminology(blocks, client, target_model, provider=provider_enum)
-        if dynamic_glossary:
-            knowledge_snippet = (knowledge_snippet or "") + dynamic_glossary
+        # Skip when most blocks are cached — the glossary was already built
+        # in the previous run and the PREBUILT_GLOSSARY above covers key terms.
+        if not _skip_pre_scan:
+            print("📖 Scanning source text for domain-specific terminology...")
+            dynamic_glossary = scan_source_terminology(blocks, client, target_model, provider=provider_enum)
+            if dynamic_glossary:
+                knowledge_snippet = (knowledge_snippet or "") + dynamic_glossary
+        else:
+            print("⏩ Skipping terminology scan (cached run).")
 
         if args.trans_mode == "balanced":
             trans_mode_snippet = """
@@ -1133,7 +1167,7 @@ def main():
     - **Understand First, Then Compress**: Read 3-5 consecutive blocks as a unit to understand the speaker\'s full thought, then express it in concise, natural Chinese. Do NOT translate word-by-word or block-by-block in isolation — each block\'s Chinese should flow into the next.
     - **Fluency Over Brevity**: Control length so subtitles are readable in their on-screen time, but never sacrifice fluency for brevity. A translation that reads naturally and is a few characters longer is better than a telegraphic one that feels robotic. Do not mechanically drop pronouns or conjunctions if removing them makes the Chinese sound abrupt or disconnected.
     - **Example Constraint**: "As Anurag said, this is our fifth DevCon in about 15 months, and momentum is palpable, I think." -> "正如 Anurag 所说，15个月内第五届 DevCon，势头非常迅猛。"
-    - **Metaphors & Terms**: Do not expand or explain (e.g., keep "DevCon", do not translate to "开发者大会" if it wastes space). Keep terms like "Gastown", "Ralph Wiggum" as direct translations or original English.
+    - **Metaphors & Terms**: Keep proper nouns and brand names in English (e.g., "DevCon" not "开发者大会", "Gastown", "Ralph Wiggum"). BUT English idioms, slang, and cultural references MUST be translated by their MEANING, not literally. "the cat is out of the bag" -> "秘密已经泄露了" (NOT "猫从袋子里出来了" and NOT confused with genie/bottle). "reverse dog years" -> "时间过得比狗年还快". "leap of faith" -> "纵身一跃的信念". Identify the idiom, understand its actual meaning, and express it in natural Chinese. Never substitute one English idiom for another.
     - **Context Injection**: Strictly forbidden. Do not add any explanatory background.
     """
         else:
@@ -1208,7 +1242,9 @@ def main():
                     elapsed = time.time() - start_time
                     # Slow crawl to 95% based on elapsed time; the last 5%
                     # jumps when generate_batch returns.
-                    pct = min(95.0, (elapsed / max(10.0, len(tasks) * 30)) * 100)
+                    # Crawl to 90% based on elapsed time; the remaining 10%
+                    # is covered by post-processing Progress prints.
+                    pct = min(90.0, (elapsed / max(10.0, len(tasks) * 30)) * 100)
                     if pct > last_print + 2:
                         last_print = round(pct, 1)
                         print(f"Progress: {last_print}% (Translating {len(tasks)} chunks...)", flush=True)
@@ -1340,6 +1376,7 @@ def main():
     untranslated_count = sum(1 for b in final_blocks if is_untranslated(b))
     if untranslated_count > 0:
         print(f"\n🔍 Post-processing: {untranslated_count} untranslated segment(s) found. Starting retry loop...")
+        print(f"Progress: 96.0% (Post-processing: retrying {untranslated_count} untranslated segments)", flush=True)
         final_blocks = postprocess_retry_loop(
             final_blocks, client, target_model, effective_style,
             verbalizer_snippet, humanizer_snippet, knowledge_snippet, trans_mode_snippet,
@@ -1354,17 +1391,26 @@ def main():
     else:
         print("\n✅ All segments translated. Skipping post-processing.", flush=True)
 
-    # 3.5 Desync backstop: detect blocks whose CN absorbed later EN content,
-    #     and strip residual untranslated English. Both use source_lines snapshot.
-    final_blocks = detect_misaligned_blocks(
-        final_blocks, source_lines, client, target_model, effective_style,
-        verbalizer_snippet, humanizer_snippet, knowledge_snippet, trans_mode_snippet
-    )
-    final_blocks = clean_untranslated_english(
-        final_blocks, source_lines, client, target_model, effective_style,
-        verbalizer_snippet, humanizer_snippet, knowledge_snippet, trans_mode_snippet
-    )
-    # Persist any re-translated blocks from the backstop into the cache.
+   # 3.5 Desync backstop: detect blocks whose CN absorbed later EN content,
+   #     and strip residual untranslated English. Both use source_lines snapshot.
+    # Skip the expensive desync backstop when most blocks came from cache —
+    # they already passed alignment checks in the previous run. Only run
+    # the backstop on freshly translated blocks (the ones NOT in the
+    # cache before this run started).
+    if _skip_pre_scan:
+        print(f"⏩ Skipping alignment backstop & residual-English check (cached run).", flush=True)
+        print(f"Progress: 99.0% (Skipping post-processing — cached run)", flush=True)
+    else:
+        print(f"Progress: 97.0% (Alignment check & cleanup)", flush=True)
+        final_blocks = detect_misaligned_blocks(
+            final_blocks, source_lines, client, target_model, effective_style,
+            verbalizer_snippet, humanizer_snippet, knowledge_snippet, trans_mode_snippet
+        )
+        final_blocks = clean_untranslated_english(
+            final_blocks, source_lines, client, target_model, effective_style,
+            verbalizer_snippet, humanizer_snippet, knowledge_snippet, trans_mode_snippet
+        )
+   # Persist any re-translated blocks from the backstop into the cache.
     for b in final_blocks:
         if not is_untranslated(b):
             translated_map[str(b['index'])] = " ".join(b['lines'])
@@ -1374,6 +1420,7 @@ def main():
 
     # 4. Final Style-Guide Humanization (single pass over all blocks)
     print("\n✨ Applying style guide and humanization to all blocks...")
+    print(f"Progress: 99.0% (Applying style guide & humanization)", flush=True)
     for block in final_blocks:
         new_lines = []
         for l in block['lines']:
