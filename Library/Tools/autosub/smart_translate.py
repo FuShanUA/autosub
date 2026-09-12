@@ -866,7 +866,7 @@ If ALL pairs are correctly aligned, output exactly: ALL_ALIGNED"""
 
     print(f"\U0001f50d LLM alignment check: verifying {total} blocks in {len(tasks)} batches...")
     print(f"Progress: 97.5% (LLM alignment check: {len(tasks)} batches)", flush=True)
-    results = client.generate_batch(tasks, model, fallback=False)
+    results = client.generate_batch(tasks, model, fallback=False, provider=provider_enum)
 
     misaligned_positions = []
     for res in results:
