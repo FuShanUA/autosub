@@ -282,8 +282,14 @@ _ZERO_WIDTH_RE = re.compile(
 )
 
 def sanitize_title(s: str) -> str:
-    """Strip zero-width and formatting characters that break grid alignment."""
-    return _ZERO_WIDTH_RE.sub('', str(s))
+    """Strip zero-width chars and replace ambiguous-width Unicode punctuation
+    with ASCII equivalents so rich's cell_len matches terminal render width."""
+    s = _ZERO_WIDTH_RE.sub('', str(s))
+    for old, new in {'\u2014': '--', '\u2013': '-', '\u2019': "'",
+                      '\u2018': "'", '\u201c': '"', '\u201d': '"',
+                      '\u2026': '...'}.items():
+        s = s.replace(old, new)
+    return s
 
 def cjk_display_width(s: str) -> int:
     """Calculate terminal display width using rich's cell_len.
@@ -1099,7 +1105,7 @@ class BatchEngine:
                 need_gd = self.do_gdsync and not os.path.exists(os.path.join(task.workdir, ".synced"))
                 need_bi = self.do_bili and not os.path.exists(os.path.join(task.workdir, ".bili_uploaded"))
                 if need_gd or need_bi:
-                    task.status = "排队中 (GD)" if need_gd else "排队中 (BI)"
+                    task.status = "排队中 (GD)"
                     _gd_pct = 100.0 if not need_gd else 0.0
                     _bi_pct = 100.0 if not need_bi else 0.0
                     task.pcts.update({"DL": 100, "TR": 100, "TL": 100, "MR": 100, "BR": 100, "GD": _gd_pct, "BI": _bi_pct})
@@ -1214,23 +1220,18 @@ class BatchEngine:
                     m = re.search(r'Progress:\s*([\d\.]+)%', line) or re.search(r'\[download\]\s*([\d\.]+)%', line)
                     if m:
                         val = float(m.group(1))
-                        # 将子进程 0-100% 的进度线性映射到 [start_pct, end_pct] 区间
                         mapped_val = start_pct + (val / 100.0) * (end_pct - start_pct)
-                        # 进度保护：仅允许向上增长，除非是重置
                         if mapped_val > task.pcts.get(stage, 0.0):
                             task.pcts[stage] = round(mapped_val, 1)
-                            # 节流写盘：最多每 2 秒存一次，让 TUI 能看到进度
                             _now = time.time()
                             if _now - _last_save > 2.0:
                                 self.save_state()
                                 _last_save = _now
 
-                    # 3. 运行中的暂停检查 (秒级响应)
-                    # 全局逻辑：如果任务被暂停，我们通过终止进程来“释放”信号量，让出资源
+                    # 暂停检查
                     if task.is_paused or self.res.global_pause:
                         logger.info(f"Task {task.uid} | {stage} | Detected pause request, KILLING process to yield slot.")
                         try:
-                            # 强力杀死进程及其所有子进程，确保资源即刻释放
                             proc = psutil.Process(task.pid)
                             for child in proc.children(recursive=True):
                                 try: child.kill()
@@ -1239,7 +1240,7 @@ class BatchEngine:
                         except: pass
                         break
 
-            # 阻塞等待直到进程彻底退出，确保信号量释放的原子性
+            # 阻塞等待直到进程彻底退出
             p.wait()
             task.pid = None
             if p.returncode == 0:
@@ -1436,7 +1437,7 @@ class BatchEngine:
                             else:
                                 if task.retries < 3:
                                     task.retries += 1
-                                    task.status = "排队中 (GD)" if not gd_ok else "排队中 (BI)"
+                                    task.status = "排队中 (GD)"
                                     time.sleep(5)
                                     continue
                                 break

@@ -811,6 +811,44 @@ def main():
             print(f"Progress: 0.5% (Model loaded)", flush=True)
             if args.multilang:
                 segments = _multilang_transcribe(model, file_path, total_duration, clip_start, kwargs)
+                skip_loop_progress = True
+                # Consume the generator fully (multilang yields segments)
+                segments = list(segments)
+            elif total_duration > 300 and clip_start == 0:
+                # --- Chunked transcription for long videos ---
+                # model.transcribe() on a long video submits all chunks at once
+                # to ctranslate2's thread pool. The generator won't yield the
+                # first segment until the entire batch is processed, which can
+                # take 20+ minutes on CPU with no progress or checkpoint.
+                # Splitting into 5-minute chunks with per-segment checkpointing
+                # ensures progress is visible and resumable.
+                CHUNK_SEC = 300  # 5 minutes per chunk
+                segments = []
+                chunk_start = 0
+                while chunk_start < total_duration:
+                    chunk_end = min(chunk_start + CHUNK_SEC, total_duration)
+                    chunk_kwargs = dict(kwargs)
+                    chunk_kwargs.pop("clip_timestamps", None)
+                    chunk_kwargs["clip_timestamps"] = [float(chunk_start), float(chunk_end)]
+                    chunk_kwargs.pop("vad_filter", None)
+                    chunk_kwargs["vad_filter"] = False
+                    pct = round((chunk_start / total_duration) * 100, 1)
+                    print(f"Progress: {max(0.9, pct)}% (Transcribing {chunk_start:.0f}-{chunk_end:.0f}s)", flush=True)
+                    seg_iter, info = model.transcribe(file_path, **chunk_kwargs)
+                    # Iterate generator one segment at a time so each segment
+                    # is checkpointed immediately (enables resume + progress).
+                    for s in seg_iter:
+                        segments.append(s)
+                        segments_list.append(serialize_segment(s))
+                        s_end = getattr(s, 'end', 0) or 0
+                        if total_duration > 0:
+                            p = round((s_end / total_duration) * 100, 1)
+                            print(f"Progress: {p}% ({s_end:.0f}/{total_duration:.0f}s)", flush=True)
+                        if len(segments_list) % 2 == 0:
+                            save_checkpoint(checkpoint_path, segments_list)
+                    save_checkpoint(checkpoint_path, segments_list)
+                    chunk_start = chunk_end
+                skip_loop_progress = True
             else:
                 segments, info = model.transcribe(file_path, **kwargs)
         detected_style = None
@@ -820,23 +858,17 @@ def main():
             segments_list.append(serialize_segment(s, lang=seg_lang))
 
         # Sort segments by start time and fix overlaps.
-        # Speaker diarization can produce overlapping turns that result
-        # in out-of-order or overlapping timestamps after transcription.
         segments_list.sort(key=lambda x: x.get('start', 0))
         for i in range(1, len(segments_list)):
             prev_end = segments_list[i-1].get('end', 0)
             curr_start = segments_list[i].get('start', 0)
             if curr_start < prev_end:
-                # Clamp current start to previous end (no overlap)
                 segments_list[i]['start'] = prev_end
-                # Ensure start < end
                 if segments_list[i].get('end', 0) <= prev_end:
                     segments_list[i]['end'] = prev_end + 0.1
-                # Fix word timestamps too
                 for w in segments_list[i].get('words', []):
                     if w.get('start', 0) < prev_end:
                         w['start'] = prev_end
-            # 提高存档频率，每 2 个片段存一次，增加抗风险能力
             if len(segments_list) % 2 == 0:
                 save_checkpoint(checkpoint_path, segments_list)
 
@@ -857,7 +889,7 @@ def main():
 
         save_checkpoint(checkpoint_path, segments_list)
         if skip_loop_progress:
-            print(f"Progress: 100.0% (GPU Transcription finished successfully)", flush=True)
+            print(f"Progress: 100.0% (Transcription finished successfully)", flush=True)
         if not detected_style: detected_style = detect_content_type(segments_list)
 
         srt_path = os.path.join(output_dir, os.path.splitext(os.path.basename(file_path))[0] + ".srt")
