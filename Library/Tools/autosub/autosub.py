@@ -309,10 +309,48 @@ def run_bili_cmd(cmd, on_progress=None, on_log=None, abort_flag=None):
             on_log(f"❌ Failed to start Bilibili upload: {e}")
         return False
     if p.stdout:
-        for line in p.stdout:
+        import queue as _queue
+        import threading as _threading
+        _line_q: _queue.Queue = _queue.Queue()
+        _reader_stop = _threading.Event()
+
+        def _stdout_reader():
+            try:
+                for line in p.stdout:
+                    if _reader_stop.is_set(): break
+                    _line_q.put(line)
+            except Exception:
+                pass
+            finally:
+                _line_q.put(None)
+
+        _rt = _threading.Thread(target=_stdout_reader, daemon=True)
+        _rt.start()
+
+        while True:
             if abort_flag and abort_flag():
                 p.kill()
+                _reader_stop.set()
                 break
+            try:
+                line = _line_q.get(timeout=1.0)
+            except Exception:
+                if p.poll() is not None:
+                    while True:
+                        try:
+                            line = _line_q.get(timeout=0.5)
+                        except Exception:
+                            break
+                        if line is None: break
+                        stripped = line.strip()
+                        if stripped and on_log:
+                            on_log(stripped)
+                        m = re.search(r'Progress:\s*([\d.]+)%', line)
+                        if m and on_progress:
+                            on_progress(float(m.group(1)))
+                    break
+                continue
+            if line is None: break
             stripped = line.strip()
             if stripped and on_log:
                 on_log(stripped)

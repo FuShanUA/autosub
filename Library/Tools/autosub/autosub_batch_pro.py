@@ -452,7 +452,7 @@ class ResourceManager:
         self.mr_sem = threading.Semaphore(20)  # 字幕合成 (极轻量)
         self.io_sem = threading.Semaphore(6)   # 下载/读取 (I/O密集)
         self.sync_sem = threading.Semaphore(4) # 同步 (I/O密集)
-        self.bili_sem = threading.Semaphore(4) # B站上传 (I/O密集)
+        self.bili_sem = threading.Semaphore(2) # B站上传 (I/O密集, 限2避免LLM元数据生成竞争B站API限流)
         # Total concurrency limiter: caps how many workers can be actively
         # running disk_truth / stage logic simultaneously (before stage-specific
         # semaphores kick in). Prevents thundering-herd on startup when dozens
@@ -1211,12 +1211,49 @@ class BatchEngine:
             task.pid = p.pid
 
             if p.stdout:
+                import queue as _queue
+                import threading as _threading
+                _line_q: _queue.Queue = _queue.Queue()
+                _reader_stop = _threading.Event()
+
+                def _stdout_reader():
+                    try:
+                        for line in p.stdout:
+                            if _reader_stop.is_set(): break
+                            _line_q.put(line)
+                    except Exception:
+                        pass
+                    finally:
+                        _line_q.put(None)
+
+                _rt = _threading.Thread(target=_stdout_reader, daemon=True)
+                _rt.start()
                 _last_save = 0.0
-                for line in p.stdout:
-                    if self.abort: p.kill(); break
+                while True:
+                    if self.abort:
+                        p.kill(); break
+                    try:
+                        line = _line_q.get(timeout=1.0)
+                    except Exception:
+                        if p.poll() is not None:
+                            while True:
+                                try:
+                                    line = _line_q.get(timeout=0.5)
+                                except Exception:
+                                    break
+                                if line is None: break
+                                output_lines.append(line)
+                                m = re.search(r'Progress:\s*([\d\.]+)%', line) or re.search(r'\[download\]\s*([\d\.]+)%', line)
+                                if m:
+                                    val = float(m.group(1))
+                                    mapped_val = start_pct + (val / 100.0) * (end_pct - start_pct)
+                                    if mapped_val > task.pcts.get(stage, 0.0):
+                                        task.pcts[stage] = round(mapped_val, 1)
+                            break
+                        continue
+                    if line is None: break
                     output_lines.append(line)
 
-                    # 进度解析
                     m = re.search(r'Progress:\s*([\d\.]+)%', line) or re.search(r'\[download\]\s*([\d\.]+)%', line)
                     if m:
                         val = float(m.group(1))
@@ -1228,7 +1265,6 @@ class BatchEngine:
                                 self.save_state()
                                 _last_save = _now
 
-                    # 暂停检查
                     if task.is_paused or self.res.global_pause:
                         logger.info(f"Task {task.uid} | {stage} | Detected pause request, KILLING process to yield slot.")
                         try:
@@ -1238,6 +1274,7 @@ class BatchEngine:
                                 except: pass
                             proc.kill()
                         except: pass
+                        _reader_stop.set()
                         break
 
             # 阻塞等待直到进程彻底退出
@@ -1515,6 +1552,7 @@ class BatchEngine:
                 if pct > task.pcts.get("BI", 0.0):
                     with self.lock:
                         task.pcts["BI"] = round(pct, 1)
+                        self.save_state()
 
             def on_log(line):
                 logger.info(f"Task {task.uid} | BI | {line}")

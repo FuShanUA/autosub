@@ -814,6 +814,9 @@ def main():
                 skip_loop_progress = True
                 # Consume the generator fully (multilang yields segments)
                 segments = list(segments)
+                for s in segments:
+                    seg_lang = getattr(s, '_lang', None)
+                    segments_list.append(serialize_segment(s, lang=seg_lang))
             elif total_duration > 300 and clip_start == 0:
                 # --- Chunked transcription for long videos ---
                 # model.transcribe() on a long video submits all chunks at once
@@ -853,9 +856,12 @@ def main():
                 segments, info = model.transcribe(file_path, **kwargs)
         detected_style = None
 
-        for s in segments:
-            seg_lang = getattr(s, '_lang', None)
-            segments_list.append(serialize_segment(s, lang=seg_lang))
+        # Chunked and multilang paths already appended to segments_list
+        # during their loops. Skip re-append to avoid duplicating segments.
+        if not skip_loop_progress:
+            for s in segments:
+                seg_lang = getattr(s, '_lang', None)
+                segments_list.append(serialize_segment(s, lang=seg_lang))
 
         # Sort segments by start time and fix overlaps.
         segments_list.sort(key=lambda x: x.get('start', 0))
@@ -872,7 +878,7 @@ def main():
             if len(segments_list) % 2 == 0:
                 save_checkpoint(checkpoint_path, segments_list)
 
-            s_end = getattr(s, 'end', 0)
+            s_end = segments_list[i].get('end', 0)
             if s_end is None: s_end = 0
 
             if not detected_style and (s_end > 60 or len(segments_list) > 20):
