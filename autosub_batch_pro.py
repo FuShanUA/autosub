@@ -84,8 +84,9 @@ def read_char():
             return b''
 
 def _read_escape_seq():
-    """Try to read an ANSI escape sequence after ESC byte. Returns scroll direction or None.
-    Handles both CSI (\x1b[...) and SS3 (\x1bO...) sequences safely."""
+    """Try to read an ANSI escape sequence after ESC byte. Returns a key name or None.
+    Handles both CSI (\x1b[...) and SS3 (\x1bO...) sequences safely.
+    Recognized: 'up', 'down', 'pageup', 'pagedown', 'home', 'end'."""
     try:
         fd = sys.stdin.fileno()
         # Wait briefly for the sequence introducer to arrive
@@ -116,13 +117,18 @@ def _read_escape_seq():
             return 'up'
         elif ch3 == b'B':
             return 'down'
+        elif ch3 == b'H':
+            return 'home'
+        elif ch3 == b'F':
+            return 'end'
 
         # Consume remaining bytes of the sequence until a terminator (letter or ~)
         if ch3 in (b'~',):
             return None  # Already terminated (e.g., \x1b[~ edge case)
 
-        # For sequences like \x1b[5~ (PgUp), \x1b[3~ (Delete), \x1b[1;5A (Ctrl+Up)
-        # ch3 is a digit or intermediate char — keep reading until terminator
+        # For sequences like \x1b[5~ (PgUp), \x1b[6~ (PgDn), \x1b[3~ (Delete), \x1b[1;5A (Ctrl+Up)
+        # ch3 is a digit or intermediate char — collect until terminator
+        seq_bytes = ch3
         while True:
             dr, _, _ = select.select([fd], [], [], 0.02)
             if not dr:
@@ -130,9 +136,21 @@ def _read_escape_seq():
             extra = os.read(fd, 1)
             if not extra:
                 break
+            seq_bytes += extra
             # Terminators: alphabetic characters or '~'
             if extra.isalpha() or extra == b'~':
                 break
+        # Decode collected numeric tilde sequences
+        if seq_bytes.endswith(b'~'):
+            num = seq_bytes[:-1].decode('ascii', errors='ignore')
+            if num == '5':
+                return 'pageup'
+            elif num == '6':
+                return 'pagedown'
+            elif num == '1':
+                return 'home'
+            elif num == '4':
+                return 'end'
         return None
     except Exception:
         return None
@@ -1611,7 +1629,7 @@ class Dashboard:
 
         # Caption bar: separate lines below table, padded to full terminal width.
         # ASCII-only (Up/Dn instead of arrows) to avoid ambiguous-width chars.
-        page_info = f"Total Tasks: {total_tasks} | Showing: {self.scroll_offset+1}-{min(self.scroll_offset+self.page_size, total_tasks)} | Up/Dn Scroll"
+        page_info = f"Total Tasks: {total_tasks} | Showing: {self.scroll_offset+1}-{min(self.scroll_offset+self.page_size, total_tasks)} | Up/Dn/PgUp/PgDn Scroll"
         cmd_text = f"[bold cyan]Cmd: [/][white]{self.cmd_buf}[/]" if self.cmd_buf else "[dim]Waiting for command...[/]"
         help_msg = f"{cmd_text} | [bold yellow]P+A[/]:Pause/Resume All | [bold yellow]P+ID[/]:Pause/Resume One | [bold yellow]R+ID[/]:Reset | [bold red]Q[/]:Exit"
 
@@ -1804,21 +1822,45 @@ def main():
                     if ch in (b'\x00', b'\xe0'):
                         ch2 = read_char()
                         if ch2 == b'H': # Up
-                            dash.scroll_offset = max(0, dash.scroll_offset - 1)
+                            dash.scroll_offset = max(0, dash.scroll_offset - dash.page_size)
                         elif ch2 == b'P': # Down
                             with engine.lock:
                                 max_offset = max(0, len(engine.task_map) - dash.page_size)
-                            dash.scroll_offset = min(max_offset, dash.scroll_offset + 1)
+                            dash.scroll_offset = min(max_offset, dash.scroll_offset + dash.page_size)
+                        elif ch2 == b'I': # PgUp
+                            dash.scroll_offset = max(0, dash.scroll_offset - dash.page_size)
+                        elif ch2 == b'Q': # PgDn
+                            with engine.lock:
+                                max_offset = max(0, len(engine.task_map) - dash.page_size)
+                            dash.scroll_offset = min(max_offset, dash.scroll_offset + dash.page_size)
+                        elif ch2 == b'G': # Home
+                            dash.scroll_offset = 0
+                        elif ch2 == b'O': # End
+                            with engine.lock:
+                                max_offset = max(0, len(engine.task_map) - dash.page_size)
+                            dash.scroll_offset = max_offset
                         continue
                 else:
                     if ch == b'\x1b':
                         direction = _read_escape_seq()
                         if direction == 'up':
-                            dash.scroll_offset = max(0, dash.scroll_offset - 1)
+                            dash.scroll_offset = max(0, dash.scroll_offset - dash.page_size)
                         elif direction == 'down':
                             with engine.lock:
                                 max_offset = max(0, len(engine.task_map) - dash.page_size)
-                            dash.scroll_offset = min(max_offset, dash.scroll_offset + 1)
+                            dash.scroll_offset = min(max_offset, dash.scroll_offset + dash.page_size)
+                        elif direction == 'pageup':
+                            dash.scroll_offset = max(0, dash.scroll_offset - dash.page_size)
+                        elif direction == 'pagedown':
+                            with engine.lock:
+                                max_offset = max(0, len(engine.task_map) - dash.page_size)
+                            dash.scroll_offset = min(max_offset, dash.scroll_offset + dash.page_size)
+                        elif direction == 'home':
+                            dash.scroll_offset = 0
+                        elif direction == 'end':
+                            with engine.lock:
+                                max_offset = max(0, len(engine.task_map) - dash.page_size)
+                            dash.scroll_offset = max_offset
                         else:
                             # Bare ESC key — clear command buffer
                             cmd_mode, id_buf, dash.cmd_buf = None, "", ""
