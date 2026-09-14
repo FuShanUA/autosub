@@ -333,8 +333,12 @@ class AutoSubGUI:
         self.progress_bar.pack(fill="x", pady=5)
         self.status_label = ttk.Label(f5, text="等待任务...")
         self.status_label.pack(pady=2)
-        self.log_text = tk.Text(f5, height=10, state="disabled", font=self.log_font, bg="#ffffff", padx=5, pady=5)
-        self.log_text.pack(fill="both", expand=True)
+        log_frame = ttk.Frame(f5)
+        log_frame.pack(fill="both", expand=True)
+        self.log_scrollbar = ttk.Scrollbar(log_frame, command=lambda *a: self.log_text.yview(*a))
+        self.log_scrollbar.pack(side="right", fill="y")
+        self.log_text = tk.Text(log_frame, height=10, state="disabled", font=self.log_font, bg="#ffffff", padx=5, pady=5, yscrollcommand=lambda *a: self.log_scrollbar.set(*a))
+        self.log_text.pack(side="left", fill="both", expand=True)
 
         # 6. Controls (Parent: root)
         f6 = ttk.Frame(self.root, padding=10)
@@ -578,8 +582,11 @@ class AutoSubGUI:
         self.log_text.config(state="normal")
         is_p = "Progress:" in msg or "%" in msg
         if is_p and self.last_was_progress: self.log_text.delete("end-2l", "end-1c")
+        # Smart scroll: only jump to bottom if user is already near the bottom.
+        at_bottom = self.log_text.yview()[1] > 0.95
         self.log_text.insert("end", msg + "\n")
-        self.log_text.see("end")
+        if at_bottom:
+            self.log_text.see("end")
         self.log_text.config(state="disabled")
         self.last_was_progress = is_p
         m = re.search(r"(\d+(\.\d+)?)%", msg)

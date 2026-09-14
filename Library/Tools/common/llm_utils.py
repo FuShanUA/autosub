@@ -924,7 +924,7 @@ class LLMClient:
         try:
            for future in concurrent.futures.as_completed(future_to_task, timeout=per_task_timeout):
                task = future_to_task[future]
-               chunk_id = task.get('chunk_idx', '?')
+               chunk_id = task.get('chunk_idx', task.get('index', task.get('n', '?')))
                try:
                    result_text = future.result(timeout=0.1)
                    results.append({**task, 'result': result_text})

@@ -726,7 +726,8 @@ Phrase -> Translation
 def detect_misaligned_blocks(final_blocks: List[Dict], source_lines: Dict[str, str],
                             client, model: str, style: str, verbalizer_snippet: str,
                             humanizer_snippet: str, knowledge_snippet: str,
-                            trans_mode_snippet: str = "") -> List[Dict]:
+                            trans_mode_snippet: str = "",
+                            provider=None) -> List[Dict]:
     """
     Desync backstop. The translation LLM sometimes merges content from EN
     block N+1 (or later) into the CN translation of block N, so the Chinese
@@ -767,20 +768,21 @@ def detect_misaligned_blocks(final_blocks: List[Dict], source_lines: Dict[str, s
     if misaligned:
         print(f"\u26a0\ufe0f Token-based alignment check: {len(misaligned)} block(s) absorb later content. "
               f"Re-translating individually: {[(idx, toks) for _, idx, toks in misaligned]}")
-        final_blocks = _retranslate_misaligned(final_blocks, misaligned, source_lines, client, model)
+        final_blocks = _retranslate_misaligned(final_blocks, misaligned, source_lines, client, model, provider=provider)
 
     # LLM-based alignment verification: catches general content shifts that
     # the token-based heuristic misses (e.g. the LLM skipped an EN block and
     # shifted all subsequent CN translations forward by one position).
     final_blocks = _llm_alignment_check(
         final_blocks, source_lines, client, model, style,
-        verbalizer_snippet, humanizer_snippet, knowledge_snippet, trans_mode_snippet
+        verbalizer_snippet, humanizer_snippet, knowledge_snippet, trans_mode_snippet,
+        provider=provider
     )
 
     return final_blocks
 
 
-def _retranslate_misaligned(final_blocks, misaligned, source_lines, client, model):
+def _retranslate_misaligned(final_blocks, misaligned, source_lines, client, model, provider=None):
     """Re-translate blocks that absorbed later content, using a strict single-fragment prompt."""
     for pos, idx, toks in misaligned:
         en_src = source_lines.get(idx, "")
@@ -796,7 +798,7 @@ FRAGMENT: {en_src}
 
 Reply with ONLY the Chinese translation, nothing else."""
         try:
-            corrected = client.generate_content(strict_prompt, model_name=model)
+            corrected = client.generate_content(strict_prompt, model_name=model, provider=provider)
             corrected = (corrected or "").strip()
             if corrected and re.search(r"[\u4e00-\u9fff]", corrected):
                 final_blocks[pos]['lines'] = [corrected]
@@ -811,7 +813,8 @@ Reply with ONLY the Chinese translation, nothing else."""
 def _llm_alignment_check(final_blocks: List[Dict], source_lines: Dict[str, str],
                          client, model: str, style: str, verbalizer_snippet: str,
                          humanizer_snippet: str, knowledge_snippet: str,
-                         trans_mode_snippet: str = "") -> List[Dict]:
+                         trans_mode_snippet: str = "",
+                         provider=None) -> List[Dict]:
     """
     LLM-based alignment verification. Sends batches of consecutive (EN, CN)
     pairs to the LLM and asks it to identify pairs where the Chinese does NOT
@@ -866,7 +869,7 @@ If ALL pairs are correctly aligned, output exactly: ALL_ALIGNED"""
 
     print(f"\U0001f50d LLM alignment check: verifying {total} blocks in {len(tasks)} batches...")
     print(f"Progress: 97.5% (LLM alignment check: {len(tasks)} batches)", flush=True)
-    results = client.generate_batch(tasks, model, fallback=False, provider=provider_enum)
+    results = client.generate_batch(tasks, model, fallback=False, provider=provider)
 
     misaligned_positions = []
     for res in results:
@@ -1402,14 +1405,15 @@ def main():
         print(f"Progress: 99.0% (Skipping post-processing — cached run)", flush=True)
     else:
         print(f"Progress: 97.0% (Alignment check & cleanup)", flush=True)
-        final_blocks = detect_misaligned_blocks(
-            final_blocks, source_lines, client, target_model, effective_style,
-            verbalizer_snippet, humanizer_snippet, knowledge_snippet, trans_mode_snippet
-        )
-        final_blocks = clean_untranslated_english(
-            final_blocks, source_lines, client, target_model, effective_style,
-            verbalizer_snippet, humanizer_snippet, knowledge_snippet, trans_mode_snippet
-        )
+    final_blocks = detect_misaligned_blocks(
+        final_blocks, source_lines, client, target_model, effective_style,
+        verbalizer_snippet, humanizer_snippet, knowledge_snippet, trans_mode_snippet,
+        provider=provider_enum
+    )
+    final_blocks = clean_untranslated_english(
+        final_blocks, source_lines, client, target_model, effective_style,
+        verbalizer_snippet, humanizer_snippet, knowledge_snippet, trans_mode_snippet
+    )
    # Persist any re-translated blocks from the backstop into the cache.
     for b in final_blocks:
         if not is_untranslated(b):
