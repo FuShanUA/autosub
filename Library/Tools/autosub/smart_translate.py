@@ -871,6 +871,8 @@ If ALL pairs are correctly aligned, output exactly: ALL_ALIGNED"""
     print(f"Progress: 97.5% (LLM alignment check: {len(tasks)} batches)", flush=True)
     results = client.generate_batch(tasks, model, fallback=False, provider=provider)
 
+    print(f"   📋 Analyzing alignment results from {len(results)} batches...", flush=True)
+
     misaligned_positions = []
     for res in results:
         result_text = res.get('result')
