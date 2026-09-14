@@ -267,7 +267,7 @@ def cjk_display_width(s: str) -> int:
     width = 0
     for c in str(s):
         ea = unicodedata.east_asian_width(c)
-        width += 2 if ea in ('F', 'W') else 1
+        width += 2 if ea in ('F', 'W', 'A') else 1
     return width
 
 
@@ -283,13 +283,32 @@ def cjk_truncate(s: str, max_width: int, ellipsis: str = '...') -> str:
     result = []
     w = 0
     for c in s:
-        cw = 2 if unicodedata.east_asian_width(c) in ('F', 'W') else 1
+        cw = 2 if unicodedata.east_asian_width(c) in ('F', 'W', 'A') else 1
         if w + cw > target:
             break
         result.append(c)
         w += cw
     return ''.join(result) + ellipsis
 
+
+
+
+def _sanitize_title(s: str) -> str:
+    """Replace ambiguous-width Unicode punctuation with ASCII equivalents
+    so that Rich's cell_len (which counts them as width 1) matches the
+    actual terminal render width (often 2)."""
+    replacements = {
+        '\u2014': '--',  # em dash
+        '\u2013': '-',   # en dash
+        '\u2019': "'",   # right single quote
+        '\u2018': "'",   # left single quote
+        '\u201c': '"',   # left double quote
+        '\u201d': '"',   # right double quote
+        '\u2026': '...', # ellipsis
+    }
+    for old, new in replacements.items():
+        s = s.replace(old, new)
+    return s
 
 def parse_duration_to_seconds(dur_str):
     if not dur_str: return 0
@@ -1126,33 +1145,55 @@ class BatchEngine:
             task.pid = p.pid
 
             if p.stdout:
-                for line in p.stdout:
-                    if self.abort: p.kill(); break
-                    output_lines.append(line)
-
-                    # 进度解析
-                    m = re.search(r'Progress:\s*([\d\.]+)%', line) or re.search(r'\[download\]\s*([\d\.]+)%', line)
-                    if m:
-                        val = float(m.group(1))
-                        # 将子进程 0-100% 的进度线性映射到 [start_pct, end_pct] 区间
-                        mapped_val = start_pct + (val / 100.0) * (end_pct - start_pct)
-                        # 进度保护：仅允许向上增长，除非是重置
-                        if mapped_val > task.pcts.get(stage, 0.0):
-                            task.pcts[stage] = round(mapped_val, 1)
-
-                    # 3. 运行中的暂停检查 (秒级响应)
-                    # 全局逻辑：如果任务被暂停，我们通过终止进程来“释放”信号量，让出资源
-                    if task.is_paused or self.res.global_pause:
-                        logger.info(f"Task {task.uid} | {stage} | Detected pause request, KILLING process to yield slot.")
-                        try:
-                            # 强力杀死进程及其所有子进程，确保资源即刻释放
-                            proc = psutil.Process(task.pid)
-                            for child in proc.children(recursive=True):
-                                try: child.kill()
-                                except: pass
-                            proc.kill()
-                        except: pass
+                import select as _select
+                _fd = p.stdout.fileno()
+                while True:
+                    if self.abort:
+                        p.kill(); break
+                    # Use select with 1s timeout so we never block forever
+                    # even if the child forked subprocesses that inherited
+                    # the stdout pipe keep it open after the main child exits.
+                    try:
+                        _ready, _, _ = _select.select([_fd], [], [], 1.0)
+                    except Exception:
                         break
+                    if _ready:
+                        _line = p.stdout.readline()
+                        if not _line:
+                            break  # EOF
+                        output_lines.append(_line)
+
+                        # 进度解析
+                        m = re.search(r'Progress:\s*([\d\.]+)%', _line) or re.search(r'\[download\]\s*([\d\.]+)%', _line)
+                        if m:
+                            val = float(m.group(1))
+                            mapped_val = start_pct + (val / 100.0) * (end_pct - start_pct)
+                            if mapped_val > task.pcts.get(stage, 0.0):
+                                task.pcts[stage] = round(mapped_val, 1)
+
+                        # 运行中的暂停检查 (秒级响应)
+                        if task.is_paused or self.res.global_pause:
+                            logger.info(f"Task {task.uid} | {stage} | Detected pause request, KILLING process to yield slot.")
+                            try:
+                                proc = psutil.Process(task.pid)
+                                for child in proc.children(recursive=True):
+                                    try: child.kill()
+                                    except: pass
+                                proc.kill()
+                            except: pass
+                            break
+                    else:
+                        # select timed out (1s). If the process has already
+                        # exited, drain any remaining output and break to avoid
+                        # blocking forever on a pipe held open by forked children.
+                        if p.poll() is not None:
+                            try:
+                                _remaining = p.stdout.read()
+                                if _remaining:
+                                    output_lines.append(_remaining)
+                            except Exception:
+                                pass
+                            break
 
             # 阻塞等待直到进程彻底退出，确保信号量释放的原子性
             p.wait()
@@ -1554,7 +1595,7 @@ class Dashboard:
 
                 row: list = [
                     Text(str(t.uid), style=row_style),
-                    Text(cjk_truncate(t.title, _title_w), style=row_style, no_wrap=True, overflow="crop"),
+                    Text(cjk_truncate(_sanitize_title(t.title), _title_w), style=row_style, no_wrap=True, overflow="crop"),
                     Text(t.duration if t.duration else "Unknown", style=row_style),
                     Text(disp_status, style=row_style, justify="center")
                 ]
