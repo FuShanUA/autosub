@@ -516,7 +516,12 @@ class LLMClient:
         # across blocks). Without thinking, GLM-5.2 mistranslates names and
         # misses domain-specific word senses (foundation -> 粉底 instead of
         # Foundry platform).
-        if is_reasoning and _disable_thinking and "aliyuncs.com" in base_url:
+        # GLM-5.3+ on DashScope enforces enable_thinking=True and rejects
+        # False with a 400 error. For those models, omit the parameter
+        # entirely (the API defaults to thinking=True) instead of sending
+        # False. Older GLM-5.x still accepts False.
+        _enforces_thinking = "glm-5.3" in _mn or "glm5.3" in _mn
+        if is_reasoning and _disable_thinking and "aliyuncs.com" in base_url and not _enforces_thinking:
             data["enable_thinking"] = False
 
         self.limiter.wait()
