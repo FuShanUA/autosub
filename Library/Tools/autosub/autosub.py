@@ -211,8 +211,10 @@ def trigger_sync(local_dir, remote_id, headless=False):
                     print(f"   [Sync] {msg}", flush=True)
             process.wait()
             print(f"\n✅ [Cloud Sync] Completed for {os.path.basename(local_dir)}")
+            return process.returncode == 0
         except Exception as e:
             print(f"⚠️  [Cloud Sync] Integrated sync failed: {e}")
+            return False
     else:
         if sys.platform == "win32":
             final_cmd = (
@@ -248,6 +250,15 @@ def trigger_sync(local_dir, remote_id, headless=False):
 BILI_SCRIPT = "/Users/shanfu/.gemini/config/skills/bilibili-uploader/scripts/bili_upload.py"
 BILI_PYTHON = "/Users/shanfu/.gemini/config/skills/bilibili-uploader/.venv/bin/python"
 BILI_VIDEO_EXTS = ('.mp4', '.mkv', '.webm', '.mov', '.ts')
+WECHAT_SCRIPT = os.path.expanduser("~/.codex/skills/wechat-channel-uploader/scripts/wechat_upload.py")
+WECHAT_MAX_UPLOAD_SECONDS = 600
+_wechat_venv_python = os.path.join(
+    CURRENT_DIR,
+    ".venv",
+    "Scripts" if sys.platform == "win32" else "bin",
+    "python.exe" if sys.platform == "win32" else "python",
+)
+WECHAT_PYTHON = _wechat_venv_python if os.path.exists(_wechat_venv_python) else sys.executable
 
 def find_hardsub_video(workdir):
     """Return the most recently modified *_hardsub* video in workdir, or None."""
@@ -272,7 +283,19 @@ def build_bili_title(hardsub_path):
         title = title[:cut].rstrip().rstrip('.') + "..."
     return title
 
-def build_bili_cmd(workdir, title=None, tid=None, category_name=None, tags=None, season=None, desc=None, public=False):
+
+def sanitize_wechat_title(title, max_chars=16):
+    """Clean a title to WeChat's short-title punctuation rules and length limit."""
+    cleaned = str(title).replace(",", " ").replace("，", " ")
+    cleaned = re.sub(
+        r"[^0-9A-Za-z\u3400-\u4dbf\u4e00-\u9fff《》“”‘’：:+?%℃ ]",
+        " ",
+        cleaned,
+    )
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return (cleaned or "未命名视频")[:max_chars]
+
+def build_bili_cmd(workdir, title=None, tid=None, category_name=None, tags=None, season=None, desc=None, public=False, cover_title=None):
     """Build the Bilibili upload command for the hardsub video in workdir.
     Metadata (tid/tags/desc/season) is auto-generated per-video by bili_upload.py's
     built-in LLM logic unless explicitly overridden. Returns the cmd list or None."""
@@ -281,6 +304,9 @@ def build_bili_cmd(workdir, title=None, tid=None, category_name=None, tags=None,
     hardsub_path = find_hardsub_video(workdir)
     if not hardsub_path:
         return None
+    # When title/desc/cover_title are all provided, the caller has pre-generated
+    # metadata; tell bili_upload.py to skip its own LLM title generation.
+    _pre_generated = title is not None and desc is not None and cover_title is not None
     if title is None:
         title = build_bili_title(hardsub_path)
     cmd = [BILI_PYTHON, "-u", BILI_SCRIPT, hardsub_path, title]
@@ -294,6 +320,10 @@ def build_bili_cmd(workdir, title=None, tid=None, category_name=None, tags=None,
         cmd.extend(["--season_name", str(season)])
     if desc:
         cmd.extend(["--desc", str(desc)])
+    if cover_title is not None and str(cover_title).strip():
+        cmd.extend(["--cover-title", str(cover_title).strip()])
+    if _pre_generated:
+        cmd.append("--no_auto_title")
     if public:
         cmd.append("--public")
     return cmd
@@ -360,18 +390,329 @@ def run_bili_cmd(cmd, on_progress=None, on_log=None, abort_flag=None):
     p.wait()
     return p.returncode == 0
 
-def trigger_bili_upload(workdir, title=None, tid=None, category_name=None, tags=None, season=None, desc=None, public=False, on_progress=None, on_log=None, abort_flag=None):
+def trigger_bili_upload(workdir, title=None, tid=None, category_name=None, tags=None, season=None, desc=None, public=False, cover_title=None, on_progress=None, on_log=None, abort_flag=None):
     """Build and run a Bilibili upload for the hardsub video in workdir.
     Convenience wrapper: build_bili_cmd + run_bili_cmd. Returns True on success."""
-    cmd = build_bili_cmd(workdir, title=title, tid=tid, category_name=category_name, tags=tags, season=season, desc=desc, public=public)
+    cmd = build_bili_cmd(workdir, title=title, tid=tid, category_name=category_name, tags=tags, season=season, desc=desc, public=public, cover_title=cover_title)
     if not cmd:
         print("⚠️  [Bilibili] upload skipped (script/venv/hardsub not found)", flush=True)
         return False
     _log = on_log or (lambda msg: print(msg, flush=True))
     _log(f"📺 Starting Bilibili upload: {os.path.basename(cmd[2])}")
-    ok = run_bili_cmd(cmd, on_progress=on_progress, on_log=_log, abort_flag=abort_flag)
+    ok = run_bili_cmd(
+        cmd,
+        on_progress=on_progress,
+        on_log=_log,
+        abort_flag=abort_flag,
+    )
     _log(f"📺 {'✅ Success' if ok else '❌ Failed'}")
     return ok
+
+# --- Shared Upload Metadata Generation ---
+# BI and WX both need the same subtitle-grounded title, description, and cover
+# title.  Generating them once here (instead of inside each upload script)
+# saves duplicate LLM calls and guarantees consistency across platforms.
+_COMMON_DIR = os.path.join(os.path.dirname(os.path.dirname(CURRENT_DIR)), "common")
+if not os.path.isdir(_COMMON_DIR):
+    _COMMON_DIR = "/Users/shanfu/cc/Library/Tools/common"
+if _COMMON_DIR not in sys.path:
+    sys.path.insert(0, _COMMON_DIR)
+
+def _load_llm_defaults():
+    """Read model/vendor from autosub settings.json, matching bili_upload.py."""
+    try:
+        p = os.path.join(CURRENT_DIR, "settings.json")
+        if os.path.exists(p):
+            with open(p, "r", encoding="utf-8") as f:
+                s = json.load(f)
+            return s.get("llm_model", "glm-5.2"), s.get("llm_vendor", "dashscope").lower().replace(" (bailian)", "dashscope")
+    except Exception:
+        pass
+    return "glm-5.2", "dashscope"
+
+def generate_upload_metadata(workdir, on_log=None):
+    """Generate shared title, cover_title, and description from subtitle content.
+    Returns dict {title, cover_title, description} or None on failure."""
+    _log = on_log or (lambda msg: print(msg, flush=True))
+    try:
+        from subtitle_title import build_subtitle_grounded_title, read_subtitle_text, SubtitleTitleError
+    except Exception as e:
+        _log(f"⚠️ [MetaGen] subtitle_title import failed: {e}")
+        return None
+    try:
+        from llm_utils import get_client as _get_llm_client
+        llm_client = _get_llm_client()
+    except Exception:
+        llm_client = None
+    model, vendor = _load_llm_defaults()
+    hardsub_path = find_hardsub_video(workdir)
+    if not hardsub_path:
+        _log("⚠️ [MetaGen] No hardsub video found")
+        return None
+    meta = {}
+    # 1. Form title (plain style, neutral hint for both platforms)
+    try:
+        grounded = build_subtitle_grounded_title(
+            hardsub_path, llm_client=llm_client, model_name=model,
+            max_title_chars=48, min_title_chars=12,
+            platform_hint="视频标题应平实、准确、克制，概括核心内容。",
+            title_style="plain",
+        )
+        meta["title"] = grounded.title
+        _log(f">>> [MetaGen] 标题: {grounded.title}")
+    except Exception as e:
+        _log(f"⚠️ [MetaGen] Title generation failed: {e}")
+    # 2. Cover title (editorial headline style)
+    try:
+        grounded = build_subtitle_grounded_title(
+            hardsub_path, llm_client=llm_client, model_name=model,
+            max_title_chars=48, min_title_chars=12,
+            platform_hint="封面标题可以更有信息量，但仍要专业、克制。",
+            title_style="cover_headline",
+        )
+        meta["cover_title"] = grounded.title
+        _log(f">>> [MetaGen] 封面标题: {grounded.title}")
+    except Exception as e:
+        _log(f"⚠️ [MetaGen] Cover title generation failed: {e}")
+    # 3. Description (LLM summary of subtitle)
+    try:
+        sub_text, sub_path = read_subtitle_text(hardsub_path, max_chars=30000)
+        if sub_text and llm_client:
+            prompt = (
+                f"根据以下视频字幕，写一段100-200字的视频简介。简洁有力，概括核心内容，不要AI味。\n"
+                f"视频标题：{meta.get('title', '')}\n\n{sub_text}\n\n只输出简介内容。"
+            )
+            desc = llm_client.generate_content(prompt, model=model)
+            if desc and desc.strip():
+                meta["description"] = desc.strip()
+                _log(f">>> [MetaGen] 简介: {desc.strip()[:60]}...")
+    except Exception as e:
+        _log(f"⚠️ [MetaGen] Description generation failed: {e}")
+    if not meta.get("title"):
+        meta["title"] = build_bili_title(hardsub_path)
+    return meta if meta else None
+
+# --- WeChat Channels Upload (canonical implementation; batch engine + GUI reuse this) ---
+def build_wechat_title(hardsub_path):
+    """Derive a WeChat Channels title, capped at the platform's short-title limit."""
+    return sanitize_wechat_title(build_bili_title(hardsub_path))
+
+def get_wechat_upload_skip_reason(workdir):
+    """Return a user-facing reason when WeChat upload must not start."""
+    if not os.path.exists(WECHAT_SCRIPT) or not os.path.exists(WECHAT_PYTHON):
+        return "script/python not found"
+    hardsub_path = find_hardsub_video(workdir)
+    if not hardsub_path:
+        return "hardsub video not found"
+    duration = get_video_duration(hardsub_path)
+    if duration <= 0:
+        return f"cannot read duration: {os.path.basename(hardsub_path)}"
+    if duration > WECHAT_MAX_UPLOAD_SECONDS:
+        return (
+            f"video is {duration / 60:.1f} min, exceeding the "
+            f"{WECHAT_MAX_UPLOAD_SECONDS // 60}-min limit"
+        )
+    return None
+
+def build_wechat_cmd(workdir, title=None, desc=None, tags=None, public=False, cover_title=None):
+    """Build the WeChat Channels upload command for the hardsub video in workdir.
+    Description/tags are auto-generated by the skill unless explicitly overridden.
+    The default action saves a draft; public publishing requires an explicit flag."""
+    skip_reason = get_wechat_upload_skip_reason(workdir)
+    if skip_reason:
+        return None
+    hardsub_path = find_hardsub_video(workdir)
+    # Omit the title by default so wechat_upload.py generates it from the
+    # subtitle. A caller can still pass a title for an explicit manual override.
+    _pre_generated = title is not None and desc is not None
+    cmd = [WECHAT_PYTHON, "-u", WECHAT_SCRIPT, hardsub_path]
+    if title is not None:
+        cmd.append(str(title))
+    if desc:
+        cmd.extend(["--desc", str(desc)])
+    if tags:
+        cmd.extend(["--tags", str(tags)])
+    if cover_title is not None and str(cover_title).strip():
+        cmd.extend(["--cover-title", str(cover_title).strip()])
+    if _pre_generated:
+        cmd.append("--no_auto_title")
+    if public:
+        cmd.append("--public")
+    # Login is a separate, visible one-time `--login` flow. Normal uploads use
+    # the persistent profile without opening a Chrome window.
+    cmd.append("--headless")
+    return cmd
+
+def run_wechat_cmd(cmd, on_progress=None, on_log=None, abort_flag=None):
+    """Run a pre-built WeChat Channels upload command. Returns True on success."""
+    try:
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', creationflags=CREATE_NO_WINDOW)
+    except Exception as e:
+        if on_log:
+            on_log(f"❌ Failed to start WeChat Channels upload: {e}")
+        return False
+    if p.stdout:
+        import queue as _queue
+        import threading as _threading
+        _line_q: _queue.Queue = _queue.Queue()
+        _reader_stop = _threading.Event()
+
+        def _stdout_reader():
+            try:
+                for line in p.stdout:
+                    if _reader_stop.is_set(): break
+                    _line_q.put(line)
+            except Exception:
+                pass
+            finally:
+                _line_q.put(None)
+
+        _rt = _threading.Thread(target=_stdout_reader, daemon=True)
+        _rt.start()
+
+        while True:
+            if abort_flag and abort_flag():
+                p.kill()
+                _reader_stop.set()
+                break
+            try:
+                line = _line_q.get(timeout=1.0)
+            except Exception:
+                if p.poll() is not None:
+                    while True:
+                        try:
+                            line = _line_q.get(timeout=0.5)
+                        except Exception:
+                            break
+                        if line is None: break
+                        stripped = line.strip()
+                        if stripped and on_log:
+                            on_log(stripped)
+                        m = re.search(r'(?:Progress|上传进度):\s*([\d.]+)%', line)
+                        if m and on_progress:
+                            on_progress(float(m.group(1)))
+                    break
+                continue
+            if line is None: break
+            stripped = line.strip()
+            if stripped and on_log:
+                on_log(stripped)
+            m = re.search(r'(?:Progress|上传进度):\s*([\d.]+)%', line)
+            if m and on_progress:
+                on_progress(float(m.group(1)))
+    p.wait()
+    return p.returncode == 0
+
+def trigger_wechat_upload(workdir, title=None, desc=None, tags=None, public=False, cover_title=None, on_progress=None, on_log=None, abort_flag=None):
+    """Build and run a WeChat Channels upload for the hardsub video in workdir."""
+    _log = on_log or (lambda msg: print(msg, flush=True))
+    skip_reason = get_wechat_upload_skip_reason(workdir)
+    if skip_reason:
+        _log(f"⚠️  [WeChat] upload skipped ({skip_reason})")
+        return False
+    cmd = build_wechat_cmd(
+        workdir, title=title, desc=desc, tags=tags, public=public, cover_title=cover_title
+    )
+    if not cmd:
+        _log("⚠️  [WeChat] upload skipped (command could not be built)")
+        return False
+    _log(f"📹 Starting WeChat Channels upload: {os.path.basename(cmd[2])}")
+    ok = run_wechat_cmd(cmd, on_progress=on_progress, on_log=_log, abort_flag=abort_flag)
+    _log(f"📹 {'✅ Success' if ok else '❌ Failed'}")
+    return ok
+
+
+def _write_upload_marker(workdir, marker_name):
+    try:
+        with open(os.path.join(workdir, marker_name), "w", encoding="utf-8") as handle:
+            handle.write("1")
+    except Exception:
+        pass
+
+
+def run_post_processing_uploads(
+    workdir,
+    sync_gdrive=None,
+    bili_upload=False,
+    wechat_upload=False,
+    headless=False,
+    bili_cover_title=None,
+    wechat_cover_title=None,
+    wechat_public=False,
+):
+    """Run GD/BI/WX uploads together and share BI/WX metadata."""
+    need_sync = bool(sync_gdrive) and not os.path.exists(os.path.join(workdir, ".synced"))
+    need_bili = bool(bili_upload) and not os.path.exists(os.path.join(workdir, ".bili_uploaded"))
+    need_wechat = bool(wechat_upload) and not os.path.exists(os.path.join(workdir, ".wechat_uploaded"))
+    if not any((need_sync, need_bili, need_wechat)):
+        return
+
+    meta = None
+    if need_bili and need_wechat:
+        meta = generate_upload_metadata(workdir) or {}
+
+    bili_kwargs = {}
+    wechat_kwargs = {"public": wechat_public}
+    if meta:
+        bili_kwargs.update({
+            "title": meta.get("title"),
+            "desc": meta.get("description"),
+            "cover_title": bili_cover_title or meta.get("cover_title"),
+        })
+        shared_title = meta.get("title")
+        wechat_kwargs.update({
+            "title": sanitize_wechat_title(shared_title) if shared_title else None,
+            "desc": meta.get("description"),
+            "cover_title": wechat_cover_title or meta.get("cover_title"),
+        })
+    elif bili_cover_title:
+        bili_kwargs["cover_title"] = bili_cover_title
+    elif wechat_cover_title:
+        wechat_kwargs["cover_title"] = wechat_cover_title
+
+    if sum((need_sync, need_bili, need_wechat)) == 1:
+        if need_sync:
+            if trigger_sync(workdir, sync_gdrive, headless=headless) is True:
+                _write_upload_marker(workdir, ".synced")
+        elif need_bili:
+            if trigger_bili_upload(workdir, **bili_kwargs):
+                _write_upload_marker(workdir, ".bili_uploaded")
+        elif need_wechat:
+            if trigger_wechat_upload(workdir, **wechat_kwargs):
+                _write_upload_marker(workdir, ".wechat_uploaded")
+        return
+
+    import threading
+    sync_result = [False]
+    bili_result = [False]
+    wechat_result = [False]
+    threads = []
+
+    if need_sync:
+        def _run_sync():
+            sync_result[0] = trigger_sync(workdir, sync_gdrive, headless=headless) is True
+        threads.append(threading.Thread(target=_run_sync, daemon=True))
+    if need_bili:
+        def _run_bili():
+            bili_result[0] = trigger_bili_upload(workdir, **bili_kwargs)
+        threads.append(threading.Thread(target=_run_bili, daemon=True))
+    if need_wechat:
+        def _run_wechat():
+            wechat_result[0] = trigger_wechat_upload(workdir, **wechat_kwargs)
+        threads.append(threading.Thread(target=_run_wechat, daemon=True))
+
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    if sync_result[0]:
+        _write_upload_marker(workdir, ".synced")
+    if bili_result[0]:
+        _write_upload_marker(workdir, ".bili_uploaded")
+    if wechat_result[0]:
+        _write_upload_marker(workdir, ".wechat_uploaded")
+
 
 # --- Robust FFmpeg/ffprobe Detection ---
 def find_tool(tool_name):
@@ -949,6 +1290,8 @@ def confirm_cookies(args):
     if getattr(args, 'cookies', None) and args.cookies.lower() == "none":
         args.cookies = "none"
         return "none"
+    if getattr(args, 'cookies', None) and args.cookies.lower() in {"chrome", "firefox", "safari", "edge"}:
+        return args.cookies
     search_paths = []
     if getattr(args, 'cookies', None): search_paths.append(args.cookies)
     
@@ -1046,6 +1389,7 @@ def main():
     parser.add_argument("--style", default=DEFAULTS.get("style", "auto"))
     parser.add_argument("--trans-mode", default=DEFAULTS.get("trans_mode", "balanced"), choices=["paraphrase", "balanced"])
     parser.add_argument("--cookies")
+    parser.add_argument("--cookies-from-browser", choices=["chrome", "firefox", "safari", "edge"], help="Read cookies from a browser profile")
     parser.add_argument("--layout", default=DEFAULTS.get("layout", "bilingual"))
     parser.add_argument("--main-lang", default=DEFAULTS.get("main_lang", "cn"))
     parser.add_argument("--cn-font", default=DEFAULTS.get("cn_font", "KaiTi"))
@@ -1062,6 +1406,10 @@ def main():
     parser.add_argument("--project-name", help="Dummy argument to prevent crashes")
     parser.add_argument("--sync-gdrive", help="Google Drive Folder ID to sync output files to")
     parser.add_argument("--bili-upload", action="store_true", help="Upload the hardsub video to Bilibili (auto-generates tid/tags/desc/season per video)")
+    parser.add_argument("--bili-cover-title", help="Text rendered on Bilibili cover images (default: subtitle-grounded form title)")
+    parser.add_argument("--wechat-upload", action="store_true", help="Upload the hardsub video to WeChat Channels as a draft (use --wechat-public to publish)")
+    parser.add_argument("--wechat-public", action="store_true", help="Publish the WeChat Channels upload publicly instead of saving a draft")
+    parser.add_argument("--wechat-cover-title", help="Text rendered on WeChat cover images (default: subtitle-grounded form title)")
     parser.add_argument("--quick", action="store_true", help="Experimental: Quick Transcribe (YouTube Subs + LLM)")
     parser.add_argument("--start", help="Start time (e.g. 00:01:30 or 90)")
     parser.add_argument("--end", help="End time (e.g. 00:03:00 or 180)")
@@ -1069,6 +1417,9 @@ def main():
     parser.add_argument("--upload-only", action="store_true", help="Skip transcription/translation/burn; only upload existing hardsub video to GDrive/Bilibili")
     parser.add_argument("--multilang", action="store_true", help="Enable per-segment language detection for mixed-language videos")
     args = parser.parse_args()
+
+    if args.cookies_from_browser:
+        args.cookies = args.cookies_from_browser
     
     # --- Intelligent Time Parsing ---
     if args.start and "-" in args.start and not args.end:
@@ -1190,20 +1541,16 @@ def main():
             print(f"❌ No hardsub video found in {workdir}", flush=True)
             return
         print(f"✅ Found hardsub: {os.path.basename(hardsub_path)}", flush=True)
-        if getattr(args, 'sync_gdrive', None):
-            if os.path.exists(os.path.join(workdir, ".synced")):
-                print("☁️  GDrive: already synced (skipping)", flush=True)
-            else:
-                trigger_sync(workdir, args.sync_gdrive, headless=args.headless)
-        if getattr(args, 'bili_upload', False):
-            if os.path.exists(os.path.join(workdir, ".bili_uploaded")):
-                print("📱 Bilibili: already uploaded (skipping)", flush=True)
-            elif trigger_bili_upload(workdir):
-                try:
-                    with open(os.path.join(workdir, ".bili_uploaded"), "w") as f:
-                        f.write("1")
-                except Exception:
-                    pass
+        run_post_processing_uploads(
+            workdir,
+            sync_gdrive=getattr(args, 'sync_gdrive', None),
+            bili_upload=getattr(args, 'bili_upload', False),
+            wechat_upload=getattr(args, 'wechat_upload', False),
+            headless=args.headless,
+            bili_cover_title=getattr(args, 'bili_cover_title', None),
+            wechat_cover_title=getattr(args, 'wechat_cover_title', None),
+            wechat_public=getattr(args, 'wechat_public', False),
+        )
         print("✅ Upload-only complete!", flush=True)
         return
 
@@ -1451,18 +1798,17 @@ def main():
     
     print("✅ All done!", flush=True)
 
-    # --- Single Job Sync ---
-    if getattr(args, 'sync_gdrive', None):
-        trigger_sync(workdir, args.sync_gdrive, headless=args.headless)
-
-    # --- Single Job Bilibili Upload ---
-    if getattr(args, 'bili_upload', False):
-        if trigger_bili_upload(workdir):
-           try:
-               with open(os.path.join(workdir, ".bili_uploaded"), "w") as f:
-                   f.write("1")
-           except Exception:
-               pass
+    # --- Parallel Post-Processing Uploads ---
+    run_post_processing_uploads(
+        workdir,
+        sync_gdrive=getattr(args, 'sync_gdrive', None),
+        bili_upload=getattr(args, 'bili_upload', False),
+        wechat_upload=getattr(args, 'wechat_upload', False),
+        headless=args.headless,
+        bili_cover_title=getattr(args, 'bili_cover_title', None),
+        wechat_cover_title=getattr(args, 'wechat_cover_title', None),
+        wechat_public=getattr(args, 'wechat_public', False),
+    )
 
     return 0
 

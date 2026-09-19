@@ -90,6 +90,8 @@ class AutoSubGUI:
     bili_tid_var: tk.StringVar
     bili_tags_var: tk.StringVar
     bili_season_var: tk.StringVar
+    wechat_enabled_var: tk.BooleanVar
+    wechat_public_var: tk.BooleanVar
 
     def __init__(self, root):
         self.root = root
@@ -324,6 +326,17 @@ class AutoSubGUI:
         ttk.Label(f4_5, text="合集名称 (新建/选择):").grid(row=2, column=0, padx=10, pady=2, sticky="e")
         self.bili_season_var = tk.StringVar(value=str(self.settings.get("bili_season", "")))
         ttk.Entry(f4_5, textvariable=self.bili_season_var, width=30).grid(row=2, column=1, columnspan=2, padx=5, pady=2, sticky="w")
+
+        # 4.6 WeChat Channels Sync (Parent: tab2)
+        f4_6 = ttk.LabelFrame(self.tab2, text=" 微信视频号同步 ", padding=10)
+        f4_6.pack(fill="x", pady=5)
+        self.wechat_enabled_var = tk.BooleanVar(value=bool(self.settings.get("wechat_enabled", False)))
+        ttk.Checkbutton(f4_6, text="上传到微信视频号", variable=self.wechat_enabled_var).grid(row=0, column=0, sticky="w", pady=2)
+        self.wechat_public_var = tk.BooleanVar(value=bool(self.settings.get("wechat_public", False)))
+        ttk.Checkbutton(f4_6, text="公开发布（不勾选则保存草稿）", variable=self.wechat_public_var).grid(row=0, column=1, padx=15, sticky="w", pady=2)
+        ttk.Label(f4_6, text="封面标题 (留空自动):").grid(row=1, column=0, padx=10, pady=2, sticky="e")
+        self.wechat_cover_title_var = tk.StringVar(value="")
+        ttk.Entry(f4_6, textvariable=self.wechat_cover_title_var, width=32).grid(row=1, column=1, columnspan=2, padx=5, pady=2, sticky="w")
 
         # 5. Log Area (Parent: tab3)
         f5 = ttk.LabelFrame(self.tab3, text=" 日志与进度 ", padding=10)
@@ -684,6 +697,10 @@ class AutoSubGUI:
             cmd.extend(["--sync-gdrive", gdrive_folder])
         if self.bili_enabled_var.get():
             cmd.append("--bili-upload")
+        if self.wechat_enabled_var.get():
+            cmd.append("--wechat-upload")
+            if self.wechat_public_var.get():
+                cmd.append("--wechat-public")
 
         print(f"📤 [GUI] Upload-only: {' '.join(cmd)}")
         threading.Thread(target=self.run_worker, args=(cmd, v, self.output_dir_var.get(), gdrive_folder, py_exe), daemon=True).start()
@@ -831,6 +848,24 @@ class AutoSubGUI:
                             _persist("⚠️ Bilibili 上传跳过（未找到上传脚本或虚拟环境）。")
                         else:
                             _persist("⚠️ 未找到生成的 hardsub 视频文件，跳过 Bilibili 上传。")
+                # 3) WeChat Channels upload (default: draft; public requires explicit checkbox)
+                if self.wechat_enabled_var.get():
+                    if sync_dir and os.path.exists(os.path.join(sync_dir, ".wechat_uploaded")):
+                        _persist("💬 [WeChat] 已上传过 (跳过)")
+                    elif sync_dir:
+                        from autosub import build_wechat_cmd
+                        wechat_cmd = build_wechat_cmd(
+                            sync_dir,
+                            public=self.wechat_public_var.get(),
+                            cover_title=self.wechat_cover_title_var.get().strip() or None,
+                        )
+                        if wechat_cmd:
+                            _persist(f"💬 找到生成的视频: {os.path.basename(wechat_cmd[2])}")
+                            upload_jobs.append(("💬 [WeChat]", wechat_cmd))
+                        elif newest_video:
+                            _persist("⚠️ 微信视频号上传跳过（未找到上传脚本或虚拟环境）。")
+                        else:
+                            _persist("⚠️ 未找到生成的 hardsub 视频文件，跳过微信视频号上传。")
                 # Launch all upload jobs concurrently, wait for all to finish
                 if upload_jobs:
                     self.root.after(0, lambda: self.status_label.config(text="📤 正在上传..."))
@@ -1002,6 +1037,8 @@ class AutoSubGUI:
             "multilang": self.multilang_var.get(),
             "sync_gdrive": self.sync_gdrive_var.get(),
             "gdrive_enabled": self.gdrive_enabled_var.get(),
+            "wechat_enabled": self.wechat_enabled_var.get(),
+            "wechat_public": self.wechat_public_var.get(),
             "vendor_default_models": self.vendor_default_models
         }
         try:

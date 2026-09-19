@@ -1,8 +1,8 @@
 #!/bin/bash
 # AutoSub Launcher App Wrapper (Mac Terminal Version)
-# Correct Tool Directory
+# TOOLS_DIR is auto-detected by the Python code via os.path.realpath,
+# so no manual AUTOSUB_TOOLS_DIR export is needed here.
 TOOLDIR="/Users/shanfu/cc/Library/Tools/autosub"
-export AUTOSUB_TOOLS_DIR="/Users/shanfu/cc/Library/Tools"
 
 # Launch a new Terminal window and run the Batch Pro directly
 osascript -e "tell application \"Terminal\"

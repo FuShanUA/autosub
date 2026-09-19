@@ -158,7 +158,7 @@ if sys.platform == "win32":
         windll.shell32.SetCurrentProcessExplicitAppUserModelID("cc.autosub.batch.pro")
 
 # --- 路径配置 ---
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+CURRENT_DIR = os.path.dirname(os.path.realpath(__file__))
 if getattr(sys, 'frozen', False):
     TOOLS_DIR = os.path.join(getattr(sys, '_MEIPASS', ''), "Library", "Tools")
 else:
@@ -169,11 +169,25 @@ os.environ.setdefault("AUTOSUB_TOOLS_DIR", TOOLS_DIR)
 _p = CURRENT_DIR
 for _ in range(3): _p = os.path.dirname(_p)
 PROJECT_ROOT = _p if os.path.basename(_p).lower() != "library" else os.path.dirname(_p)
+# Guard: the naive 3-level walk-up under-walks when the package is
+# nested inside itself (cc/Library/Tools/autosub/Library/Tools/autosub).
+# Walk up until we find the real root, identified by CLAUDE.md or AGENTS.md.
+_walk = PROJECT_ROOT
+while True:
+    if os.path.exists(os.path.join(_walk, "CLAUDE.md")) or os.path.exists(os.path.join(_walk, "AGENTS.md")):
+        PROJECT_ROOT = _walk
+        break
+    parent = os.path.dirname(_walk)
+    if parent == _walk:
+        break
+    _walk = parent
 DEFAULT_OUTPUT_ROOT = os.path.join(PROJECT_ROOT, "Projects")
 
 # Reuse the canonical Bilibili upload API from the base autosub module.
 sys.path.insert(0, CURRENT_DIR)
-from autosub import build_bili_cmd, run_bili_cmd  # noqa: E402
+from autosub import build_bili_cmd, build_wechat_cmd, run_bili_cmd, run_wechat_cmd, generate_upload_metadata  # noqa: E402
+
+BROWSER_COOKIE_NAMES = {"chrome", "firefox", "safari", "edge"}
 
 # --- 核心工具指令 ---
 VENV_DIR = os.path.join(CURRENT_DIR, ".venv")
@@ -399,7 +413,7 @@ class SubTask:
     title: str = "加载中..."
     duration: str = "未知"
     status: str = "排队中"  # QUEUED, ACTIVE (STAGE), DONE, FAILED, PAUSED
-    pcts: Dict[str, float] = field(default_factory=lambda: {"DL": 0.0, "TR": 0.0, "TL": 0.0, "MR": 0.0, "BR": 0.0, "GD": 0.0, "BI": 0.0})
+    pcts: Dict[str, float] = field(default_factory=lambda: {"DL": 0.0, "TR": 0.0, "TL": 0.0, "MR": 0.0, "BR": 0.0, "GD": 0.0, "BI": 0.0, "WX": 0.0})
     workdir: Optional[str] = None
     error: Optional[str] = None
     pid: Optional[int] = None
@@ -416,6 +430,8 @@ class SubTask:
     @classmethod
     def from_dict(cls, d):
         data = {k: v for k, v in d.items() if k in cls.__dataclass_fields__}
+        if isinstance(data.get("pcts"), dict):
+            data["pcts"].setdefault("WX", 0.0)
         if (not data.get('vid_id')) and data.get('url'):
             data['vid_id'] = extract_vid(data['url'])
         # 强制清洗路径
@@ -453,6 +469,7 @@ class ResourceManager:
         self.io_sem = threading.Semaphore(6)   # 下载/读取 (I/O密集)
         self.sync_sem = threading.Semaphore(4) # 同步 (I/O密集)
         self.bili_sem = threading.Semaphore(2) # B站上传 (I/O密集, 限2避免LLM元数据生成竞争B站API限流)
+        self.wechat_sem = threading.Semaphore(1) # 视频号上传共用浏览器 Profile，必须串行
         # Total concurrency limiter: caps how many workers can be actively
         # running disk_truth / stage logic simultaneously (before stage-specific
         # semaphores kick in). Prevents thundering-herd on startup when dozens
@@ -469,6 +486,7 @@ class ResourceManager:
         if stage == "MR": return self.mr_sem
         if stage == "GD": return self.sync_sem
         if stage == "BI": return self.bili_sem
+        if stage == "WX": return self.wechat_sem
         return self.io_sem
 
 # --- 核心引擎 ---
@@ -505,6 +523,17 @@ class BatchEngine:
         self.lock = threading.RLock()
         self.abort = False
         self.no_sequence = False
+
+        # Initialize dashboard attributes before the single-instance lock check,
+        # because Live Monitor Mode renders the Dashboard immediately.
+        self.do_gdsync = False
+        self.do_bili = False
+        self.do_wechat = False
+        self.wechat_public = False
+        self.gdsync_id = "18iAFFSuHQmZlxVN0dri1Gbje9SmpS96f"
+        self.playlist_title = sub_dir_name or "AutoSub Batch Pro"
+        self.quality = "high"
+        self.active_workers: Set[int] = set()
 
         # Single instance lock for the project
         self.lock_file = os.path.join(self.project_dir, "batch_engine.lock")
@@ -557,13 +586,6 @@ class BatchEngine:
 
         # Cookie Discovery
         self.cookie_path = self._discover_cookies()
-
-        self.do_gdsync = False
-        self.do_bili = False
-        self.gdsync_id = "18iAFFSuHQmZlxVN0dri1Gbje9SmpS96f"
-        self.playlist_title = sub_dir_name or "AutoSub Batch Pro"
-        self.quality = "high"
-        self.active_workers: Set[int] = set()
 
         # Node Discovery
         self.node_exe = self._discover_node()
@@ -779,7 +801,7 @@ class BatchEngine:
             for child in parent.children(recursive=True):
                 try:
                     cmdline = " ".join(child.cmdline())
-                    if any(x in cmdline for x in ["sync.py", "bili_upload.py", "transcribe_engine.py", "smart_translate.py", "burn_engine.py"]):
+                    if any(x in cmdline for x in ["sync.py", "bili_upload.py", "wechat_upload.py", "transcribe_engine.py", "smart_translate.py", "burn_engine.py"]):
                         logger.info(f"Killing child on exit: PID {child.pid} ({cmdline[:60]})")
                         child.kill()
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
@@ -792,13 +814,20 @@ class BatchEngine:
             # 兼容 Launcher 格式：如果是 dict 形式的 map
             tasks_data = {str(t.uid): t.to_dict() for t in self.task_map.values()}
             data = {"tasks": tasks_data, "time": time.time(), "global_pause": self.res.global_pause}
+            cookie_state = {}
+            if self.cookie_path in BROWSER_COOKIE_NAMES:
+                cookie_state["browser"] = self.cookie_path
+            elif self.cookie_path and os.path.exists(self.cookie_path):
+                cookie_state["cookies"] = self.cookie_path
         try:
             # CRITICAL: Always save global_pause even in flat batch_state.json format,
             # so _pause_monitor can correctly sync global_pause from the state file.
             # For batch_state.json, embed global_pause alongside the flat task map.
             if "batch_state.json" in self.state_file:
                 flat_data = {**tasks_data, "global_pause": self.res.global_pause,
-                             "bili": self.do_bili, "gdsync": self.do_gdsync}
+                             "bili": self.do_bili, "gdsync": self.do_gdsync,
+                             "wechat": self.do_wechat, "wechat_public": self.wechat_public,
+                             **cookie_state}
                 with open(self.state_file, "w", encoding="utf-8") as f:
                     json.dump(flat_data, f, ensure_ascii=False, indent=2)
             else:
@@ -816,6 +845,20 @@ class BatchEngine:
             tasks_source = data.get("tasks", data) if isinstance(data, dict) else {}
             if not isinstance(tasks_source, dict): tasks_source = {}
 
+            # Flat batch_state.json stores upload preferences alongside task IDs.
+            # Restore them so a restart does not silently disable selected stages.
+            if "batch_state.json" in os.path.basename(self.state_file):
+                self.do_bili = bool(data.get("bili", self.do_bili))
+                self.do_gdsync = bool(data.get("gdsync", self.do_gdsync))
+                self.do_wechat = bool(data.get("wechat", self.do_wechat))
+                self.wechat_public = bool(data.get("wechat_public", self.wechat_public))
+                browser_cookie = data.get("browser")
+                cookie_file = data.get("cookies") or data.get("cookie_path")
+                if browser_cookie in BROWSER_COOKIE_NAMES:
+                    self.cookie_path = browser_cookie
+                elif cookie_file and os.path.exists(cookie_file):
+                    self.cookie_path = cookie_file
+
             with self.lock:
                 # 信号量物理重置：防止因之前崩溃导致的信号量泄露
                 default_heavy = 2 if (self.res.has_cuda or self.res.is_mac) else 1
@@ -831,7 +874,7 @@ class BatchEngine:
                     t = SubTask.from_dict(d)
                     self.task_map[t.uid] = t
 
-                    # Marker-file truth: if .synced/.bili_uploaded exist on disk,
+                    # Marker-file truth: if .synced/.bili_uploaded/.wechat_uploaded exist on disk,
                     # force pcts to 100% regardless of what the state file says.
                     # This fixes the pcts-vs-reality mismatch after batch_pro restarts.
                     if t.workdir:
@@ -839,12 +882,14 @@ class BatchEngine:
                             t.pcts["GD"] = 100.0
                         if os.path.exists(os.path.join(t.workdir, ".bili_uploaded")):
                             t.pcts["BI"] = 100.0
+                        if os.path.exists(os.path.join(t.workdir, ".wechat_uploaded")):
+                            t.pcts["WX"] = 100.0
                         if os.path.exists(os.path.join(t.workdir, ".burn_complete")):
                             t.pcts["BR"] = 100.0
 
                     # 彻底自愈：不再解析可能损坏的 status 字符串，而是根据 pcts 数据重新推导
                     current_stage = "DL"
-                    for s in ["DL", "TR", "TL", "MR", "BR", "GD", "BI"]:
+                    for s in ["DL", "TR", "TL", "MR", "BR", "GD", "BI", "WX"]:
                         if t.pcts.get(s, 0.0) < 100.0:
                             current_stage = s
                             break
@@ -861,8 +906,6 @@ class BatchEngine:
                         t.retries = 0
 
                     t.pid = None # 启动时重置 PID
-        except Exception as e:
-            logger.error(f"Load state failed: {e}")
         except Exception as e:
             logger.error(f"Load state failed: {e}")
 
@@ -1044,6 +1087,7 @@ class BatchEngine:
            
             # 前置检查：如果上传标记都已存在，直接判完成，无需检查中间产物
             has_bili_done = os.path.exists(os.path.join(task.workdir, ".bili_uploaded"))
+            has_wechat_done = os.path.exists(os.path.join(task.workdir, ".wechat_uploaded"))
             has_synced = os.path.exists(os.path.join(task.workdir, ".synced"))
             has_hardsub = any("_hardsub" in f and f.endswith((".mp4", ".mkv", ".webm")) for f in files)
             has_burn_complete = os.path.exists(os.path.join(task.workdir, ".burn_complete"))
@@ -1053,7 +1097,11 @@ class BatchEngine:
             base_done = has_burn_complete
             
             # If upload stages are enabled, they must also be done.
-            upload_done = (not self.do_bili or has_bili_done) and (not self.do_gdsync or has_synced)
+            upload_done = (
+                (not self.do_bili or has_bili_done)
+                and (not self.do_gdsync or has_synced)
+                and (not self.do_wechat or has_wechat_done)
+            )
             
             if base_done and upload_done:
                 task.status = "完成"
@@ -1104,11 +1152,13 @@ class BatchEngine:
             if has_hardsub and has_burn_complete:
                 need_gd = self.do_gdsync and not os.path.exists(os.path.join(task.workdir, ".synced"))
                 need_bi = self.do_bili and not os.path.exists(os.path.join(task.workdir, ".bili_uploaded"))
-                if need_gd or need_bi:
+                need_wx = self.do_wechat and not os.path.exists(os.path.join(task.workdir, ".wechat_uploaded"))
+                if need_gd or need_bi or need_wx:
                     task.status = "排队中 (GD)"
                     _gd_pct = 100.0 if not need_gd else 0.0
                     _bi_pct = 100.0 if not need_bi else 0.0
-                    task.pcts.update({"DL": 100, "TR": 100, "TL": 100, "MR": 100, "BR": 100, "GD": _gd_pct, "BI": _bi_pct})
+                    _wx_pct = 100.0 if not need_wx else 0.0
+                    task.pcts.update({"DL": 100, "TR": 100, "TL": 100, "MR": 100, "BR": 100, "GD": _gd_pct, "BI": _bi_pct, "WX": _wx_pct})
                 else:
                     task.status = "完成"
                     for k in task.pcts: task.pcts[k] = 100.0
@@ -1243,7 +1293,7 @@ class BatchEngine:
                                     break
                                 if line is None: break
                                 output_lines.append(line)
-                                m = re.search(r'Progress:\s*([\d\.]+)%', line) or re.search(r'\[download\]\s*([\d\.]+)%', line)
+                                m = re.search(r'Progress:\s*([\d\.]+)%', line) or re.search(r'\[download\]\s*([\d\.]+)%', line) or re.search(r'上传进度:\s*([\d\.]+)%', line)
                                 if m:
                                     val = float(m.group(1))
                                     mapped_val = start_pct + (val / 100.0) * (end_pct - start_pct)
@@ -1254,7 +1304,7 @@ class BatchEngine:
                     if line is None: break
                     output_lines.append(line)
 
-                    m = re.search(r'Progress:\s*([\d\.]+)%', line) or re.search(r'\[download\]\s*([\d\.]+)%', line)
+                    m = re.search(r'Progress:\s*([\d\.]+)%', line) or re.search(r'\[download\]\s*([\d\.]+)%', line) or re.search(r'上传进度:\s*([\d\.]+)%', line)
                     if m:
                         val = float(m.group(1))
                         mapped_val = start_pct + (val / 100.0) * (end_pct - start_pct)
@@ -1440,57 +1490,118 @@ class BatchEngine:
                     stage = "GD"
                     need_gd = self.do_gdsync and not os.path.exists(os.path.join(workdir, ".synced"))
                     need_bi = self.do_bili and not os.path.exists(os.path.join(workdir, ".bili_uploaded"))
+                    need_wx = self.do_wechat and not os.path.exists(os.path.join(workdir, ".wechat_uploaded"))
 
-                    if need_gd and need_bi:
-                        # === PARALLEL UPLOAD: Drive sync + Bilibili upload simultaneously ===
-                        # Both only read the finished hardsub video; no write conflict.
-                        bili_cmd = self._build_bili_cmd(workdir)
-                        if not bili_cmd:
-                            try:
-                                with open(os.path.join(workdir, ".bili_uploaded"), "w") as f: f.write("1")
-                            except: pass
-                            need_bi = False
-                        else:
-                            sync_cmd = [str(x) for x in [PYTHON_EXE, SYNC_SCRIPT, "--local-dir", workdir, "--remote-id", self.gdsync_id, "--wrap-folder", "--headless"] if x is not None]
-                            bili_result = [False]
-                            bt = threading.Thread(target=self._run_bili_upload, args=(task, bili_cmd, bili_result), daemon=True)
-                            bt.start()
-                            gd_ok = self.run_process(task, "GD", sync_cmd, start_pct=0.0, end_pct=100.0)
-                            bt.join()
-                            if gd_ok:
-                                try:
-                                    with open(os.path.join(workdir, ".synced"), "w") as f: f.write("1")
-                                except: pass
-                                task.pcts["GD"] = 100.0
-                                self.save_state()
-                            if bili_result[0]:
+                    # Count how many uploads are needed
+                    active = sum([bool(need_gd), bool(need_bi), bool(need_wx)])
+
+                    if active == 0:
+                        cmd = []
+                    elif active == 1:
+                        # Single upload — use the shared run_process block below
+                        if need_gd:
+                            cmd = [PYTHON_EXE, SYNC_SCRIPT, "--local-dir", workdir, "--remote-id", self.gdsync_id, "--wrap-folder", "--headless"]
+                        elif need_bi:
+                            stage = "BI"
+                            cmd = self._build_bili_cmd(workdir)
+                            if not cmd:
                                 try:
                                     with open(os.path.join(workdir, ".bili_uploaded"), "w") as f: f.write("1")
                                 except: pass
-                                task.pcts["BI"] = 100.0
-                                self.save_state()
-                            if gd_ok and bili_result[0]:
-                                self.disk_truth(task)
-                            else:
-                                if task.retries < 3:
-                                    task.retries += 1
-                                    task.status = "排队中 (GD)"
-                                    time.sleep(5)
-                                    continue
-                                break
-                        cmd = []  # already handled above, skip shared block
-                    elif need_bi and not need_gd:
-                        # Only Bilibili upload (Drive already synced or disabled)
-                        stage = "BI"
-                        cmd = self._build_bili_cmd(workdir)
-                        if not cmd:
+                                cmd = []
+                        elif need_wx:
+                            stage = "WX"
+                            cmd = self._build_wechat_cmd(workdir)
+                            if not cmd:
+                                try:
+                                    with open(os.path.join(workdir, ".wechat_uploaded"), "w") as f: f.write("1")
+                                except: pass
+                                cmd = []
+                    else:
+                        # === THREE-WAY PARALLEL: GD + BI + WX simultaneously ===
+                        # GD starts immediately; shared metadata is generated for
+                        # BI/WX (title, description, cover_title) so both upload
+                        # scripts skip their own LLM generation and stay consistent.
+                        sync_cmd = [str(x) for x in [PYTHON_EXE, SYNC_SCRIPT, "--local-dir", workdir, "--remote-id", self.gdsync_id, "--wrap-folder", "--headless"] if x is not None] if need_gd else None
+
+                        # Build BI/WX cmds with pre-generated metadata
+                        meta = None
+                        if need_bi or need_wx:
+                            meta = generate_upload_metadata(workdir, on_log=lambda msg: logger.info(f"Task {task.uid} | MetaGen | {msg}"))
+                        bili_cmd = None
+                        wechat_cmd = None
+                        if need_bi:
+                            bili_cmd = build_bili_cmd(workdir, title=meta.get("title") if meta else None,
+                                desc=meta.get("description") if meta else None,
+                                cover_title=meta.get("cover_title") if meta else None)
+                            if not bili_cmd:
+                                try:
+                                    with open(os.path.join(workdir, ".bili_uploaded"), "w") as f: f.write("1")
+                                except: pass
+                                need_bi = False
+                        if need_wx:
+                            wechat_cmd = build_wechat_cmd(workdir,
+                                title=meta.get("title") if meta else None,
+                                desc=meta.get("description") if meta else None,
+                                cover_title=meta.get("cover_title") if meta else None,
+                                public=self.wechat_public)
+                            if not wechat_cmd:
+                                try:
+                                    with open(os.path.join(workdir, ".wechat_uploaded"), "w") as f: f.write("1")
+                                except: pass
+                                need_wx = False
+
+                        # Launch all active uploads in parallel
+                        gd_result = [False]
+                        bi_result = [False]
+                        wx_result = [False]
+                        threads = []
+
+                        if need_gd and sync_cmd:
+                            def _run_gd():
+                                gd_result[0] = self.run_process(task, "GD", sync_cmd, start_pct=0.0, end_pct=100.0)
+                            threads.append(threading.Thread(target=_run_gd, daemon=True))
+                        if need_bi and bili_cmd:
+                            threads.append(threading.Thread(target=self._run_bili_upload, args=(task, bili_cmd, bi_result), daemon=True))
+                        if need_wx and wechat_cmd:
+                            threads.append(threading.Thread(target=self._run_wechat_upload, args=(task, wechat_cmd, wx_result), daemon=True))
+
+                        for t in threads: t.start()
+                        for t in threads: t.join()
+
+                        # Write markers
+                        if gd_result[0]:
+                            try:
+                                with open(os.path.join(workdir, ".synced"), "w") as f: f.write("1")
+                            except: pass
+                            task.pcts["GD"] = 100.0
+                        if bi_result[0]:
                             try:
                                 with open(os.path.join(workdir, ".bili_uploaded"), "w") as f: f.write("1")
                             except: pass
-                            cmd = []
-                    else:
-                        # Only GD sync (existing behavior) or nothing to do
-                        cmd = [PYTHON_EXE, SYNC_SCRIPT, "--local-dir", workdir, "--remote-id", self.gdsync_id, "--wrap-folder", "--headless"] if need_gd else []
+                            task.pcts["BI"] = 100.0
+                        if wx_result[0]:
+                            try:
+                                with open(os.path.join(workdir, ".wechat_uploaded"), "w", encoding="utf-8") as f: f.write("1")
+                            except: pass
+                            task.pcts["WX"] = 100.0
+                        self.save_state()
+
+                        all_ok = all([
+                            not need_gd or gd_result[0],
+                            not need_bi or bi_result[0],
+                            not need_wx or wx_result[0],
+                        ])
+                        if all_ok:
+                            self.disk_truth(task)
+                        else:
+                            if task.retries < 3:
+                                task.retries += 1
+                                task.status = "排队中 (GD)"
+                                time.sleep(5)
+                                continue
+                            break
+                        cmd = []  # already handled, skip shared block
 
                 if cmd:
                     cmd = [str(x) for x in cmd if x is not None]
@@ -1505,6 +1616,8 @@ class BatchEngine:
                             with open(os.path.join(workdir, ".synced"), "w") as f: f.write("1")
                         if stage == "BI":
                             with open(os.path.join(workdir, ".bili_uploaded"), "w") as f: f.write("1")
+                        if stage == "WX":
+                            with open(os.path.join(workdir, ".wechat_uploaded"), "w", encoding="utf-8") as f: f.write("1")
                         self.disk_truth(task)
                     else:
                         # 失败重试逻辑
@@ -1531,6 +1644,16 @@ class BatchEngine:
         cmd = build_bili_cmd(workdir)
         if cmd is None:
             logger.warning(f"Bilibili cmd build failed for {workdir} (script/venv/hardsub missing)")
+        return cmd
+
+    def _build_wechat_cmd(self, workdir):
+        """Build WeChat Channels upload command via the canonical autosub API."""
+        cmd = build_wechat_cmd(
+            workdir,
+            public=self.wechat_public,
+        )
+        if cmd is None:
+            logger.warning(f"WeChat cmd build failed for {workdir} (script/python/hardsub missing)")
         return cmd
 
     def _run_bili_upload(self, task, cmd, result_box):
@@ -1567,8 +1690,41 @@ class BatchEngine:
                 task.error = "BI upload failed"
                 logger.error(f"Task {task.uid} | BI | Failed")
         except Exception as e:
+           task.error = str(e)
+           logger.error(f"Task {task.uid} | BI | Exception: {e}")
+        finally:
+           if has_sem:
+               sem.release()
+
+    def _run_wechat_upload(self, task, cmd, result_box):
+        """Run WeChat Channels upload in a background thread (parallel with GD/BI),
+        delegating the subprocess to the canonical autosub.run_wechat_cmd."""
+        sem = self.res.get_sem("WX")
+        has_sem = False
+        try:
+            if self.abort:
+                return
+            sem.acquire()
+            has_sem = True
+            with self.lock:
+                task.pcts["WX"] = 0.0
+            logger.info(f"Task {task.uid} | WX | Start (parallel): {' '.join(cmd)}")
+
+            def on_log(line):
+                logger.info(f"Task {task.uid} | WX | {line}")
+
+            ok = run_wechat_cmd(cmd, on_log=on_log, abort_flag=lambda: self.abort)
+            if ok:
+                with self.lock:
+                    task.pcts["WX"] = 100.0
+                result_box[0] = True
+                logger.info(f"Task {task.uid} | WX | Success")
+            else:
+                task.error = "WX upload failed"
+                logger.error(f"Task {task.uid} | WX | Failed")
+        except Exception as e:
             task.error = str(e)
-            logger.error(f"Task {task.uid} | BI | Exception: {e}")
+            logger.error(f"Task {task.uid} | WX | Exception: {e}")
         finally:
             if has_sem:
                 sem.release()
@@ -1641,10 +1797,11 @@ class Dashboard:
 
             stages = ["DL", "TR", "TL", "MR", "BR", "GD"]
             if self.engine.do_bili: stages.append("BI")
+            if self.engine.do_wechat: stages.append("WX")
             for s in stages:
                 table.add_column(s, width=10, justify="center", vertical="middle")
             active_stages = list(stages)
-            _title_w = max(20, term_width - 107 - (10 if self.engine.do_bili else 0))
+            _title_w = max(20, term_width - 107 - (10 * (int(self.engine.do_bili) + int(self.engine.do_wechat))))
 
         elif term_width >= 105:
             # 2. Medium Mode: Show all columns but optimize progress stages to be extremely compact (width=6)
@@ -1655,10 +1812,11 @@ class Dashboard:
 
             stages = ["DL", "TR", "TL", "MR", "BR", "GD"]
             if self.engine.do_bili: stages.append("BI")
+            if self.engine.do_wechat: stages.append("WX")
             for s in stages:
                 table.add_column(s, width=6, justify="center", vertical="middle")
             active_stages = list(stages)
-            _title_w = max(20, term_width - 83 - (6 if self.engine.do_bili else 0))
+            _title_w = max(20, term_width - 83 - (6 * (int(self.engine.do_bili) + int(self.engine.do_wechat))))
             
         else:
             # 3. Narrow Mode: Completely hide stage progress columns to prioritize Title column
@@ -1759,9 +1917,12 @@ def main():
     parser.add_argument("--sub-dir-name", help="项目子目录名称")
     parser.add_argument("--gdsync", action="store_true")
     parser.add_argument("--bili-upload", action="store_true", help="Upload each hardsub video to Bilibili (auto-generates tid/tags/desc/season per video)")
+    parser.add_argument("--wechat-upload", action="store_true", help="Upload each hardsub video to WeChat Channels as a draft")
+    parser.add_argument("--wechat-public", action="store_true", help="Publish WeChat Channels uploads publicly instead of saving drafts")
     parser.add_argument("--urls", nargs="*")
     parser.add_argument("--file", help="包含 URL 列表的文本文件")
     parser.add_argument("--cookies", help="Path to cookies.txt (optional)")
+    parser.add_argument("--cookies-from-browser", choices=sorted(BROWSER_COOKIE_NAMES), help="Read cookies from a browser profile")
     parser.add_argument("--exclude", help="要排除的视频序号 (1-based, 逗号分隔, 支持范围如 1-5)")
     parser.add_argument("--include", help="仅包含的视频序号 (1-based, 逗号分隔, 支持范围如 1-5)")
     parser.add_argument("--separate", action="store_true", help="使用播放列表名称作为子目录")
@@ -1774,12 +1935,16 @@ def main():
     engine.quality = args.quality
     engine.do_gdsync = args.gdsync
     engine.do_bili = args.bili_upload
+    engine.do_wechat = args.wechat_upload
+    engine.wechat_public = args.wechat_public
     engine.no_sequence = args.no_sequence
-    if args.cookies:
-        engine.cookie_path = args.cookies
 
     # 1. 加载既有状态
     engine.load_state()
+    if args.cookies:
+        engine.cookie_path = args.cookies
+    elif args.cookies_from_browser:
+        engine.cookie_path = args.cookies_from_browser
 
     # Unified index selection logic
     selection_str = ""

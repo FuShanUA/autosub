@@ -817,7 +817,7 @@ def main():
                 for s in segments:
                     seg_lang = getattr(s, '_lang', None)
                     segments_list.append(serialize_segment(s, lang=seg_lang))
-            elif total_duration > 300 and clip_start == 0:
+            elif total_duration > 300:
                 # --- Chunked transcription for long videos ---
                 # model.transcribe() on a long video submits all chunks at once
                 # to ctranslate2's thread pool. The generator won't yield the
@@ -827,7 +827,9 @@ def main():
                 # ensures progress is visible and resumable.
                 CHUNK_SEC = 300  # 5 minutes per chunk
                 segments = []
-                chunk_start = 0
+                # Resume from the checkpoint instead of submitting the whole
+                # remaining audio to faster-whisper as one uncheckpointed batch.
+                chunk_start = float(clip_start)
                 while chunk_start < total_duration:
                     chunk_end = min(chunk_start + CHUNK_SEC, total_duration)
                     chunk_kwargs = dict(kwargs)
@@ -836,7 +838,7 @@ def main():
                     chunk_kwargs.pop("vad_filter", None)
                     chunk_kwargs["vad_filter"] = False
                     pct = round((chunk_start / total_duration) * 100, 1)
-                    print(f"Progress: {max(0.9, pct)}% (Transcribing {chunk_start:.0f}-{chunk_end:.0f}s)", flush=True)
+                    print(f"Progress: {pct}% (Transcribing {chunk_start:.0f}-{chunk_end:.0f}s)", flush=True)
                     seg_iter, info = model.transcribe(file_path, **chunk_kwargs)
                     # Iterate generator one segment at a time so each segment
                     # is checkpointed immediately (enables resume + progress).

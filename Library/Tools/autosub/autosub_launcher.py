@@ -20,7 +20,7 @@ from rich import box
 from rich.cells import cell_len
 
 # Configuration
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+CURRENT_DIR = os.path.dirname(os.path.realpath(__file__))
 if getattr(sys, 'frozen', False):
     TOOLS_DIR = os.path.join(getattr(sys, '_MEIPASS', ''), "Library", "Tools")
 else:
@@ -175,11 +175,16 @@ def check_all_completed(state_data: Any) -> bool:
                 continue
             status = task_d.get("status", "")
             pcts = task_d.get("pcts", {})
-            is_done = (status == "完成") or (
+            base_done = (status == "完成") or (
                 isinstance(pcts, dict) and 
                 pcts.get("BR", 0.0) >= 100.0 and 
                 pcts.get("GD", 100.0) >= 100.0 and 
                 pcts.get("BI", 100.0) >= 100.0
+            )
+            wechat_enabled = bool(task_d.get("wechat", state_data.get("wechat", False)))
+            is_done = base_done and (
+                not wechat_enabled
+                or (isinstance(pcts, dict) and pcts.get("WX", 0.0) >= 100.0)
             )
             if not is_done:
                 return False
@@ -213,6 +218,7 @@ def fetch_metadata(url: str, cookies_path: Optional[str] = None, browser: Option
     if cookies_path: label = f"Cookies: {os.path.basename(cookies_path)}"
     if browser: label = f"浏览器: {browser}"
 
+    console.print(f"[bold blue]正在解析内容信息 ({label})，最长等待 90 秒...[/]")
     with console.status(f"[bold blue]正在解析内容信息 ({label})..."):
         cmd = [
             YTDLP_EXE,
@@ -246,7 +252,12 @@ def fetch_metadata(url: str, cookies_path: Optional[str] = None, browser: Option
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE
                     )
-                stdout, stderr = process.communicate()
+                try:
+                    stdout, stderr = process.communicate(timeout=90)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.communicate()
+                    return {"error": "解析内容信息超时（90 秒）。请检查网络或稍后重试。"}
 
                 if process.returncode != 0:
                     err_msg = stderr.decode('utf-8', errors='ignore')
@@ -363,6 +374,8 @@ def launch_engine(cmd):
             console.print("\n[bold blue]✅ 任务已移交。[/]")
         elif sys.platform == "darwin":
             console.print("\n[bold blue]🚀 正在启动 AutoSub 压制引擎，请稍候...[/]\n")
+            # Replace this process so batch_pro inherits our stdout pipe
+            # (terminal_gui captures output via subprocess.Popen).
             os.execv(cmd[0], cmd)
         else:
             subprocess.Popen(cmd)
@@ -663,6 +676,37 @@ def onboard_model_selection():
                 break
 
 
+def confirm_wechat_upload(state: Optional[Dict[str, Any]] = None):
+    """Ask for WeChat Channels upload settings with safe defaults."""
+    # Resume path: reuse saved preference instead of re-asking every time
+    if isinstance(state, dict) and "wechat" in state:
+        enabled = bool(state.get("wechat", False))
+        public = bool(state.get("wechat_public", False))
+        return enabled, public
+
+    # New project path: prompt the user
+    choice = Prompt.ask(
+        "\n微信视频号上传方式 (1: 不上传 / 2: 上传并保存草稿 / 3: 上传并公开发布)",
+        choices=["1", "2", "3"],
+        default="2",
+    )
+    enabled = choice in ("2", "3")
+    public = choice == "3"
+
+    if isinstance(state, dict):
+        state["wechat"] = enabled
+        state["wechat_public"] = public
+    return enabled, public
+
+
+def ask_wechat_cover_title():
+    """Ask for an optional cover-only headline; blank keeps subtitle grounding."""
+    return Prompt.ask(
+        "\n微信封面标题 (留空自动按字幕提炼，仅影响封面画面)",
+        default="",
+    ).strip()
+
+
 def process_folder_mode(folder_path: str):
     """Folder re-processing mode: skip download/transcription, re-run from translate/burn/upload."""
     folder_path = os.path.abspath(folder_path)
@@ -750,7 +794,7 @@ def process_folder_mode(folder_path: str):
                     except Exception:
                         pass
 
-        markers_to_delete = [".synced", ".bili_uploaded"]
+        markers_to_delete = [".synced", ".bili_uploaded", ".wechat_uploaded"]
         if full_reset:
             markers_to_delete.append(".burn_complete")
         for marker in markers_to_delete:
@@ -767,6 +811,7 @@ def process_folder_mode(folder_path: str):
 
     do_sync = Confirm.ask("\n是否同步到 Google Drive?", default=True)
     do_bili = Confirm.ask("\n是否上传到 Bilibili?", default=True)
+    do_wechat, do_wechat_public = confirm_wechat_upload(existing_state)
     quality = Prompt.ask("\n选择压制字幕画质", choices=["standard", "high", "lossless"], default="high")
     onboard_model_selection()
 
@@ -781,7 +826,7 @@ def process_folder_mode(folder_path: str):
                 "title": meta.get("title", entry),
                 "duration": meta.get("duration", "未知"),
                 "status": "等待中",
-                "pcts": {"DL": 0.0, "TR": 0.0, "TL": 0.0, "MR": 0.0, "BR": 0.0, "GD": 0.0, "BI": 0.0},
+                "pcts": {"DL": 0.0, "TR": 0.0, "TL": 0.0, "MR": 0.0, "BR": 0.0, "GD": 0.0, "BI": 0.0, "WX": 0.0},
                 "workdir": sub_path,
                 "error": None,
                 "is_paused": False,
@@ -789,6 +834,8 @@ def process_folder_mode(folder_path: str):
             }
         task_map["bili"] = do_bili
         task_map["gdsync"] = do_sync
+        task_map["wechat"] = do_wechat
+        task_map["wechat_public"] = do_wechat_public
         with open(state_path, "w", encoding="utf-8") as f:
             json.dump(task_map, f, ensure_ascii=False, indent=2)
 
@@ -802,6 +849,10 @@ def process_folder_mode(folder_path: str):
         cmd.append("--gdsync")
     if do_bili:
         cmd.append("--bili-upload")
+    if do_wechat:
+        cmd.append("--wechat-upload")
+        if do_wechat_public:
+            cmd.append("--wechat-public")
 
     console.print(f"\n[bold green]🚀 启动文件夹重处理引擎...[/]")
     launch_engine(cmd)
@@ -918,10 +969,15 @@ def main():
             elif browser:
                 cmd.extend(["--cookies-from-browser", browser])
             do_bili = state_data.get("bili", True)
+            do_wechat, do_wechat_public = confirm_wechat_upload(state_data)
             if do_sync:
                 cmd.append("--gdsync")
             if do_bili:
                 cmd.append("--bili-upload")
+            if do_wechat:
+                cmd.append("--wechat-upload")
+                if do_wechat_public:
+                    cmd.append("--wechat-public")
 
             launch_engine(cmd)
             return
@@ -965,7 +1021,11 @@ def main():
 
     # Metadata Fetch Loop
     current_cookies = INITIAL_COOKIES_PATH if (INITIAL_COOKIES_PATH and os.path.exists(INITIAL_COOKIES_PATH)) else None
-    current_browser = None
+    # On macOS, default to Chrome cookies (aligned with batch_pro._discover_cookies)
+    if current_cookies is None and sys.platform == "darwin":
+        current_browser = "chrome"
+    else:
+        current_browser = None
     all_entries: List[Dict[str, Any]] = []
     final_title = None
     data: Optional[Dict[str, Any]] = None
@@ -1105,6 +1165,8 @@ def main():
 
     do_sync = Confirm.ask("\n是否同步到 Google Drive?", default=True)
     do_bili = Confirm.ask("\n是否上传到 Bilibili? (分区/标签/简介/合集按视频自动生成)", default=True)
+    do_wechat, do_wechat_public = confirm_wechat_upload()
+    wechat_cover_title = ask_wechat_cover_title() if do_wechat and is_single_video else ""
     quality = Prompt.ask("\n选择压制字幕画质 (standard: 标准质量, high: 高清原画, lossless: 无损超清)", choices=["standard", "high", "lossless"], default="high")
 
     # 3.5 Model Selection (optional, default: no change)
@@ -1118,6 +1180,12 @@ def main():
         elif current_browser: cmd.extend(["--cookies-from-browser", current_browser])
         if do_sync: cmd.extend(["--sync-gdrive", GDRIVE_FOLDER_ID])
         if do_bili: cmd.append("--bili-upload")
+        if do_wechat:
+            cmd.append("--wechat-upload")
+            if wechat_cover_title:
+                cmd.extend(["--wechat-cover-title", wechat_cover_title])
+            if do_wechat_public:
+                cmd.append("--wechat-public")
     else:
         # Pre-seed the batch_state.json to avoid redundant yt-dlp fetch in batch_v4
         project_dir = os.path.join(DEFAULT_OUTPUT_ROOT, folder_name)
@@ -1196,13 +1264,17 @@ def main():
                     "title": title, "vid_id": vid_id, "uid": idx, "workdir": workdir,
                     "duration": format_duration(entry.get('duration')),
                     "status": "等待中", "error": None, "is_paused": False,
-                    "pcts": {"DL": 0.0, "TR": 0.0, "TL": 0.0, "MR": 0.0, "BR": 0.0, "GD": 0.0, "BI": 0.0},
+                    "pcts": {"DL": 0.0, "TR": 0.0, "TL": 0.0, "MR": 0.0, "BR": 0.0, "GD": 0.0, "BI": 0.0, "WX": 0.0},
                     "queued_stages": ["DL"]
                 }
 
             # Persist global flags so resume can restore them
             task_map["bili"] = do_bili
             task_map["gdsync"] = do_sync
+            task_map["wechat"] = do_wechat
+            task_map["wechat_public"] = do_wechat_public
+            task_map["cookies"] = current_cookies
+            task_map["browser"] = current_browser
             with open(state_path, "w", encoding="utf-8") as f:
                 json.dump(task_map, f, ensure_ascii=False, indent=2)
 
@@ -1223,6 +1295,10 @@ def main():
                 cmd.extend(["--exclude", sel])
         if do_sync: cmd.append("--gdsync")
         if do_bili: cmd.append("--bili-upload")
+        if do_wechat:
+            cmd.append("--wechat-upload")
+            if do_wechat_public:
+                cmd.append("--wechat-public")
 
     console.print(f"\n[bold green]🚀 启动 {'单视频处理' if is_single_video else '批处理'} 引擎...[/]")
     launch_engine(cmd)
