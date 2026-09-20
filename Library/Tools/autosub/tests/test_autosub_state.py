@@ -265,6 +265,155 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         cover_index = cmd.index("--cover-title")
         self.assertEqual(cmd[cover_index + 1], "抽象产品")
 
+    def test_pre_generated_metadata_disables_platform_auto_title(self):
+        """Shared metadata must be passed through, not regenerated per platform."""
+        workdir = os.path.join(self.temp_dir, "pre_generated_metadata")
+        os.makedirs(workdir)
+        hardsub = os.path.join(workdir, "video_hardsub.mp4")
+        with open(hardsub, "w") as handle:
+            handle.write("video")
+        bili_script = os.path.join(self.temp_dir, "bili_upload.py")
+        wechat_script = os.path.join(self.temp_dir, "wechat_upload.py")
+        with open(bili_script, "w") as handle:
+            handle.write("# placeholder")
+        with open(wechat_script, "w") as handle:
+            handle.write("# placeholder")
+
+        with patch.object(autosub, "BILI_SCRIPT", bili_script), \
+             patch.object(autosub, "BILI_PYTHON", sys.executable), \
+             patch.object(autosub, "WECHAT_SCRIPT", wechat_script), \
+             patch.object(autosub, "WECHAT_PYTHON", sys.executable), \
+             patch.object(autosub, "get_video_duration", lambda _path: 600):
+            bili_cmd = autosub.build_bili_cmd(
+                workdir,
+                title="OpenAI研究员谈智能体",
+                desc="共享简介",
+                cover_title="智能体与自我改进",
+            )
+            wechat_cmd = autosub.build_wechat_cmd(
+                workdir,
+                title="OpenAI研究员谈智能体",
+                desc="共享简介",
+                cover_title="智能体与自我改进",
+            )
+
+        self.assertIn("--no_auto_title", bili_cmd)
+        self.assertIn("--no_auto_title", wechat_cmd)
+        self.assertIn("OpenAI研究员谈智能体", bili_cmd)
+        self.assertIn("OpenAI研究员谈智能体", wechat_cmd)
+        self.assertIn("共享简介", bili_cmd)
+        self.assertIn("共享简介", wechat_cmd)
+
+    def test_generate_upload_metadata_uses_llm_client_model_name(self):
+        """The shared description and summary-title calls use the model name."""
+        workdir = os.path.join(self.temp_dir, "metadata_llm_interface")
+        os.makedirs(workdir)
+        hardsub = os.path.join(workdir, "video_hardsub.mp4")
+        with open(hardsub, "w") as handle:
+            handle.write("video")
+        llm_client = MagicMock()
+        llm_client.generate_content.side_effect = [
+            "共享简介",
+            '{"title":"Palantir数据整合","evidence":["Palantir把数据整合做成产品"]}',
+        ]
+        subtitle_title = MagicMock()
+        subtitle_title.build_subtitle_grounded_title.return_value = SimpleNamespace(
+            title="Palantir是什么"
+        )
+        subtitle_title.read_subtitle_text.return_value = ("字幕内容", "subtitle.srt")
+        subtitle_title.read_full_subtitle_text.return_value = ("完整字幕内容", "subtitle.srt")
+        subtitle_title.parse_llm_title_response.return_value = (
+            "Palantir数据整合",
+            ("Palantir把数据整合做成产品",),
+        )
+        subtitle_title.validate_title_from_subtitle.return_value = (
+            "Palantir把数据整合做成产品",
+        )
+
+        with patch.object(autosub, "find_hardsub_video", return_value=hardsub), \
+             patch.object(
+                 autosub,
+                 "_load_llm_defaults",
+                 return_value=("glm-5.2", "dashscope"),
+             ), \
+             patch.dict(
+                 sys.modules,
+                 {
+                     "subtitle_title": subtitle_title,
+                     "llm_utils": MagicMock(get_client=lambda: llm_client),
+                 },
+             ):
+            metadata = autosub.generate_upload_metadata(
+                workdir,
+                title_max_chars=16,
+            )
+
+        self.assertEqual(metadata["description"], "共享简介")
+        self.assertEqual(metadata["title"], "Palantir数据整合")
+        self.assertEqual(llm_client.generate_content.call_count, 2)
+        self.assertEqual(
+            llm_client.generate_content.call_args.kwargs["model_name"],
+            "glm-5.2",
+        )
+        self.assertNotIn("视频标题：", llm_client.generate_content.call_args.args[0])
+        self.assertIn("视频简介：\n共享简介", llm_client.generate_content.call_args_list[1].args[0])
+        self.assertIn("Palantir 为 8 字符", llm_client.generate_content.call_args_list[1].args[0])
+        self.assertIn("主体+核心对象+动作或结果", llm_client.generate_content.call_args_list[1].args[0])
+        self.assertIn("「整合数据」时可以写「数据整合」", llm_client.generate_content.call_args_list[1].args[0])
+        self.assertIn("逐字复制字幕原文", llm_client.generate_content.call_args_list[1].args[0])
+        plain_title_calls = [
+            call for call in subtitle_title.build_subtitle_grounded_title.call_args_list
+            if call.kwargs.get("title_style") == "plain"
+        ]
+        self.assertEqual(plain_title_calls, [])
+
+    def test_generate_upload_metadata_falls_back_when_summary_title_is_bad(self):
+        """Invalid summary compression must not bypass subtitle grounding."""
+        workdir = os.path.join(self.temp_dir, "metadata_summary_fallback")
+        os.makedirs(workdir)
+        hardsub = os.path.join(workdir, "video_hardsub.mp4")
+        with open(hardsub, "w") as handle:
+            handle.write("video")
+        llm_client = MagicMock()
+        llm_client.generate_content.side_effect = ["共享简介", "bad response"]
+        subtitle_title = MagicMock()
+        subtitle_title.read_subtitle_text.return_value = ("字幕内容", "subtitle.srt")
+        subtitle_title.read_full_subtitle_text.return_value = ("完整字幕内容", "subtitle.srt")
+        subtitle_title.parse_llm_title_response.return_value = (
+            "Palantir到底做什么",
+            ("Palantir把数据整合做成产品",),
+        )
+        subtitle_title.build_subtitle_grounded_title.return_value = SimpleNamespace(
+            title="Palantir数据整合"
+        )
+
+        with patch.object(autosub, "find_hardsub_video", return_value=hardsub), \
+             patch.object(autosub, "_load_llm_defaults", return_value=("glm-5.2", "dashscope")), \
+             patch.dict(
+                 sys.modules,
+                 {
+                     "subtitle_title": subtitle_title,
+                     "llm_utils": MagicMock(get_client=lambda: llm_client),
+                 },
+             ):
+            metadata = autosub.generate_upload_metadata(
+                workdir,
+                title_max_chars=16,
+            )
+
+        self.assertEqual(metadata["title"], "Palantir数据整合")
+        self.assertEqual(subtitle_title.build_subtitle_grounded_title.call_count, 2)
+        fallback_call = subtitle_title.build_subtitle_grounded_title.call_args_list[0]
+        self.assertIn("保留主体和最具体的核心结果", fallback_call.kwargs["platform_hint"])
+        self.assertIn("上限16字", fallback_call.kwargs["platform_hint"])
+        self.assertIn("英文字母逐字符计数", fallback_call.kwargs["platform_hint"])
+        self.assertIn("禁止使用省略号", fallback_call.kwargs["platform_hint"])
+        self.assertIn("不要改写成概括句", fallback_call.kwargs["platform_hint"])
+        self.assertIn("不得用「东西」「能力」等泛词", fallback_call.kwargs["platform_hint"])
+        self.assertIn("优先删除「把/了/的/一个」等功能词", fallback_call.kwargs["platform_hint"])
+        self.assertIn("不得用「它/他们」替代主体", fallback_call.kwargs["platform_hint"])
+        self.assertIn("视频简介第一句：共享简介", fallback_call.kwargs["platform_hint"])
+
     def test_build_bili_cmd_separates_cover_title_from_form_title(self):
         """A Bilibili cover-only headline must not replace the form title."""
         workdir = os.path.join(self.temp_dir, "bili_cover_title")
@@ -359,6 +508,113 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         self.assertTrue(wechat_kwargs["public"])
         for marker in (".synced", ".bili_uploaded", ".wechat_uploaded"):
             self.assertTrue(os.path.exists(os.path.join(workdir, marker)))
+
+    def test_parallel_uploads_generate_title_at_wechat_limit(self):
+        """BI/WX must use one title short enough for WeChat, not truncate only WX."""
+        workdir = os.path.join(self.temp_dir, "shared_title_limit")
+        os.makedirs(workdir)
+        metadata = {
+            "title": "OpenAI研究员谈智能体",
+            "description": "共享简介",
+            "cover_title": "智能体与自我改进",
+        }
+        calls = []
+
+        def fake_bili(_workdir, **kwargs):
+            calls.append(("BI", kwargs))
+            return True
+
+        def fake_wechat(_workdir, **kwargs):
+            calls.append(("WX", kwargs))
+            return True
+
+        with patch.object(autosub, "generate_upload_metadata", return_value=metadata) as mock_meta, \
+             patch.object(autosub, "trigger_bili_upload", side_effect=fake_bili), \
+             patch.object(autosub, "trigger_wechat_upload", side_effect=fake_wechat):
+            autosub.run_post_processing_uploads(
+                workdir,
+                bili_upload=True,
+                wechat_upload=True,
+            )
+
+        mock_meta.assert_called_once_with(workdir, title_max_chars=16)
+        bili_kwargs = next(call[1] for call in calls if call[0] == "BI")
+        wechat_kwargs = next(call[1] for call in calls if call[0] == "WX")
+        self.assertEqual(bili_kwargs["title"], metadata["title"])
+        self.assertEqual(wechat_kwargs["title"], metadata["title"])
+        self.assertLessEqual(len(wechat_kwargs["title"]), 16)
+
+    def test_shared_title_is_rejected_instead_of_silently_truncated(self):
+        """A 19-character title must stop shared uploads, not cut to 16."""
+        title = "OpenAI研究员谈智能体和自我改进"
+        self.assertEqual(
+            autosub.normalize_shared_upload_title("OpenAI研究员谈智能体"),
+            "OpenAI研究员谈智能体",
+        )
+        self.assertEqual(autosub.normalize_shared_upload_title(title), "")
+
+    def test_parallel_uploads_stop_when_shared_metadata_is_incomplete(self):
+        """A platform must not silently generate its own substitute metadata."""
+        workdir = os.path.join(self.temp_dir, "incomplete_metadata")
+        os.makedirs(workdir)
+        metadata = {
+            "title": "OpenAI研究员谈智能体",
+            "description": "",
+            "cover_title": "智能体与自我改进",
+        }
+
+        with patch.object(autosub, "generate_upload_metadata", return_value=metadata), \
+             patch.object(autosub, "trigger_bili_upload") as mock_bili, \
+             patch.object(autosub, "trigger_wechat_upload") as mock_wechat:
+            autosub.run_post_processing_uploads(
+                workdir,
+                bili_upload=True,
+                wechat_upload=True,
+            )
+
+        mock_bili.assert_not_called()
+        mock_wechat.assert_not_called()
+        for marker in (".bili_uploaded", ".wechat_uploaded"):
+            self.assertFalse(os.path.exists(os.path.join(workdir, marker)))
+
+    def test_parallel_uploads_stop_when_shared_metadata_generation_fails(self):
+        """A total metadata failure must not fall back to per-platform generation."""
+        workdir = os.path.join(self.temp_dir, "metadata_generation_failed")
+        os.makedirs(workdir)
+
+        with patch.object(autosub, "generate_upload_metadata", return_value=None), \
+             patch.object(autosub, "trigger_bili_upload") as mock_bili, \
+             patch.object(autosub, "trigger_wechat_upload") as mock_wechat:
+            autosub.run_post_processing_uploads(
+                workdir,
+                bili_upload=True,
+                wechat_upload=True,
+            )
+
+        mock_bili.assert_not_called()
+        mock_wechat.assert_not_called()
+        for marker in (".bili_uploaded", ".wechat_uploaded"):
+            self.assertFalse(os.path.exists(os.path.join(workdir, marker)))
+
+    def test_parallel_uploads_reject_different_explicit_cover_titles(self):
+        """Explicit per-platform cover titles must not diverge in shared mode."""
+        workdir = os.path.join(self.temp_dir, "different_covers")
+        os.makedirs(workdir)
+
+        with patch.object(autosub, "generate_upload_metadata") as mock_meta, \
+             patch.object(autosub, "trigger_bili_upload") as mock_bili, \
+             patch.object(autosub, "trigger_wechat_upload") as mock_wechat:
+            autosub.run_post_processing_uploads(
+                workdir,
+                bili_upload=True,
+                wechat_upload=True,
+                bili_cover_title="智能体与自我改进",
+                wechat_cover_title="智能体会自我改进",
+            )
+
+        mock_meta.assert_not_called()
+        mock_bili.assert_not_called()
+        mock_wechat.assert_not_called()
 
     def test_build_wechat_title_caps_at_platform_limit(self):
         """WeChat's short-title field rejects long titles and unsupported punctuation."""

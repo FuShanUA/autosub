@@ -252,6 +252,7 @@ BILI_PYTHON = "/Users/shanfu/.gemini/config/skills/bilibili-uploader/.venv/bin/p
 BILI_VIDEO_EXTS = ('.mp4', '.mkv', '.webm', '.mov', '.ts')
 WECHAT_SCRIPT = os.path.expanduser("~/.codex/skills/wechat-channel-uploader/scripts/wechat_upload.py")
 WECHAT_MAX_UPLOAD_SECONDS = 600
+SHARED_UPLOAD_TITLE_MAX_CHARS = 16
 _wechat_venv_python = os.path.join(
     CURRENT_DIR,
     ".venv",
@@ -294,6 +295,19 @@ def sanitize_wechat_title(title, max_chars=16):
     )
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return (cleaned or "未命名视频")[:max_chars]
+
+
+def normalize_shared_upload_title(title, max_chars=SHARED_UPLOAD_TITLE_MAX_CHARS):
+    """Clean a shared title without silently truncating its meaning."""
+    value = str(title or "").strip()
+    if not value:
+        return ""
+    # Sanitize with the original length first so an over-limit title is
+    # detected instead of being cut to 16 characters.
+    cleaned = sanitize_wechat_title(value, max_chars=max(len(value), 1))
+    if not cleaned or cleaned == "未命名视频" or len(cleaned) > max_chars:
+        return ""
+    return cleaned
 
 def build_bili_cmd(workdir, title=None, tid=None, category_name=None, tags=None, season=None, desc=None, public=False, cover_title=None):
     """Build the Bilibili upload command for the hardsub video in workdir.
@@ -430,12 +444,95 @@ def _load_llm_defaults():
         pass
     return "glm-5.2", "dashscope"
 
-def generate_upload_metadata(workdir, on_log=None):
+
+_SHARED_TITLE_BANNED_TERMS = (
+    "它", "他们", "她们", "东西", "能力", "到底", "究竟",
+    "为什么", "为何", "如何", "怎么", "怎样", "什么",
+)
+
+
+def _shared_title_has_quality_issue(title):
+    value = re.sub(r"\s+", " ", str(title or "")).strip()
+    return any(term in value for term in _SHARED_TITLE_BANNED_TERMS)
+
+
+def _generate_title_from_description(
+    description,
+    subtitle_text,
+    full_subtitle_text,
+    llm_client,
+    model_name,
+    max_chars,
+):
+    """Compress the whole-video summary into one shared form title."""
+    from subtitle_title import (
+        parse_llm_title_response,
+        SubtitleTitleError,
+        validate_title_from_subtitle,
+    )
+
+    if not description or not subtitle_text or not full_subtitle_text or llm_client is None:
+        return None
+
+    min_chars = min(12, max_chars)
+    base_prompt = (
+        "把下面的视频简介精炼成共享表单标题。"
+        f"标题长度必须为 {min_chars}-{max_chars} 个字符，英文字母逐字符计数。"
+        "例如 Palantir 为 8 字符。"
+        "标题要如实概括整个视频，像简介第一句的更短版本："
+        "保留主体、最具体的核心对象和结果，删除修饰词。"
+        "语序必须自然，优先写成「主体+核心对象+动作或结果」，"
+        "不要把动词硬放在核心对象前面造成翻译腔。"
+        "允许把字幕动词短语名词化成自然中文，"
+        "例如字幕说「整合数据」时可以写「数据整合」，但不得新增事实。"
+        "不要疑问句、悬念句、代词、泛词或营销口吻。"
+        "标题中的事实和术语必须来自字幕。"
+        "同时给出 1-2 条 evidence，必须逐字复制字幕原文，不得改写或加省略号。"
+        '只输出 JSON：{"title":"...","evidence":["..."]}\n\n'
+        f"视频简介：\n{description}\n\n"
+        f"字幕内容：\n{subtitle_text}"
+    )
+    last_error = None
+    validation_feedback = ""
+    for _ in range(2):
+        prompt = base_prompt
+        if validation_feedback:
+            prompt += (
+                f"\n上一轮标题未通过字幕溯源校验：{validation_feedback}\n"
+                "请只修正标题措辞和 evidence，保持全片概括不变。"
+            )
+        try:
+            raw = llm_client.generate_content(prompt, model_name=model_name)
+            title, evidence = parse_llm_title_response(raw)
+            title = sanitize_wechat_title(title, max_chars=max_chars)
+            if len(title) < min_chars or len(title) > max_chars or _shared_title_has_quality_issue(title):
+                raise SubtitleTitleError("简介压缩标题不符合共享标题质量要求")
+            validate_title_from_subtitle(
+                title,
+                full_subtitle_text,
+                evidence,
+                min_chars=min_chars,
+                max_chars=max_chars,
+            )
+            return title
+        except SubtitleTitleError as exc:
+            last_error = exc
+            validation_feedback = str(exc)
+    if last_error is not None:
+        raise last_error
+    raise SubtitleTitleError("简介压缩标题生成失败")
+
+
+def generate_upload_metadata(workdir, on_log=None, title_max_chars=48):
     """Generate shared title, cover_title, and description from subtitle content.
     Returns dict {title, cover_title, description} or None on failure."""
     _log = on_log or (lambda msg: print(msg, flush=True))
     try:
-        from subtitle_title import build_subtitle_grounded_title, read_subtitle_text, SubtitleTitleError
+        from subtitle_title import (
+            build_subtitle_grounded_title,
+            read_full_subtitle_text,
+            read_subtitle_text,
+        )
     except Exception as e:
         _log(f"⚠️ [MetaGen] subtitle_title import failed: {e}")
         return None
@@ -450,18 +547,74 @@ def generate_upload_metadata(workdir, on_log=None):
         _log("⚠️ [MetaGen] No hardsub video found")
         return None
     meta = {}
-    # 1. Form title (plain style, neutral hint for both platforms)
+    sub_text = None
+
+    # Generate the description first. The form title is a compressed version of
+    # this summary, so sharing its first sentence keeps the title tied to the
+    # whole video instead of one striking transcript fragment.
     try:
-        grounded = build_subtitle_grounded_title(
-            hardsub_path, llm_client=llm_client, model_name=model,
-            max_title_chars=48, min_title_chars=12,
-            platform_hint="视频标题应平实、准确、克制，概括核心内容。",
-            title_style="plain",
-        )
-        meta["title"] = grounded.title
-        _log(f">>> [MetaGen] 标题: {grounded.title}")
+        sub_text, sub_path = read_subtitle_text(hardsub_path, max_chars=30000)
+        if sub_text and llm_client:
+            prompt = (
+                "根据以下视频字幕，写一段100-200字的视频简介。简洁有力，概括核心内容，不要AI味。\n\n"
+                f"{sub_text}\n\n只输出简介内容。"
+            )
+            desc = llm_client.generate_content(prompt, model_name=model)
+            if desc and desc.strip():
+                meta["description"] = desc.strip()
+                _log(f">>> [MetaGen] 简介: {desc.strip()[:60]}...")
     except Exception as e:
-        _log(f"⚠️ [MetaGen] Title generation failed: {e}")
+        _log(f"⚠️ [MetaGen] Description generation failed: {e}")
+
+    # Prefer a title compressed from the whole-video description. The older
+    # subtitle-candidate path remains as a fallback when this grounded path
+    # cannot produce a valid short title.
+    if meta.get("description") and sub_text and llm_client:
+        try:
+            full_sub_text, _full_sub_path = read_full_subtitle_text(hardsub_path)
+            summary_title = _generate_title_from_description(
+                meta["description"],
+                sub_text,
+                full_sub_text,
+                llm_client,
+                model,
+                title_max_chars,
+            )
+            if summary_title:
+                meta["title"] = summary_title
+                _log(f">>> [MetaGen] 标题: {summary_title}")
+        except Exception as e:
+            _log(f"⚠️ [MetaGen] Summary title generation failed: {e}")
+
+    # 1. Form title (plain style, neutral hint for both platforms)
+    description_context = ""
+    if meta.get("description"):
+        description_context = str(meta["description"]).splitlines()[0].strip()[:120]
+    if not meta.get("title"):
+        try:
+            platform_hint = (
+                "共享表单标题上限16字。它必须像视频简介第一句的精炼版："
+                "保留主体和最具体的核心结果，禁止只剩过程、代词或泛化判断。"
+                "英文字母逐字符计数，例如 Palantir 为 8 字符。"
+                "候选 evidence 必须逐字复制字幕原文，禁止使用省略号；"
+                "不确定时选择包含标题关键词的完整原行，不要改写成概括句。"
+                "不得用「东西」「能力」等泛词替代字幕中的具体对象。"
+                "长度紧张时优先删除「把/了/的/一个」等功能词，"
+                "保留主体、具体对象和结果。"
+                "不得用「它/他们」替代主体。"
+            )
+            if description_context:
+                platform_hint += f"视频简介第一句：{description_context}"
+            grounded = build_subtitle_grounded_title(
+                hardsub_path, llm_client=llm_client, model_name=model,
+                max_title_chars=title_max_chars, min_title_chars=min(12, title_max_chars),
+                platform_hint=platform_hint,
+                title_style="plain",
+            )
+            meta["title"] = grounded.title
+            _log(f">>> [MetaGen] 标题: {grounded.title}")
+        except Exception as e:
+            _log(f"⚠️ [MetaGen] Title generation failed: {e}")
     # 2. Cover title (editorial headline style)
     try:
         grounded = build_subtitle_grounded_title(
@@ -474,22 +627,8 @@ def generate_upload_metadata(workdir, on_log=None):
         _log(f">>> [MetaGen] 封面标题: {grounded.title}")
     except Exception as e:
         _log(f"⚠️ [MetaGen] Cover title generation failed: {e}")
-    # 3. Description (LLM summary of subtitle)
-    try:
-        sub_text, sub_path = read_subtitle_text(hardsub_path, max_chars=30000)
-        if sub_text and llm_client:
-            prompt = (
-                f"根据以下视频字幕，写一段100-200字的视频简介。简洁有力，概括核心内容，不要AI味。\n"
-                f"视频标题：{meta.get('title', '')}\n\n{sub_text}\n\n只输出简介内容。"
-            )
-            desc = llm_client.generate_content(prompt, model=model)
-            if desc and desc.strip():
-                meta["description"] = desc.strip()
-                _log(f">>> [MetaGen] 简介: {desc.strip()[:60]}...")
-    except Exception as e:
-        _log(f"⚠️ [MetaGen] Description generation failed: {e}")
     if not meta.get("title"):
-        meta["title"] = build_bili_title(hardsub_path)
+        return meta
     return meta if meta else None
 
 # --- WeChat Channels Upload (canonical implementation; batch engine + GUI reuse this) ---
@@ -647,24 +786,51 @@ def run_post_processing_uploads(
     if not any((need_sync, need_bili, need_wechat)):
         return
 
+    shared_uploads = need_bili and need_wechat
+    explicit_cover_titles = (
+        str(bili_cover_title or "").strip(),
+        str(wechat_cover_title or "").strip(),
+    )
+    if shared_uploads and all(explicit_cover_titles) and explicit_cover_titles[0] != explicit_cover_titles[1]:
+        print("❌ [MetaGen] Bilibili and WeChat cover titles differ; shared uploads stopped", flush=True)
+        need_bili = False
+        need_wechat = False
+        shared_uploads = False
+
     meta = None
-    if need_bili and need_wechat:
-        meta = generate_upload_metadata(workdir) or {}
+    if shared_uploads:
+        meta = generate_upload_metadata(
+            workdir,
+            title_max_chars=SHARED_UPLOAD_TITLE_MAX_CHARS,
+        )
 
     bili_kwargs = {}
     wechat_kwargs = {"public": wechat_public}
-    if meta:
-        bili_kwargs.update({
-            "title": meta.get("title"),
-            "desc": meta.get("description"),
-            "cover_title": bili_cover_title or meta.get("cover_title"),
-        })
-        shared_title = meta.get("title")
-        wechat_kwargs.update({
-            "title": sanitize_wechat_title(shared_title) if shared_title else None,
-            "desc": meta.get("description"),
-            "cover_title": wechat_cover_title or meta.get("cover_title"),
-        })
+    if shared_uploads and not meta:
+        print("❌ [MetaGen] shared metadata generation failed; BI/WX uploads stopped", flush=True)
+        need_bili = False
+        need_wechat = False
+    elif meta:
+        shared_title = normalize_shared_upload_title(
+            meta.get("title"),
+            max_chars=SHARED_UPLOAD_TITLE_MAX_CHARS,
+        )
+        shared_desc = str(meta.get("description") or "").strip()
+        shared_cover_title = str(
+            bili_cover_title or wechat_cover_title or meta.get("cover_title") or ""
+        ).strip()
+        if not shared_title or not shared_desc or not shared_cover_title:
+            print("❌ [MetaGen] shared title/description/cover title incomplete; BI/WX uploads stopped", flush=True)
+            need_bili = False
+            need_wechat = False
+        else:
+            shared_metadata = {
+                "title": shared_title,
+                "desc": shared_desc,
+                "cover_title": shared_cover_title,
+            }
+            bili_kwargs.update(shared_metadata)
+            wechat_kwargs.update(shared_metadata)
     elif bili_cover_title:
         bili_kwargs["cover_title"] = bili_cover_title
     elif wechat_cover_title:
