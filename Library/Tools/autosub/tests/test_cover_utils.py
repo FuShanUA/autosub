@@ -21,6 +21,7 @@ from cover_utils import (
     generate_platform_covers,
     _cover_cache_marker,
     _centering_for_face,
+    _centering_for_faces,
     _draw_title,
     _find_latin_font,
     _fit_font,
@@ -357,6 +358,23 @@ class TestCoverUtils(unittest.TestCase):
             (204, 134, 301, 301),
         )
         self.assertEqual(centering, (0.0, 0.5))
+
+    def test_portrait_crop_keeps_more_visible_faces(self):
+        faces = [(240, 200, 300, 300), (720, 220, 180, 180)]
+        centering = _centering_for_faces(
+            (1920, 1080),
+            (1080, 1440),
+            faces,
+        )
+        crop_width = round(1080 * 1080 / 1440)
+        left = round(centering[0] * (1920 - crop_width))
+        visible_faces = 0
+        for x, _, width, _ in faces:
+            visible_width = max(0, min(x + width, left + crop_width) - max(x, left))
+            if visible_width == width:
+                visible_faces += 1
+        self.assertGreaterEqual(visible_faces, 1)
+        self.assertGreater(centering[0], 0.0)
 
     def test_title_card_moves_below_subject(self):
         image = Image.new("RGB", (1920, 1080), (42, 82, 126))

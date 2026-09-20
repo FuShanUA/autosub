@@ -872,6 +872,70 @@ def _centering_for_face(
     return (0.5, center_y)
 
 
+def _centering_for_faces(
+    source_size: Tuple[int, int],
+    target_size: Tuple[int, int],
+    faces: Sequence[Tuple[int, int, int, int]],
+) -> Tuple[float, float]:
+    """Crop to keep the most visible people, not only the largest face."""
+    if not faces:
+        return (0.5, 0.5)
+
+    source_width, source_height = source_size
+    target_width, target_height = target_size
+    source_ratio = source_width / source_height
+    target_ratio = target_width / target_height
+
+    if source_ratio > target_ratio:
+        crop_width = round(source_height * target_ratio)
+        max_left = max(0, source_width - crop_width)
+        if max_left == 0:
+            return (0.5, 0.5)
+
+        best_left = 0
+        best_key = (-1, -1.0, 0.0)
+        for left in range(max_left + 1):
+            full_count = 0
+            visible_area = 0.0
+            for x, _, width, height in faces:
+                visible_width = max(
+                    0, min(x + width, left + crop_width) - max(x, left)
+                )
+                visible_area += visible_width * height
+                if visible_width == width:
+                    full_count += 1
+            center_bonus = -abs(left + crop_width / 2 - source_width / 2)
+            key = (full_count, visible_area, center_bonus)
+            if key > best_key:
+                best_key = key
+                best_left = left
+        return (best_left / max_left, 0.5)
+
+    crop_height = round(source_width / target_ratio)
+    max_top = max(0, source_height - crop_height)
+    if max_top == 0:
+        return (0.5, 0.5)
+
+    best_top = 0
+    best_key = (-1, -1.0, 0.0)
+    for top in range(max_top + 1):
+        full_count = 0
+        visible_area = 0.0
+        for _, y, width, height in faces:
+            visible_height = max(
+                0, min(y + height, top + crop_height) - max(y, top)
+            )
+            visible_area += visible_height * width
+            if visible_height == height:
+                full_count += 1
+        center_bonus = -abs(top + crop_height / 2 - source_height / 2)
+        key = (full_count, visible_area, center_bonus)
+        if key > best_key:
+            best_key = key
+            best_top = top
+    return (0.5, best_top / max_top)
+
+
 def _choose_source_frame(
     video_path: str,
     source_path: Optional[str],
@@ -1016,7 +1080,7 @@ def generate_cover(
         return output_path
 
     source = _load_source_frame(video_path, source_path)
-    centering = _centering_for_face(source.size, size, _largest_face_bbox(source))
+    centering = _centering_for_faces(source.size, size, _face_bboxes(source))
     cover = ImageOps.fit(
         source,
         size,
