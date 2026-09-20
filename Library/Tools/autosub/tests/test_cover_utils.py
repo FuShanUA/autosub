@@ -2,14 +2,16 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest.mock import patch
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
-COMMON_DIR = os.path.join(REPO_ROOT, "..", "common")
+COMMON_DIR = os.path.join(REPO_ROOT, "Library", "Tools", "common")
 if os.path.isdir(COMMON_DIR):
     import sys
     if COMMON_DIR not in sys.path:
         sys.path.insert(0, COMMON_DIR)
 
+import cover_utils
 from PIL import Image, ImageFont
 
 from cover_utils import (
@@ -22,6 +24,8 @@ from cover_utils import (
     _draw_title,
     _find_latin_font,
     _fit_font,
+    _frame_face_score,
+    _largest_face_bbox,
     _load_title_fonts,
     _legacy_cover_cache_marker,
     read_cover_metadata,
@@ -34,6 +38,38 @@ class TestCoverUtils(unittest.TestCase):
         self.temp_dir = tempfile.mkdtemp()
         self.source = os.path.join(self.temp_dir, "source.jpg")
         Image.new("RGB", (1920, 1080), (42, 82, 126)).save(self.source, "JPEG")
+
+    def test_face_frame_scores_above_frame_without_faces(self):
+        with patch.object(cover_utils, "_face_bboxes", return_value=[]):
+            no_face_score = _frame_face_score(self.source)
+        with patch.object(
+            cover_utils,
+            "_face_bboxes",
+            return_value=[(860, 390, 200, 200)],
+        ):
+            face_score = _frame_face_score(self.source)
+
+        self.assertLess(no_face_score, 2.0)
+        self.assertGreater(face_score, 30.0)
+        self.assertLess(no_face_score, face_score)
+
+    def test_more_faces_win_even_when_each_face_is_smaller(self):
+        one_large_face = [(760, 240, 400, 400)]
+        two_smaller_faces = [(560, 420, 180, 180), (1180, 420, 180, 180)]
+
+        with patch.object(cover_utils, "_face_bboxes", return_value=one_large_face):
+            one_face_score = _frame_face_score(self.source)
+        with patch.object(
+            cover_utils, "_face_bboxes", return_value=two_smaller_faces
+        ):
+            two_face_score = _frame_face_score(self.source)
+
+        self.assertGreater(two_face_score, one_face_score)
+
+    def test_largest_face_bbox_keeps_dominant_face_for_cropping(self):
+        faces = [(100, 100, 120, 120), (650, 300, 260, 260)]
+        with patch.object(cover_utils, "_face_bboxes", return_value=faces):
+            self.assertEqual(_largest_face_bbox(self.source), (650, 300, 260, 260))
 
     def tearDown(self):
         shutil.rmtree(self.temp_dir)
