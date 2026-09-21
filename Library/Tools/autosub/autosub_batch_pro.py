@@ -1520,8 +1520,9 @@ class BatchEngine:
                     else:
                         # === THREE-WAY PARALLEL: GD + BI + WX simultaneously ===
                         # GD starts immediately; shared metadata is generated for
-                        # BI/WX (title, description, cover_title) so both upload
-                        # scripts skip their own LLM generation and stay consistent.
+                        # BI/WX. Bilibili gets the fuller title, WeChat gets a
+                        # 16-character title derived from it, and both share the
+                        # description and cover title.
                         sync_cmd = [str(x) for x in [PYTHON_EXE, SYNC_SCRIPT, "--local-dir", workdir, "--remote-id", self.gdsync_id, "--wrap-folder", "--headless"] if x is not None] if need_gd else None
 
                         # Build BI/WX cmds with pre-generated metadata
@@ -1541,7 +1542,7 @@ class BatchEngine:
                                 need_bi = False
                         if need_wx:
                             wechat_cmd = build_wechat_cmd(workdir,
-                                title=meta.get("title") if meta else None,
+                                title=meta.get("wechat_title") if meta else None,
                                 desc=meta.get("description") if meta else None,
                                 cover_title=meta.get("cover_title") if meta else None,
                                 public=self.wechat_public)

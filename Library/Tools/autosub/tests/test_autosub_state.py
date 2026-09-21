@@ -314,7 +314,9 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         llm_client = MagicMock()
         llm_client.generate_content.side_effect = [
             "共享简介",
-            '{"title":"Palantir数据整合","evidence":["Palantir把数据整合做成产品"]}',
+            '{"title":"卡普谈Palantir数据整合，不做服务并坚持工程为本","evidence":["卡普谈Palantir数据整合"]}',
+            '{"title":"卡普谈Palantir数据整合","evidence":["卡普谈Palantir数据整合"]}',
+            '{"central_claim":"卡普谈Palantir数据整合","candidates":[{"title":"没有销售团队，却看到大规模采用","evidence":["我们没有销售团队，却看到了大规模的采用。"]}]}',
         ]
         subtitle_title = MagicMock()
         subtitle_title.build_subtitle_grounded_title.return_value = SimpleNamespace(
@@ -323,9 +325,23 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         subtitle_title.read_subtitle_text.return_value = ("字幕内容", "subtitle.srt")
         subtitle_title.read_full_subtitle_text.return_value = ("完整字幕内容", "subtitle.srt")
         subtitle_title.parse_llm_title_response.return_value = (
-            "Palantir数据整合",
-            ("Palantir把数据整合做成产品",),
+            "卡普谈Palantir数据整合",
+            ("卡普谈Palantir数据整合",),
         )
+        subtitle_title.parse_llm_title_candidates.side_effect = [
+            (
+                "卡普谈Palantir数据整合，不做服务并坚持工程为本",
+                (("卡普谈Palantir数据整合，不做服务并坚持工程为本", ("卡普谈Palantir数据整合",)),),
+            ),
+            (
+                "卡普谈Palantir数据整合",
+                (("卡普谈Palantir数据整合", ("卡普谈Palantir数据整合",)),),
+            ),
+            (
+                "卡普谈Palantir数据整合",
+                (("没有销售团队，却看到大规模采用", ("我们没有销售团队，却看到了大规模的采用。",)),),
+            ),
+        ]
         subtitle_title.validate_title_from_subtitle.return_value = (
             "Palantir把数据整合做成产品",
         )
@@ -342,25 +358,35 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
                      "subtitle_title": subtitle_title,
                      "llm_utils": MagicMock(get_client=lambda: llm_client),
                  },
-             ):
-            metadata = autosub.generate_upload_metadata(
-                workdir,
-                title_max_chars=16,
-            )
+            ):
+            metadata = autosub.generate_upload_metadata(workdir)
 
         self.assertEqual(metadata["description"], "共享简介")
-        self.assertEqual(metadata["title"], "Palantir数据整合")
-        self.assertEqual(llm_client.generate_content.call_count, 2)
+        self.assertEqual(metadata["title"], "卡普谈Palantir数据整合，不做服务并坚持工程为本")
+        self.assertEqual(metadata["wechat_title"], "卡普谈Palantir数据整合")
+        self.assertEqual(metadata["cover_title"], "没有销售团队，却看到大规模采用")
+        self.assertEqual(llm_client.generate_content.call_count, 4)
         self.assertEqual(
             llm_client.generate_content.call_args.kwargs["model_name"],
             "glm-5.2",
         )
         self.assertNotIn("视频标题：", llm_client.generate_content.call_args.args[0])
+        self.assertIn(
+            "所有数字、金额、时间和公司关系必须逐字来自字幕",
+            llm_client.generate_content.call_args_list[0].args[0],
+        )
+        self.assertIn(
+            "不得换算数量级",
+            llm_client.generate_content.call_args_list[0].args[0],
+        )
         self.assertIn("视频简介：\n共享简介", llm_client.generate_content.call_args_list[1].args[0])
-        self.assertIn("Palantir 为 8 字符", llm_client.generate_content.call_args_list[1].args[0])
-        self.assertIn("主体+核心对象+动作或结果", llm_client.generate_content.call_args_list[1].args[0])
-        self.assertIn("「整合数据」时可以写「数据整合」", llm_client.generate_content.call_args_list[1].args[0])
+        self.assertIn("优先 24-40 个字符", llm_client.generate_content.call_args_list[1].args[0])
+        self.assertIn("基于完整中文字幕和视频简介", llm_client.generate_content.call_args_list[1].args[0])
+        self.assertIn("列出访谈的 3-5 个主要内容", llm_client.generate_content.call_args_list[1].args[0])
+        self.assertIn("不要输出名词短语拼接", llm_client.generate_content.call_args_list[1].args[0])
         self.assertIn("逐字复制字幕原文", llm_client.generate_content.call_args_list[1].args[0])
+        self.assertIn("B站表单标题：", llm_client.generate_content.call_args_list[2].args[0])
+        self.assertIn("必须从B站标题的主张出发", llm_client.generate_content.call_args_list[2].args[0])
         plain_title_calls = [
             call for call in subtitle_title.build_subtitle_grounded_title.call_args_list
             if call.kwargs.get("title_style") == "plain"
@@ -375,16 +401,37 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         with open(hardsub, "w") as handle:
             handle.write("video")
         llm_client = MagicMock()
-        llm_client.generate_content.side_effect = ["共享简介", "bad response"]
+        llm_client.generate_content.side_effect = [
+            "共享简介",
+            "bad response",
+            "bad response",
+            "bad response",
+            "bad response",
+            '{"title":"Palantir整合数据不做服务"}',
+            '{"central_claim":"卡普谈Palantir数据整合","candidates":[{"title":"没有销售团队，却看到大规模采用","evidence":["我们没有销售团队，却看到了大规模的采用。"]}]}',
+        ]
         subtitle_title = MagicMock()
+        subtitle_title.SubtitleTitleError = ValueError
         subtitle_title.read_subtitle_text.return_value = ("字幕内容", "subtitle.srt")
         subtitle_title.read_full_subtitle_text.return_value = ("完整字幕内容", "subtitle.srt")
+        subtitle_title.parse_llm_title_candidates.side_effect = [
+            ("", ()),
+            ("", ()),
+            (
+                "卡普谈Palantir数据整合",
+                (("卡普谈Palantir数据整合", ("卡普谈Palantir数据整合",)),),
+            ),
+            (
+                "卡普谈Palantir数据整合",
+                (("没有销售团队，却看到大规模采用", ("我们没有销售团队，却看到了大规模的采用。",)),),
+            ),
+        ]
         subtitle_title.parse_llm_title_response.return_value = (
             "Palantir到底做什么",
             ("Palantir把数据整合做成产品",),
         )
         subtitle_title.build_subtitle_grounded_title.return_value = SimpleNamespace(
-            title="Palantir数据整合"
+            title="卡普谈Palantir数据整合，不做服务"
         )
 
         with patch.object(autosub, "find_hardsub_video", return_value=hardsub), \
@@ -396,23 +443,428 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
                      "llm_utils": MagicMock(get_client=lambda: llm_client),
                  },
              ):
-            metadata = autosub.generate_upload_metadata(
-                workdir,
-                title_max_chars=16,
-            )
+            metadata = autosub.generate_upload_metadata(workdir)
 
-        self.assertEqual(metadata["title"], "Palantir数据整合")
-        self.assertEqual(subtitle_title.build_subtitle_grounded_title.call_count, 2)
+        self.assertEqual(metadata["title"], "卡普谈Palantir数据整合，不做服务")
+        self.assertEqual(metadata["wechat_title"], "卡普谈Palantir数据整合")
+        self.assertEqual(subtitle_title.build_subtitle_grounded_title.call_count, 1)
         fallback_call = subtitle_title.build_subtitle_grounded_title.call_args_list[0]
-        self.assertIn("保留主体和最具体的核心结果", fallback_call.kwargs["platform_hint"])
-        self.assertIn("上限16字", fallback_call.kwargs["platform_hint"])
+        self.assertIn("保留主体、谓语和最具体的核心结果", fallback_call.kwargs["platform_hint"])
+        self.assertIn("保留受益者、问题或明确立场", fallback_call.kwargs["platform_hint"])
+        self.assertIn("「主体+动作+对象」压缩片段", fallback_call.kwargs["platform_hint"])
+        self.assertIn("B站表单标题没有微信的16字限制", fallback_call.kwargs["platform_hint"])
+        self.assertIn("优先24-40字", fallback_call.kwargs["platform_hint"])
         self.assertIn("英文字母逐字符计数", fallback_call.kwargs["platform_hint"])
         self.assertIn("禁止使用省略号", fallback_call.kwargs["platform_hint"])
         self.assertIn("不要改写成概括句", fallback_call.kwargs["platform_hint"])
         self.assertIn("不得用「东西」「能力」等泛词", fallback_call.kwargs["platform_hint"])
-        self.assertIn("优先删除「把/了/的/一个」等功能词", fallback_call.kwargs["platform_hint"])
+        self.assertIn("优先删除「把/了/的/一个」等功能词和修饰语", fallback_call.kwargs["platform_hint"])
         self.assertIn("不得用「它/他们」替代主体", fallback_call.kwargs["platform_hint"])
         self.assertIn("视频简介第一句：共享简介", fallback_call.kwargs["platform_hint"])
+
+    def test_bili_title_prompt_requires_a_complete_summary_sentence(self):
+        """The Bilibili title must summarize the interview, not pile up nouns."""
+        self.assertTrue(autosub._shared_title_has_quality_issue("Palantir数据整合产品化"))
+        self.assertTrue(autosub._shared_title_has_quality_issue("Palantir把数据整合成产品"))
+        self.assertTrue(autosub._shared_title_has_quality_issue("Palantir为企业做成产品"))
+        self.assertFalse(autosub._shared_title_has_quality_issue("Palantir为企业整合数据"))
+        self.assertFalse(autosub._shared_title_has_quality_issue("卡普谈Palantir数据整合"))
+        self.assertFalse(autosub._shared_title_has_quality_issue("Palantir押注工程团队"))
+        self.assertTrue(autosub._shared_title_has_quality_issue("Palantir押注解决重要问题"))
+
+        llm_client = MagicMock()
+        llm_client.generate_content.return_value = (
+            '{"title":"卡普谈Palantir数据整合，不做服务并坚持工程为本"}'
+        )
+        subtitle_title = MagicMock()
+        subtitle_title.SubtitleTitleError = ValueError
+        subtitle_title.parse_llm_title_candidates.return_value = (
+            "卡普谈Palantir数据整合，不做服务并坚持工程为本",
+            (
+                ("Palantir把数据整合成产品并坚持工程为本", ("卡普谈Palantir数据整合",)),
+                (
+                    "卡普谈Palantir数据整合，不做服务并坚持工程为本",
+                    ("卡普谈Palantir数据整合",),
+                ),
+            ),
+        )
+        subtitle_title.validate_title_from_subtitle.return_value = (
+            "卡普谈Palantir数据整合，不做服务",
+        )
+
+        with patch.dict(
+            sys.modules,
+            {"subtitle_title": subtitle_title},
+        ):
+            title = autosub._generate_title_from_description(
+                "卡普谈Palantir如何把数据整合做成产品。",
+                "卡普谈Palantir把数据整合做成产品。",
+                "卡普谈Palantir把数据整合做成产品。",
+                llm_client,
+                "glm-5.2",
+                48,
+            )
+
+        self.assertEqual(title, "卡普谈Palantir数据整合，不做服务并坚持工程为本")
+        prompt = llm_client.generate_content.call_args.args[0]
+        self.assertIn("完整中文字幕", prompt)
+        self.assertIn("列出访谈的 3-5 个主要内容", prompt)
+        self.assertIn("优先 24-40 个字符", prompt)
+        self.assertIn("通常覆盖 3 个实质信息点", prompt)
+        self.assertIn("参考下面公开B站标题的结构", prompt)
+        self.assertIn("B站标题没有微信的 16 字限制", prompt)
+        self.assertIn("谁做了什么、为谁或解决什么", prompt)
+        self.assertIn("Palantir把数据整合成产品", prompt)
+        self.assertIn("不要输出名词短语拼接", prompt)
+        self.assertIn("不要机械堆关键词", prompt)
+        self.assertIn("不要把全片主体缩小成单一客户群体", prompt)
+        self.assertIn("不要用「大型企业」这类限定词缩窄范围", prompt)
+        self.assertIn("核心业务优先写成具体动作和对象", prompt)
+        self.assertIn("多个分句不要重复同一个核心宾语或谓语", prompt)
+        self.assertIn("不要输出「押注解决」", prompt)
+        self.assertIn("生成 5 个候选", prompt)
+        subtitle_title.validate_title_from_subtitle.assert_called_once_with(
+            "卡普谈Palantir数据整合，不做服务并坚持工程为本",
+            "卡普谈Palantir把数据整合做成产品。",
+            ("卡普谈Palantir数据整合",),
+            min_chars=24,
+            max_chars=48,
+        )
+
+    def test_shared_title_prefers_information_density_over_first_candidate(self):
+        """A richer grounded claim should beat a safe single-action title."""
+        llm_client = MagicMock()
+        llm_client.generate_content.return_value = "{}"
+        subtitle_title = MagicMock()
+        subtitle_title.parse_llm_title_candidates.return_value = (
+            "Palantir整合数据不做服务，打造产品",
+            (
+                (
+                    "Palantir为企业整合数据，坚持产品化并服务客户",
+                    ("我们干的，基本上就是整合数据。",),
+                ),
+                (
+                    "Palantir整合数据不做服务，打造客户可用产品",
+                    ("我们不想把它做成服务。",),
+                ),
+            ),
+        )
+        subtitle_title.validate_title_from_subtitle.return_value = (
+            "我们不想把它做成服务。",
+        )
+
+        with patch.dict(sys.modules, {"subtitle_title": subtitle_title}):
+            title = autosub._generate_title_from_description(
+                "Palantir整合企业数据，不做服务。",
+                "我们干的，基本上就是整合数据。我们不想把它做成服务。",
+                "我们干的，基本上就是整合数据。我们不想把它做成服务。",
+                llm_client,
+                "glm-5.2",
+                48,
+            )
+
+        self.assertEqual(title, "Palantir整合数据不做服务，打造客户可用产品")
+
+    def test_bili_title_scoring_penalizes_repeated_objects(self):
+        """A title should add claims, not repeat the same object in clauses."""
+        self.assertLess(
+            autosub._shared_title_score(
+                "Palantir押注解决重要问题，不招销售，让工程师迭代产品解决问题",
+                48,
+            ),
+            autosub._shared_title_score(
+                "Palantir为客户整合数据，不做服务，坚持工程为本",
+                48,
+            ),
+        )
+
+    def test_wechat_title_is_derived_from_bili_title(self):
+        """WeChat compression must preserve the Bilibili title's main claim."""
+        llm_client = MagicMock()
+        llm_client.generate_content.return_value = "{}"
+        subtitle_title = MagicMock()
+        subtitle_title.parse_llm_title_candidates.return_value = (
+            "Palantir整合数据不做服务",
+            (
+                ("Palantir为企业整合数据", ("我们干的，基本上就是整合数据。",)),
+                ("Palantir整合数据不做服务", ("我们不想把它做成服务。",)),
+            ),
+        )
+        subtitle_title.validate_title_from_subtitle.return_value = (
+            "我们不想把它做成服务。",
+        )
+
+        with patch.dict(sys.modules, {"subtitle_title": subtitle_title}):
+            title = autosub._derive_wechat_title_from_bili_title(
+                "Palantir为企业整合数据，不做服务，打造产品",
+                "Palantir整合企业数据，不做服务。",
+                "我们干的，基本上就是整合数据。我们不想把它做成服务。",
+                llm_client,
+                "glm-5.2",
+                max_chars=16,
+            )
+
+        self.assertEqual(title, "Palantir整合数据不做服务")
+        prompt = llm_client.generate_content.call_args.args[0]
+        self.assertIn("把下面的B站表单标题压缩成视频号表单标题", prompt)
+        self.assertIn("必须从B站标题的主张出发", prompt)
+        self.assertIn("不得另起主题", prompt)
+        self.assertIn("B站表单标题：\nPalantir为企业整合数据，不做服务，打造产品", prompt)
+        self.assertIn("中文最多还能放 8 个字", prompt)
+        self.assertIn("必须优先原样保留B站标题开头的主体", prompt)
+        self.assertIn("长度允许时保留两个信息点", prompt)
+        self.assertIn("主体+核心动作+对象+最有力的立场", prompt)
+        self.assertEqual(
+            autosub.normalize_bili_upload_title("Palantir为客户整合数据。"),
+            "Palantir为客户整合数据",
+        )
+        self.assertEqual(
+            subtitle_title.validate_title_from_subtitle.call_count,
+            2,
+        )
+        subtitle_title.validate_title_from_subtitle.assert_any_call(
+            "Palantir整合数据不做服务",
+            "我们干的，基本上就是整合数据。我们不想把它做成服务。",
+            ("我们不想把它做成服务。",),
+            min_chars=12,
+            max_chars=16,
+        )
+
+    def test_wechat_title_prefers_a_candidate_that_keeps_the_subject(self):
+        """A subjectless compression is invalid when the subject fits."""
+        self.assertEqual(
+            autosub._extract_bili_title_subject(
+                "Palantir押注工程团队解决长期问题"
+            ),
+            "Palantir",
+        )
+        self.assertEqual(
+            autosub._extract_bili_title_subject("OpenAI研究员谈智能体边界"),
+            "OpenAI研究员",
+        )
+        self.assertFalse(
+            autosub._wechat_title_preserves_bili_subject(
+                "让工程师解决长期问题",
+                "Palantir押注工程团队解决长期问题",
+                16,
+            )
+        )
+        self.assertEqual(
+            autosub._compress_bili_title_for_wechat(
+                "Palantir为工程师迭代核心问题，死活不招销售与市场团队",
+                16,
+            ),
+            "Palantir不招销售团队",
+        )
+        self.assertEqual(
+            autosub._compress_bili_title_for_wechat(
+                "Palantir为企业和政府解决数据隐私问题，押注工程师团队不招销售",
+                16,
+                description="Palantir将各类数据源整合，并保护隐私。",
+            ),
+            "Palantir整合数据不招销售",
+        )
+
+        llm_client = MagicMock()
+        llm_client.generate_content.return_value = "{}"
+        subtitle_title = MagicMock()
+        subtitle_title.parse_llm_title_candidates.return_value = (
+            "Palantir押注长期问题",
+            (
+                ("让工程师解决长期问题", ("我们押注工程团队。",)),
+                ("Palantir押注长期问题", ("我们押注工程团队。",)),
+            ),
+        )
+        subtitle_title.validate_title_from_subtitle.return_value = (
+            "我们押注工程团队。",
+        )
+
+        with patch.dict(sys.modules, {"subtitle_title": subtitle_title}):
+            title = autosub._derive_wechat_title_from_bili_title(
+                "Palantir押注工程团队解决三年后依然重要的问题",
+                "Palantir押注工程团队解决长期问题。",
+                "我们押注工程团队，解决三年后依然重要的问题。",
+                llm_client,
+                "glm-5.2",
+                max_chars=16,
+            )
+
+        self.assertEqual(title, "Palantir押注长期问题")
+
+    def test_structured_title_fallback_assembles_a_budgeted_sentence(self):
+        """The structured fallback avoids model miscounts of full titles."""
+        llm_client = MagicMock()
+        llm_client.generate_content.return_value = (
+            '{"candidates":[{"subject":"Palantir","beneficiary":"企业",'
+            '"action":"整合","object":"数据","second_claim":"不做服务，坚持工程为本",'
+            '"evidence":["我们干的，基本上就是整合数据。"]}]}'
+        )
+        subtitle_title = MagicMock()
+        subtitle_title.SubtitleTitleError = ValueError
+        subtitle_title.validate_title_from_subtitle.return_value = (
+            "我们干的，基本上就是整合数据。",
+        )
+
+        with patch.dict(sys.modules, {"subtitle_title": subtitle_title}):
+            title = autosub._generate_structured_title_from_description(
+                "Palantir为企业整合数据。",
+                "我们干的，基本上就是整合数据。我们为企业整合数据。",
+                llm_client,
+                "glm-5.2",
+                48,
+            )
+
+        self.assertEqual(title, "Palantir为企业整合数据，不做服务，坚持工程为本")
+        prompt = llm_client.generate_content.call_args.args[0]
+        self.assertIn("输出5个结构化候选", prompt)
+        self.assertIn("有 second_claim 时追加「，second_claim」", prompt)
+        self.assertIn("第一候选必须覆盖核心业务、产品或具体做法", prompt)
+        self.assertIn("不得用「产品」「价值」「问题」这类泛词充当 object", prompt)
+        subtitle_title.validate_title_from_subtitle.assert_called_once_with(
+            "Palantir为企业整合数据，不做服务，坚持工程为本",
+            "我们干的，基本上就是整合数据。我们为企业整合数据。",
+            ("我们干的，基本上就是整合数据。",),
+            min_chars=24,
+            max_chars=48,
+        )
+
+    def test_cover_title_prompt_scans_full_chinese_subtitle(self):
+        """Cover titles must scan the full transcript and prefer exact hooks."""
+        self.assertTrue(autosub._cover_title_has_quality_issue("帕罗奥图马戏团"))
+        self.assertTrue(autosub._cover_title_has_quality_issue("就像在帕罗奥图正中央开马戏团"))
+        self.assertFalse(autosub._cover_title_has_quality_issue("人脑对付善变对手"))
+        self.assertFalse(
+            autosub._cover_title_has_quality_issue("我们就像在帕罗奥图正中央开马戏团")
+        )
+        self.assertEqual(
+            autosub._normalize_cover_simile_title(
+                "我们在帕罗奥图正中央开马戏团",
+                "就有点像带着一帮工程师，在帕罗奥图正中央开马戏团。",
+            ),
+            "我们就像在帕罗奥图正中央开马戏团",
+        )
+        self.assertEqual(
+            autosub._normalize_cover_simile_title(
+                "我们带着工程师在帕罗奥图开马戏团",
+                "就有点像带着一帮工程师，在帕罗奥图正中央开马戏团。",
+            ),
+            "我们就像在帕罗奥图正中央开马戏团",
+        )
+        self.assertEqual(
+            autosub._normalize_cover_simile_title(
+                "我们没有销售团队",
+                "就有点像带着一帮工程师，在帕罗奥图正中央开马戏团。",
+            ),
+            "我们没有销售团队",
+        )
+        full_subtitle = (
+            "我们没有销售团队，却看到了大规模的采用。\n"
+            "就有点像带着一帮工程师，在帕罗奥图正中央开马戏团。"
+        )
+        llm_client = MagicMock()
+        llm_client.generate_content.return_value = "{}"
+        subtitle_title = MagicMock()
+        subtitle_title.parse_llm_title_candidates.return_value = (
+            "Palantir没有销售团队",
+            (
+                ("没有销售团队，却看到大规模采用", ("我们没有销售团队，却看到了大规模的采用。",)),
+                ("我们像在帕罗奥图正中央开马戏团", ("就有点像带着一帮工程师，在帕罗奥图正中央开马戏团。",)),
+            ),
+        )
+        subtitle_title.validate_title_from_subtitle.side_effect = lambda *args, **kwargs: args[2]
+
+        with patch.dict(
+            sys.modules,
+            {"subtitle_title": subtitle_title},
+        ):
+            cover_title = autosub._generate_cover_title_from_full_subtitle(
+                full_subtitle,
+                llm_client,
+                "glm-5.2",
+            )
+
+        self.assertEqual(cover_title, "我们就像在帕罗奥图正中央开马戏团")
+        prompt = llm_client.generate_content.call_args.args[0]
+        self.assertIn("通读下面的完整中文字幕", prompt)
+        self.assertIn("不要只看开头、结尾或采样片段", prompt)
+        self.assertIn("按话题感、画面感", prompt)
+        self.assertIn("不要把普通商务反差或抽象结论当成最强钩子", prompt)
+        self.assertIn("主语、谓语和比喻/冲突对象要保留", prompt)
+        self.assertIn("不得以「就像」「在」「需要」「带着」这类无主语成分开头", prompt)
+        self.assertIn("优先 14-18 个字符", prompt)
+        self.assertIn("不得保留「带着一帮工程师」这类可删修饰", prompt)
+        self.assertIn("「正中央」这类承担画面强度的定位词必须保留", prompt)
+        self.assertIn("「我们」「的」「了」若承担语法或语境作用必须保留", prompt)
+        self.assertIn("字幕说「就有点像」时，标题必须压缩成「就像」", prompt)
+        self.assertIn("不得输出无语境的反常识短语", prompt)
+        self.assertIn("克制复述", prompt)
+        self.assertIn("市井口语、夸张营销或AI套话", prompt)
+
+    def test_cover_validation_allows_minimal_simile_compression(self):
+        """A grounded simile may be tightened without inventing facts."""
+        from subtitle_title import validate_title_from_subtitle
+
+        evidence = validate_title_from_subtitle(
+            "我们就像在帕罗奥图正中央开马戏团",
+            "我们干的，基本上就是整合数据。\n"
+            "就有点像带着一帮工程师，在帕罗奥图正中央开马戏团。",
+            ["就有点像带着一帮工程师，在帕罗奥图正中央开马戏团。"],
+            min_chars=12,
+            max_chars=48,
+        )
+        self.assertEqual(
+            evidence,
+            ("就有点像带着一帮工程师，在帕罗奥图正中央开马戏团。",),
+        )
+
+    def test_generate_upload_metadata_passes_chinese_lines_to_cover_generator(self):
+        """Metadata generation should use every Chinese line, not sampled text."""
+        workdir = os.path.join(self.temp_dir, "metadata_full_chinese")
+        os.makedirs(workdir)
+        hardsub = os.path.join(workdir, "video_hardsub.mp4")
+        with open(hardsub, "w") as handle:
+            handle.write("video")
+        llm_client = MagicMock()
+        llm_client.generate_content.return_value = "共享简介"
+        subtitle_title = MagicMock()
+        subtitle_title.read_full_subtitle_text.return_value = (
+            "中文第一行\nEnglish line\n中文第二行",
+            "subtitle.srt",
+        )
+
+        with patch.object(autosub, "find_hardsub_video", return_value=hardsub), \
+             patch.object(autosub, "_load_llm_defaults", return_value=("glm-5.2", "dashscope")), \
+             patch.object(
+                 autosub,
+                 "_generate_title_from_description",
+                 return_value="卡普谈Palantir数据整合，不做服务",
+             ) as mock_title, \
+             patch.object(
+                 autosub,
+                 "_derive_wechat_title_from_bili_title",
+                 return_value="Palantir整合数据不做服务",
+             ) as mock_wechat_title, \
+             patch.object(
+                 autosub,
+                 "_generate_cover_title_from_full_subtitle",
+                 return_value="没有销售团队，却看到大规模采用",
+             ) as mock_cover, \
+             patch.dict(
+                 sys.modules,
+                 {
+                     "subtitle_title": subtitle_title,
+                     "llm_utils": MagicMock(get_client=lambda: llm_client),
+                 },
+             ):
+            metadata = autosub.generate_upload_metadata(workdir)
+
+        self.assertEqual(metadata["title"], "卡普谈Palantir数据整合，不做服务")
+        self.assertEqual(metadata["wechat_title"], "Palantir整合数据不做服务")
+        self.assertEqual(metadata["cover_title"], "没有销售团队，却看到大规模采用")
+        self.assertEqual(mock_title.call_args.args[1], "中文第一行\n中文第二行")
+        self.assertEqual(mock_wechat_title.call_args.args[0], "卡普谈Palantir数据整合，不做服务")
+        self.assertEqual(mock_wechat_title.call_args.args[2], "中文第一行\n中文第二行")
+        self.assertEqual(mock_cover.call_args.args[0], "中文第一行\n中文第二行")
 
     def test_build_bili_cmd_separates_cover_title_from_form_title(self):
         """A Bilibili cover-only headline must not replace the form title."""
@@ -460,7 +912,8 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         workdir = os.path.join(self.temp_dir, "post_uploads")
         os.makedirs(workdir)
         metadata = {
-            "title": "OpenAI研究员谈智能体",
+            "title": "OpenAI研究员谈智能体和自我改进的边界",
+            "wechat_title": "OpenAI研究员谈智能体",
             "description": "共享简介",
             "cover_title": "智能体与自我改进",
         }
@@ -502,7 +955,7 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         self.assertEqual(bili_kwargs["title"], metadata["title"])
         self.assertEqual(bili_kwargs["desc"], metadata["description"])
         self.assertEqual(bili_kwargs["cover_title"], metadata["cover_title"])
-        self.assertEqual(wechat_kwargs["title"], metadata["title"])
+        self.assertEqual(wechat_kwargs["title"], metadata["wechat_title"])
         self.assertEqual(wechat_kwargs["desc"], metadata["description"])
         self.assertEqual(wechat_kwargs["cover_title"], metadata["cover_title"])
         self.assertTrue(wechat_kwargs["public"])
@@ -514,7 +967,8 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         workdir = os.path.join(self.temp_dir, "shared_title_limit")
         os.makedirs(workdir)
         metadata = {
-            "title": "OpenAI研究员谈智能体",
+            "title": "OpenAI研究员谈智能体和自我改进的边界",
+            "wechat_title": "OpenAI研究员谈智能体",
             "description": "共享简介",
             "cover_title": "智能体与自我改进",
         }
@@ -537,11 +991,15 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
                 wechat_upload=True,
             )
 
-        mock_meta.assert_called_once_with(workdir, title_max_chars=16)
+        mock_meta.assert_called_once_with(
+            workdir,
+            bili_title_max_chars=48,
+            wechat_title_max_chars=16,
+        )
         bili_kwargs = next(call[1] for call in calls if call[0] == "BI")
         wechat_kwargs = next(call[1] for call in calls if call[0] == "WX")
         self.assertEqual(bili_kwargs["title"], metadata["title"])
-        self.assertEqual(wechat_kwargs["title"], metadata["title"])
+        self.assertEqual(wechat_kwargs["title"], metadata["wechat_title"])
         self.assertLessEqual(len(wechat_kwargs["title"]), 16)
 
     def test_shared_title_is_rejected_instead_of_silently_truncated(self):
@@ -558,7 +1016,8 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         workdir = os.path.join(self.temp_dir, "incomplete_metadata")
         os.makedirs(workdir)
         metadata = {
-            "title": "OpenAI研究员谈智能体",
+            "title": "OpenAI研究员谈智能体和自我改进的边界",
+            "wechat_title": "OpenAI研究员谈智能体",
             "description": "",
             "cover_title": "智能体与自我改进",
         }
