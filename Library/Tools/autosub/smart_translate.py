@@ -39,6 +39,12 @@ sys.path.append(os.path.join(TOOLS_DIR, "common"))
 from llm_utils import LLMClient, LLMProvider
 
 try:
+    from common_utils import load_terms
+except ImportError:
+    load_terms = None
+    print("Warning: common_utils.load_terms not found; terms.yml glossary will not be loaded.")
+
+try:
     import gemini_utils
 except ImportError as e:
     print(f"Warning: gemini_utils not found ({e}). Using llm_utils only.")
@@ -1152,6 +1158,15 @@ def main():
 - Conviction: Keep in English when referring to Sarah Guo's venture capital FUND/FIRM (e.g. "inside of Conviction", "when you started Conviction", "Conviction内部最大的分歧"). Translate as "确信" or "信念" when used as a common noun meaning personal belief or investment conviction (e.g. "leap of conviction" -> "纵身一跃的确信", "climb to conviction" -> "慢慢建立确信", "behind conviction" -> "在确信的背后", "what conviction looks like" -> "确信是什么样的"). Context determines which sense applies.
 """
         knowledge_snippet = (knowledge_snippet or "") + PREBUILT_GLOSSARY
+
+        # Load user-maintained terms.yml glossary (same file used by PostOS).
+        # This ensures names like 黄仁勋 and business terms like alpha are
+        # consistently translated across all videos.
+        if load_terms:
+            terms_glossary = load_terms()
+            if terms_glossary:
+                knowledge_snippet = knowledge_snippet + "\n" + terms_glossary
+                print(f"📖 Loaded terms.yml glossary into translation prompt.")
 
         # Dynamic terminology scan: detect domain-specific phrases in the source
         # text and build a per-video glossary. This prevents mistranslations of

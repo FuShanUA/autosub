@@ -148,7 +148,9 @@ def load_terms():
     possible_paths = [
         current_dir.parent / "config" / "terms.yml",
         current_dir.parent / "postfdry" / "config" / "terms.yml",
-        project_root.parent / "PostOS" / "config" / "terms.yml"
+        project_root.parent / "PostOS" / "config" / "terms.yml",
+        # User's global terms.yml at ~/cc/config/terms.yml
+        Path.home() / "cc" / "config" / "terms.yml",
     ]
 
     terms_file = None

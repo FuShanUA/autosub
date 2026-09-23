@@ -38,9 +38,11 @@ Rules are auto-classified by the post-processing script based on the replacement
 | Jensen Hwang→Huang ASR Fix | `(?i)Jensen\s+Hwang\b` | `Jensen Huang` | Whisper mishears "Huang" as "Hwang" for NVIDIA CEO Jensen Huang. |
 | Anthropics→Anthropic's ASR Fix | `(?i)\bAnthropics\b(?!\s+Fable\b)` | `Anthropic's` | Whisper drops apostrophe from "Anthropic's". Fix unless followed by "Fable" (handled by Fable rule below). |
 | Fable Model Protection | `(?i)Anthropic'?s?\s*(?:的\s*)?寓言` | `Anthropic 的 Fable` | Protect Anthropic's "Fable" model name from being translated to "寓言". |
-| Jensen Huang→黄仁勋 | `(?i)Jensen\s+Huang\b` | `黄仁勋` | NVIDIA CEO is universally known as 黄仁勋 in Chinese media. Translate in all contexts. |
+| Jensen Huang→黄仁勋 | `(?i)(?<![a-zA-Z])Jensen\s+Huang(?![a-zA-Z])` | `黄仁勋` | NVIDIA CEO is universally known as 黄仁勋 in Chinese media. Translate in all contexts. Uses ASCII lookaround instead of \b because \b fails at CJK boundaries. |
 | Enderlin→Anduril ASR Fix | `(?i)\bEnderlin\s+Palmer\b` | `Anduril, Palmer` | Whisper merges "Anduril, Palmer" into "Enderlin Palmer". Fix when Palmer Luckey context exists. |
 | Enderlin Standalone Fix | `(?i)\bEnderlin\b` | `Anduril` | Whisper mishears "Anduril" as "Enderlin" in tech/defense context. |
+| She→Xi ASR Fix (political) | `(?i)\bshe\s+and\s+the\s+president\b` | `Xi and the president` | Whisper mishears "Xi" (Chinese leader) as "she" in US-China political context. Only fix when followed by "and the president" to avoid false positives. |
+| Tough→Sharp Confusion Guard | `(?i)you\s+guys\s+are\s+tough\b` | `you guys are tough` | Protect "tough" (meaning difficult/hard to deal with) from being mistranslated as 锐利. In interview context, "you guys are tough" means the interviewers ask hard questions. |
 
 ## 2. Text Cleanup (Regex)
 These regex patterns will be executed in order by the post-processing script.
