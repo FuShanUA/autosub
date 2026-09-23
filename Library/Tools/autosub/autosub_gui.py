@@ -22,21 +22,25 @@ class ProcessTree:
 
     @staticmethod
     def suspend(pid):
-        if not pid: return
+        if not pid: return False
         try:
             parent = psutil.Process(pid)
             for child in parent.children(recursive=True): child.suspend()
             parent.suspend()
-        except: pass
+            return True
+        except Exception:
+            return False
 
     @staticmethod
     def resume(pid):
-        if not pid: return
+        if not pid: return False
         try:
             parent = psutil.Process(pid)
             for child in parent.children(recursive=True): child.resume()
             parent.resume()
-        except: pass
+            return True
+        except Exception:
+            return False
 
 # --- Paths ---
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -145,6 +149,7 @@ class AutoSubGUI:
         self.key_editor_env_key = self.vendor_env_keys.get(self.key_editor_vendor, "VERTEX_SA_KEY_PATH")
         self.current_process = None
         self.last_was_progress = False
+        self.is_paused = False
 
         self.setup_ui()
 
@@ -737,11 +742,12 @@ class AutoSubGUI:
                     pass
 
         try:
-            self.current_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', bufsize=1)
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', bufsize=1)
+            self.current_process = proc
             self.root.after(0, lambda: self.pause_btn.config(state="normal"))
-            if self.current_process.stdout:
-                for line in self.current_process.stdout: self.root.after(0, self.log, line.strip())
-            ret_code = self.current_process.wait()
+            if proc.stdout:
+                for line in proc.stdout: self.root.after(0, self.log, line.strip())
+            ret_code = proc.wait()
             # Main pipeline (incl. hardsub burn) finished. Release current_process so
             # stop/pause no longer target the completed subprocess during uploads.
             self.current_process = None
@@ -925,21 +931,24 @@ class AutoSubGUI:
 
     def toggle_pause(self):
         if not self.current_process:
+            self.root.after(0, self.log, "⚠️ 没有正在运行的进程，无法暂停/继续")
             return
         if self.is_paused:
-            self.is_paused = False
-            self.root.after(0, lambda: self.pause_btn.config(text="暂停 (Pause)"))
-            try:
-                ProcessTree.resume(self.current_process.pid)
-            except Exception:
-                pass
+            ok = ProcessTree.resume(self.current_process.pid)
+            if ok:
+                self.is_paused = False
+                self.root.after(0, lambda: self.pause_btn.config(text="暂停 (Pause)"))
+                self.root.after(0, self.log, "▶️ 已继续")
+            else:
+                self.root.after(0, self.log, "⚠️ 继续失败，进程可能已结束")
         else:
-            self.is_paused = True
-            self.root.after(0, lambda: self.pause_btn.config(text="继续 (Resume)"))
-            try:
-                ProcessTree.suspend(self.current_process.pid)
-            except Exception:
-                pass
+            ok = ProcessTree.suspend(self.current_process.pid)
+            if ok:
+                self.is_paused = True
+                self.root.after(0, lambda: self.pause_btn.config(text="继续 (Resume)"))
+                self.root.after(0, self.log, "⏸️ 已暂停")
+            else:
+                self.root.after(0, self.log, "⚠️ 暂停失败，进程可能已结束")
 
     def stop_process(self):
         if self.current_process and self.current_process.poll() is None:
@@ -994,12 +1003,13 @@ class AutoSubGUI:
 
     def _remove_ads_worker(self, cmd):
         try:
-            self.current_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', bufsize=1)
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', bufsize=1)
+            self.current_process = proc
             self.root.after(0, lambda: self.pause_btn.config(state="normal"))
-            if self.current_process.stdout:
-                for line in self.current_process.stdout:
+            if proc.stdout:
+                for line in proc.stdout:
                     self.root.after(0, self.log, line.strip())
-            ret = self.current_process.wait()
+            ret = proc.wait()
             self.current_process = None
             if ret == 0:
                 self.root.after(0, lambda: self.status_label.config(text="✅ 广告剪除完成"))
