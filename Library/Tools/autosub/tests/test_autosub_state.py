@@ -6,7 +6,7 @@ import tempfile
 import threading
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, mock_open, patch
 
 # Prefer the package path when tests run from the repository root. This avoids
 # accidentally importing the older top-level autosub_batch_pro.py copy.
@@ -14,6 +14,7 @@ CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(CURRENT_DIR)
 try:
     from Library.Tools.autosub import autosub, autosub_launcher
+    from Library.Tools.autosub import autosub_batch_pro as batch_pro
     from Library.Tools.autosub.autosub_batch_pro import (
         BatchEngine,
         SubTask,
@@ -24,6 +25,7 @@ except ModuleNotFoundError:
         sys.path.insert(0, PROJECT_DIR)
     import autosub
     import autosub_launcher
+    import autosub_batch_pro as batch_pro
     from autosub_batch_pro import BatchEngine, SubTask, ResourceManager
 
 class TestAutoSubStateAndLauncher(unittest.TestCase):
@@ -199,6 +201,51 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         }
         self.assertFalse(autosub_launcher.check_all_completed(state))
 
+    def test_check_all_completed_treats_wechat_limit_as_not_success(self):
+        """A WeChat duration-limit terminal state is not a completed upload."""
+        state = {
+            "wechat": True,
+            "1": {
+                "status": "超限 (WX)",
+                "pcts": {
+                    "BR": 100.0,
+                    "GD": 100.0,
+                    "BI": 100.0,
+                    "WX": 0.0,
+                },
+            },
+        }
+        self.assertFalse(autosub_launcher.check_all_completed(state))
+
+    def test_disk_truth_preserves_wechat_limit_terminal_state(self):
+        """Physical state repair must not turn a WX limit skip back into a queue."""
+        task = SubTask(
+            uid=4,
+            url="http://test.com",
+            title="Video 4",
+            status="超限 (WX)",
+            workdir=os.path.join(self.temp_dir, "task_4"),
+            pcts={
+                "DL": 100.0,
+                "TR": 100.0,
+                "TL": 100.0,
+                "MR": 100.0,
+                "BR": 100.0,
+                "GD": 100.0,
+                "BI": 100.0,
+                "WX": 0.0,
+            },
+            error="视频时长 10.2 分钟，超过视频号 10 分钟限制",
+        )
+        os.makedirs(task.workdir)
+        engine = BatchEngine(output_dir=self.temp_dir, sub_dir_name="project_1")
+
+        engine.disk_truth(task)
+
+        self.assertEqual(task.status, "超限 (WX)")
+        self.assertIn("超过视频号 10 分钟限制", task.error)
+        self.assertEqual(task.pcts["WX"], 0.0)
+
     def test_build_wechat_cmd_draft_and_public_flags(self):
         """WeChat upload defaults to a draft and only adds --public when requested."""
         workdir = os.path.join(self.temp_dir, "wechat_task")
@@ -221,6 +268,369 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         self.assertEqual(draft_cmd[:4], [sys.executable, "-u", script, hardsub])
         self.assertNotIn("--public", draft_cmd)
         self.assertIn("--public", public_cmd)
+
+    def test_wechat_duration_limit_matches_ten_minute_uploader(self):
+        """The launcher accepts exactly 10 minutes and rejects one second more."""
+        workdir = os.path.join(self.temp_dir, "wechat_duration_boundary")
+        os.makedirs(workdir)
+        hardsub = os.path.join(workdir, "video_hardsub.mp4")
+        with open(hardsub, "w") as handle:
+            handle.write("video")
+        script = os.path.join(self.temp_dir, "wechat_upload.py")
+        with open(script, "w") as handle:
+            handle.write("# placeholder")
+
+        with patch.object(autosub, "WECHAT_SCRIPT", script), \
+             patch.object(autosub, "WECHAT_PYTHON", sys.executable), \
+             patch.object(autosub, "get_video_duration", lambda _path: 600):
+            self.assertIsNotNone(autosub.build_wechat_cmd(workdir))
+
+        with patch.object(autosub, "WECHAT_SCRIPT", script), \
+             patch.object(autosub, "WECHAT_PYTHON", sys.executable), \
+             patch.object(autosub, "get_video_duration", lambda _path: 601):
+            self.assertIsNone(autosub.build_wechat_cmd(workdir))
+
+    def test_upload_commands_follow_main_llm_selection(self):
+        """Bilibili and WeChat uploaders receive the selected model/provider."""
+        workdir = os.path.join(self.temp_dir, "upload_llm_selection")
+        os.makedirs(workdir)
+        hardsub = os.path.join(workdir, "video_hardsub.mp4")
+        with open(hardsub, "w") as handle:
+            handle.write("video")
+        bili_script = os.path.join(self.temp_dir, "bili_upload.py")
+        wechat_script = os.path.join(self.temp_dir, "wechat_upload.py")
+        for script in (bili_script, wechat_script):
+            with open(script, "w") as handle:
+                handle.write("# placeholder")
+
+        with patch.object(autosub, "BILI_SCRIPT", bili_script), \
+             patch.object(autosub, "BILI_PYTHON", sys.executable), \
+             patch.object(autosub, "WECHAT_SCRIPT", wechat_script), \
+             patch.object(autosub, "WECHAT_PYTHON", sys.executable), \
+             patch.object(autosub, "get_video_duration", lambda _path: 600):
+            bili_cmd = autosub.build_bili_cmd(
+                workdir,
+                llm_model="glm-5.3",
+                llm_provider="dashscope",
+            )
+            wechat_cmd = autosub.build_wechat_cmd(
+                workdir,
+                llm_model="glm-5.3",
+                llm_provider="dashscope",
+            )
+
+        for cmd in (bili_cmd, wechat_cmd):
+            self.assertEqual(cmd[cmd.index("--llm-model") + 1], "glm-5.3")
+            self.assertEqual(cmd[cmd.index("--llm-provider") + 1], "dashscope")
+
+    def test_batch_worker_starts_gd_while_metadata_generation_is_blocked(self):
+        """GD sync must not wait for a slow shared metadata LLM call."""
+        workdir = os.path.join(self.temp_dir, "batch_slow_meta")
+        os.makedirs(workdir)
+        task = SubTask(
+            uid=1,
+            url="http://test.com",
+            title="Video 1",
+            status="排队中 (GD)",
+            workdir=workdir,
+            pcts={
+                "DL": 100.0,
+                "TR": 100.0,
+                "TL": 100.0,
+                "MR": 100.0,
+                "BR": 100.0,
+                "GD": 0.0,
+                "BI": 0.0,
+                "WX": 0.0,
+            },
+        )
+        engine = BatchEngine(
+            output_dir=self.temp_dir,
+            sub_dir_name="project",
+            state_file=os.path.join(self.temp_dir, "batch_state.json"),
+        )
+        engine.do_gdsync = True
+        engine.do_bili = True
+        engine.do_wechat = True
+        engine.task_map[task.uid] = task
+
+        metadata = {
+            "title": "OpenAI研究员谈智能体",
+            "wechat_title": "OpenAI研究员谈智能体",
+            "description": "共享简介",
+            "cover_title": "智能体",
+        }
+        calls = []
+        meta_started = threading.Event()
+        release_meta = threading.Event()
+        gd_started = threading.Event()
+
+        def fake_disk_truth(current_task):
+            if current_task.status == "排队中 (GD)" and not os.path.exists(
+                os.path.join(workdir, ".synced")
+            ):
+                return
+            current_task.status = "完成"
+
+        def fake_run_process(*_args, **_kwargs):
+            calls.append("GD")
+            gd_started.set()
+            if not release_meta.wait(2):
+                return False
+            return True
+
+        def fake_generate_metadata(*_args, **_kwargs):
+            calls.append("META")
+            meta_started.set()
+            if not release_meta.wait(2):
+                raise TimeoutError("metadata generation stayed blocked")
+            return metadata
+
+        def fake_bili_cmd(*_args, **_kwargs):
+            return ["bili-upload"]
+
+        def fake_wechat_cmd(*_args, **_kwargs):
+            return ["wechat-upload"]
+
+        def fake_bili_run(*_args, **_kwargs):
+            calls.append("BI")
+            return True
+
+        def fake_wechat_run(*_args, **_kwargs):
+            calls.append("WX")
+            return True
+
+        worker = threading.Thread(target=engine.worker, args=(task,), daemon=True)
+        try:
+            with patch.object(BatchEngine, "disk_truth", side_effect=fake_disk_truth), \
+                 patch.object(BatchEngine, "run_process", side_effect=fake_run_process), \
+                 patch.object(batch_pro, "generate_upload_metadata", side_effect=fake_generate_metadata), \
+                 patch.object(batch_pro, "build_bili_cmd", side_effect=fake_bili_cmd), \
+                 patch.object(batch_pro, "build_wechat_cmd", side_effect=fake_wechat_cmd), \
+                 patch.object(batch_pro, "run_bili_cmd", side_effect=fake_bili_run), \
+                 patch.object(batch_pro, "run_wechat_cmd", side_effect=fake_wechat_run):
+                worker.start()
+
+                self.assertTrue(meta_started.wait(2))
+                self.assertTrue(
+                    gd_started.wait(0.2),
+                    "GD sync should start while metadata generation is blocked",
+                )
+                release_meta.set()
+                worker.join(5)
+
+            self.assertFalse(worker.is_alive())
+            self.assertIn("GD", calls)
+            self.assertIn("META", calls)
+            self.assertIn("BI", calls)
+            self.assertIn("WX", calls)
+            self.assertLess(calls.index("GD"), calls.index("BI"))
+            self.assertLess(calls.index("META"), calls.index("BI"))
+            for marker in (".synced", ".bili_uploaded", ".wechat_uploaded"):
+                self.assertTrue(os.path.exists(os.path.join(workdir, marker)))
+            self.assertEqual(task.status, "完成")
+        finally:
+            release_meta.set()
+            worker.join(2)
+
+    def test_batch_worker_stops_uploads_when_shared_metadata_is_incomplete(self):
+        """A partial MetaGen result must not trigger per-platform fallback."""
+        workdir = os.path.join(self.temp_dir, "batch_partial_meta")
+        os.makedirs(workdir)
+        task = SubTask(
+            uid=2,
+            url="http://test.com",
+            title="Video 2",
+            status="排队中 (GD)",
+            workdir=workdir,
+            pcts={
+                "DL": 100.0,
+                "TR": 100.0,
+                "TL": 100.0,
+                "MR": 100.0,
+                "BR": 100.0,
+                "GD": 100.0,
+                "BI": 0.0,
+                "WX": 0.0,
+            },
+        )
+        engine = BatchEngine(
+            output_dir=self.temp_dir,
+            sub_dir_name="project",
+            state_file=os.path.join(self.temp_dir, "batch_state.json"),
+        )
+        engine.do_gdsync = False
+        engine.do_bili = True
+        engine.do_wechat = True
+        engine.task_map[task.uid] = task
+
+        def fake_disk_truth(current_task):
+            if current_task.status == "排队中 (GD)":
+                return
+            current_task.status = "完成"
+
+        worker = threading.Thread(target=engine.worker, args=(task,), daemon=True)
+        with patch.object(BatchEngine, "disk_truth", side_effect=fake_disk_truth), \
+             patch.object(
+                 batch_pro,
+                 "generate_upload_metadata",
+                 return_value={"title": "OpenAI研究员谈智能体"},
+             ) as mock_meta, \
+             patch.object(batch_pro, "build_bili_cmd") as mock_bili, \
+            patch.object(batch_pro, "build_wechat_cmd") as mock_wechat:
+            worker.start()
+            worker.join(20)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(mock_meta.call_count, 4)
+        mock_bili.assert_not_called()
+        mock_wechat.assert_not_called()
+        self.assertEqual(task.status, "失败 (上传)")
+        self.assertEqual(task.retries, 3)
+        for marker in (".bili_uploaded", ".wechat_uploaded"):
+            self.assertFalse(os.path.exists(os.path.join(workdir, marker)))
+
+    def test_batch_worker_keeps_wechat_build_failure_unfinished(self):
+        """A skipped WeChat upload must not create a success marker."""
+        workdir = os.path.join(self.temp_dir, "batch_wechat_build_failed")
+        os.makedirs(workdir)
+        task = SubTask(
+            uid=3,
+            url="http://test.com",
+            title="Video 3",
+            status="排队中 (GD)",
+            workdir=workdir,
+            pcts={
+                "DL": 100.0,
+                "TR": 100.0,
+                "TL": 100.0,
+                "MR": 100.0,
+                "BR": 100.0,
+                "GD": 100.0,
+                "BI": 100.0,
+                "WX": 0.0,
+            },
+        )
+        engine = BatchEngine(
+            output_dir=self.temp_dir,
+            sub_dir_name="project",
+            state_file=os.path.join(self.temp_dir, "batch_state.json"),
+        )
+        engine.do_gdsync = False
+        engine.do_bili = False
+        engine.do_wechat = True
+        engine.task_map[task.uid] = task
+
+        def fake_disk_truth(current_task):
+            if current_task.status == "排队中 (GD)":
+                return
+            current_task.status = "完成"
+
+        worker = threading.Thread(target=engine.worker, args=(task,), daemon=True)
+        with patch.object(BatchEngine, "disk_truth", side_effect=fake_disk_truth), \
+             patch.object(
+            batch_pro,
+            "get_wechat_upload_skip_reason",
+            return_value="视频时长 10.2 分钟，超过视频号 10 分钟限制",
+        ), patch.object(batch_pro, "build_wechat_cmd", return_value=None):
+            worker.start()
+            worker.join(5)
+
+        self.assertFalse(worker.is_alive())
+        self.assertIn("超过视频号 10 分钟限制", task.error)
+        self.assertEqual(task.status, "超限 (WX)")
+        self.assertEqual(task.pcts["WX"], 0.0)
+        self.assertFalse(
+            os.path.exists(os.path.join(workdir, ".wechat_uploaded"))
+        )
+
+    def test_parallel_upload_marks_wechat_limit_as_terminal(self):
+        """When only WX is skipped for duration, GD/BI success must yield LIMIT."""
+        workdir = os.path.join(self.temp_dir, "batch_wechat_limit")
+        os.makedirs(workdir)
+        task = SubTask(
+            uid=5,
+            url="http://test.com",
+            title="Video 5",
+            status="排队中 (GD)",
+            workdir=workdir,
+            pcts={
+                "DL": 100.0,
+                "TR": 100.0,
+                "TL": 100.0,
+                "MR": 100.0,
+                "BR": 100.0,
+                "GD": 0.0,
+                "BI": 0.0,
+                "WX": 0.0,
+            },
+        )
+        engine = BatchEngine(
+            output_dir=self.temp_dir,
+            sub_dir_name="project",
+            state_file=os.path.join(self.temp_dir, "batch_state.json"),
+        )
+        engine.do_gdsync = True
+        engine.do_bili = True
+        engine.do_wechat = True
+        engine.task_map[task.uid] = task
+
+        metadata = {
+            "title": "OpenAI研究员谈智能体",
+            "wechat_title": "OpenAI研究员谈智能体",
+            "description": "共享简介",
+            "cover_title": "智能体",
+        }
+
+        def fake_disk_truth(current_task):
+            if current_task.status == "排队中 (GD)":
+                return
+            current_task.status = "完成"
+
+        def fake_bili_run(_task, _cmd, result_box):
+            result_box[0] = True
+            return True
+
+        worker = threading.Thread(target=engine.worker, args=(task,), daemon=True)
+        with patch.object(BatchEngine, "disk_truth", side_effect=fake_disk_truth), \
+             patch.object(BatchEngine, "run_process", return_value=True), \
+             patch.object(
+                 batch_pro,
+                 "generate_upload_metadata",
+                 return_value=metadata,
+             ), \
+             patch.object(batch_pro, "build_bili_cmd", return_value=["bili-upload"]), \
+             patch.object(
+                 batch_pro,
+                 "get_wechat_upload_skip_reason",
+                 return_value="视频时长 10.2 分钟，超过视频号 10 分钟限制",
+             ), \
+             patch.object(batch_pro, "build_wechat_cmd", return_value=None), \
+             patch.object(BatchEngine, "_run_bili_upload", side_effect=fake_bili_run):
+            worker.start()
+            worker.join(5)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(
+            task.error,
+            "视频号上传未启动：视频时长 10.2 分钟，超过视频号 10 分钟限制",
+        )
+        self.assertEqual(task.pcts["GD"], 100.0)
+        self.assertEqual(task.pcts["BI"], 100.0)
+        self.assertEqual(task.pcts["WX"], 0.0)
+        self.assertEqual(task.status, "超限 (WX)")
+
+    def test_llm_defaults_accept_legacy_vendor_key(self):
+        """The GUI's vendor key must resolve to the same provider."""
+        settings = json.dumps(
+            {"vendor": "Alibaba (Bailian)", "llm_model": "glm-5.3"}
+        )
+        with patch.object(autosub, "DEFAULTS", {}), \
+             patch("builtins.open", mock_open(read_data=settings)):
+            self.assertEqual(
+                autosub._load_llm_defaults(),
+                ("glm-5.3", "dashscope"),
+            )
 
     def test_build_wechat_cmd_omits_title_for_subtitle_grounding(self):
         """Launcher/GUI lets the WeChat skill derive the title from subtitles."""
@@ -319,6 +729,8 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
             '{"central_claim":"卡普谈Palantir数据整合","candidates":[{"title":"没有销售团队，却看到大规模采用","evidence":["我们没有销售团队，却看到了大规模的采用。"]}]}',
         ]
         subtitle_title = MagicMock()
+        subtitle_title.SubtitleTitleError = ValueError
+        subtitle_title._title_has_quality_issue.return_value = False
         subtitle_title.build_subtitle_grounded_title.return_value = SimpleNamespace(
             title="Palantir是什么"
         )
@@ -386,12 +798,388 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         self.assertIn("不要输出名词短语拼接", llm_client.generate_content.call_args_list[1].args[0])
         self.assertIn("逐字复制字幕原文", llm_client.generate_content.call_args_list[1].args[0])
         self.assertIn("B站表单标题：", llm_client.generate_content.call_args_list[2].args[0])
-        self.assertIn("必须从B站标题的主张出发", llm_client.generate_content.call_args_list[2].args[0])
+        self.assertIn(
+            "B站标题只确定主题边界和必须保留的主体",
+            llm_client.generate_content.call_args_list[2].args[0],
+        )
         plain_title_calls = [
             call for call in subtitle_title.build_subtitle_grounded_title.call_args_list
             if call.kwargs.get("title_style") == "plain"
         ]
         self.assertEqual(plain_title_calls, [])
+
+    def test_metadata_description_proper_nouns_must_be_grounded(self):
+        """A summary cannot invent or misspell subtitle proper nouns."""
+        subtitle = "Stefano Ermon谈Inception和Mercury。"
+        video = "/tmp/Stefano_Ermon_Inception_hardsub.mp4"
+        self.assertEqual(
+            autosub._metadata_text_issues(
+                "Stefano Ermon介绍Inception的Mercury。",
+                subtitle,
+                video,
+            ),
+            [],
+        )
+        self.assertEqual(
+            autosub._metadata_text_issues(
+                "Stefano Ermann介绍Inception的Mercury。",
+                subtitle,
+                video,
+            ),
+            ["known ASR proper noun misspelling: Ermann"],
+        )
+        self.assertEqual(
+            autosub._metadata_text_issues(
+                "Chad Walkwest谈Palantir。",
+                "Chad Wahlquist谈Palantir。",
+                "/tmp/Palantir_Chard_Wahlquist_hardsub.mp4",
+            ),
+            ["known ASR proper noun misspelling: Walkwest"],
+        )
+        self.assertEqual(
+            autosub._metadata_text_issues(
+                "低成本交付集成么服务。",
+                "低成本交付集成服务。",
+                "/tmp/video_hardsub.mp4",
+            ),
+            ["description contains a truncated service fragment"],
+        )
+
+    def test_generate_upload_metadata_corrects_known_asr_names(self):
+        """Known ASR aliases must not be copied into metadata prompts."""
+        workdir = os.path.join(self.temp_dir, "metadata_asr_names")
+        os.makedirs(workdir)
+        hardsub = os.path.join(workdir, "Stefano_Ermon_Chard_Wahlquist_hardsub.mp4")
+        with open(hardsub, "w") as handle:
+            handle.write("video")
+        llm_client = MagicMock()
+        llm_client.generate_content.return_value = "共享简介"
+        subtitle_title = MagicMock()
+        subtitle_title.SubtitleTitleError = ValueError
+        subtitle_title.read_full_subtitle_text.return_value = (
+            "Stefano Ermann和Chad Walkwest谈数据。",
+            "subtitle.srt",
+        )
+
+        with patch.object(autosub, "find_hardsub_video", return_value=hardsub), \
+             patch.object(
+                 autosub,
+                 "_load_llm_defaults",
+                 return_value=("glm-5.2", "dashscope"),
+             ), \
+             patch.dict(
+                 sys.modules,
+                 {
+                     "subtitle_title": subtitle_title,
+                     "llm_utils": MagicMock(get_client=lambda: llm_client),
+                 },
+             ):
+            autosub.generate_upload_metadata(workdir)
+
+        prompt = llm_client.generate_content.call_args_list[0].args[0]
+        self.assertIn("Stefano Ermon和Chad Wahlquist谈数据。", prompt)
+        self.assertNotIn("Ermann", prompt)
+        self.assertNotIn("Walkwest", prompt)
+
+    def test_local_metadata_fallback_survives_llm_timeout(self):
+        """A saved description can produce complete upload metadata offline."""
+        description = (
+            "几位 Palantir 员工现身说法：新人入职即被“扔进深水区”，"
+            "有人第二周就进驻贝德福德郡警局上线工具。"
+        )
+        reframed_description = (
+            "几位 Palantir 员工回答“给新人的建议”。"
+            "新人一上来就被扔进深水区：入职第二周就去贝德福德郡警局上线工具。"
+        )
+        title = autosub._fallback_bili_title_from_description(description, 48)
+        wechat_title = autosub._fallback_wechat_title_from_bili_title(title, 16)
+        cover_title = autosub._fallback_cover_title(
+            {"title": title, "wechat_title": wechat_title}
+        )
+
+        self.assertEqual(title, "Palantir 员工谈新人入职即被扔进深水区")
+        self.assertEqual(wechat_title, "Palantir员工谈新人入职")
+        self.assertEqual(cover_title, "Palantir员工谈新人入职")
+        self.assertTrue(autosub.normalize_bili_upload_title(title))
+        self.assertTrue(autosub.normalize_shared_upload_title(wechat_title))
+
+        reframed_title = autosub._fallback_bili_title_from_description(
+            reframed_description, 48
+        )
+        reframed_wechat_title = autosub._fallback_wechat_title_from_bili_title(
+            reframed_title, 16
+        )
+        self.assertEqual(
+            reframed_title,
+            "Palantir 员工谈新人一上来就被扔进深水区",
+        )
+        self.assertEqual(reframed_wechat_title, "Palantir员工谈新人深水区")
+
+    def test_offline_fallback_uses_distinct_subtitle_hooks(self):
+        """LLM timeouts must still yield concrete, non-duplicate titles."""
+        subtitle_text = (
+            "数据治理有一半的工作是在当穿针引线的人、当知识\n"
+            "我们就是结缔组织，是那层筋膜"
+        )
+        form_title = "正在帮助从业者在当今的数据治理时代做出贡献、展现价值"
+
+        wechat_title = autosub._fallback_wechat_title_from_subtitle(
+            subtitle_text,
+            max_chars=16,
+        )
+        cover_title = autosub._fallback_cover_title_from_subtitle(
+            subtitle_text,
+            form_title=form_title,
+        )
+
+        self.assertEqual(wechat_title, "数据治理一半是在穿针引线")
+        self.assertEqual(cover_title, "我们就是结缔组织，是那层筋膜")
+        self.assertNotEqual(cover_title, form_title)
+        self.assertNotEqual(cover_title, wechat_title)
+
+    def test_offline_fallback_prefers_cause_and_consequence_hooks(self):
+        """A form title may use a grounded consequence, not only a metaphor."""
+        subtitle_text = (
+            "当数据治理办公室的核心成员，甚至整个数据治理办公室\n"
+            "被整个裁掉的时候，会怎么样？\n"
+            "慢慢地、慢慢地、慢慢烂掉。你提供过的服务没人做了\n"
+            "我们就是结缔组织，是那层筋膜\n"
+            "没了筋膜，身体、肌肉、骨骼\n"
+        )
+        form_title = "数据治理团队展示不做的后果"
+
+        wechat_title = autosub._fallback_wechat_title_from_subtitle(
+            subtitle_text,
+            max_chars=16,
+            form_title=form_title,
+        )
+        cover_title = autosub._fallback_cover_title_from_subtitle(
+            subtitle_text,
+            form_title=form_title,
+        )
+
+        self.assertEqual(wechat_title, "数据治理团队被裁后组织会烂掉")
+        self.assertEqual(cover_title, "没了筋膜，身体肌肉骨骼慢慢烂掉")
+
+    def test_generate_upload_metadata_completes_after_llm_timeout(self):
+        """A timeout must not leave BI/WX blocked without local metadata."""
+        workdir = os.path.join(self.temp_dir, "metadata_llm_timeout")
+        os.makedirs(workdir)
+        hardsub = os.path.join(workdir, "video_hardsub.mp4")
+        with open(hardsub, "w") as handle:
+            handle.write("video")
+        with open(os.path.join(workdir, "upload_metadata.json"), "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "title": "正在帮助从业者在当今的数据治理时代做出贡献、展现价值",
+                    "description": "数据治理实践者讨论组织连接和基础工作。",
+                },
+                handle,
+                ensure_ascii=False,
+            )
+
+        subtitle_text = (
+            "数据治理有一半的工作是在当穿针引线的人、当知识\n"
+            "我们就是结缔组织，是那层筋膜"
+        )
+        subtitle_title = MagicMock()
+        subtitle_title.read_full_subtitle_text.return_value = (
+            subtitle_text,
+            "subtitle.srt",
+        )
+        subtitle_title._title_has_quality_issue.return_value = False
+        llm_client = MagicMock()
+
+        with patch.object(autosub, "find_hardsub_video", return_value=hardsub), \
+             patch.object(autosub, "_load_llm_defaults", return_value=("glm-5.2", "dashscope")), \
+             patch.object(autosub, "_generate_title_from_description", side_effect=TimeoutError), \
+             patch.object(autosub, "_derive_wechat_title_from_bili_title", side_effect=TimeoutError), \
+             patch.object(autosub, "_generate_cover_title_from_full_subtitle", side_effect=TimeoutError), \
+             patch.dict(
+                 sys.modules,
+                 {
+                     "subtitle_title": subtitle_title,
+                     "llm_utils": MagicMock(get_client=lambda: llm_client),
+                 },
+             ):
+            metadata = autosub.generate_upload_metadata(workdir)
+
+        self.assertEqual(metadata["wechat_title"], "数据治理一半是在穿针引线")
+        self.assertEqual(metadata["cover_title"], "我们就是结缔组织，是那层筋膜")
+
+    def test_extract_source_title_uses_info_file_then_filename(self):
+        """Metadata generation should recover the publisher title reliably."""
+        workdir = os.path.join(self.temp_dir, "source_title")
+        os.makedirs(workdir)
+        hardsub = os.path.join(
+            workdir,
+            "Responsible_AI_Innovation_for_British_Public_Services "
+            "[7uIX9Zd4-VA] [1080p]_hardsub.mp4",
+        )
+        info_path = os.path.join(workdir, "source.info.json")
+        with open(info_path, "w", encoding="utf-8") as handle:
+            json.dump({"title": "Publisher Title"}, handle)
+
+        self.assertEqual(autosub._extract_source_title(hardsub), "Publisher Title")
+
+        os.remove(info_path)
+        self.assertEqual(
+            autosub._extract_source_title(hardsub),
+            "Responsible AI Innovation for British Public Services",
+        )
+        self.assertEqual(
+            autosub._extract_source_title(
+                os.path.join(workdir, "video_hardsub.mp4")
+            ),
+            "",
+        )
+
+    def test_generate_upload_metadata_prefers_source_title_over_random_hook(self):
+        """A publisher title is a safer offline fallback than one vivid quote."""
+        workdir = os.path.join(self.temp_dir, "metadata_source_fallback")
+        os.makedirs(workdir)
+        hardsub = os.path.join(
+            workdir,
+            "Responsible_AI_Innovation_for_British_Public_Services "
+            "[7uIX9Zd4-VA] [1080p]_hardsub.mp4",
+        )
+        with open(hardsub, "w") as handle:
+            handle.write("video")
+        with open(os.path.join(workdir, "upload_metadata.json"), "w", encoding="utf-8") as handle:
+            json.dump({"description": "Palantir UK FDE interview"}, handle)
+
+        subtitle_title = MagicMock()
+        subtitle_title.read_full_subtitle_text.return_value = (
+            "Palantir FDE 谈英国公共服务。",
+            "subtitle.srt",
+        )
+        subtitle_title.build_subtitle_grounded_title.return_value = SimpleNamespace(title="")
+
+        with patch.object(autosub, "find_hardsub_video", return_value=hardsub), \
+             patch.object(autosub, "_load_llm_defaults", return_value=("glm-5.2", "dashscope")), \
+             patch.object(autosub, "_generate_title_from_description", side_effect=ValueError), \
+             patch.object(autosub, "_derive_wechat_title_from_bili_title", return_value=None), \
+             patch.object(autosub, "_generate_cover_title_from_full_subtitle", return_value=None), \
+             patch.dict(
+                 sys.modules,
+                 {
+                     "subtitle_title": subtitle_title,
+                     "llm_utils": MagicMock(get_client=lambda: MagicMock()),
+                 },
+             ):
+            metadata = autosub.generate_upload_metadata(workdir)
+
+        self.assertEqual(metadata["title"], "Responsible AI Innovation for British Public")
+        self.assertEqual(metadata["wechat_title"], "Responsible AI")
+        self.assertEqual(metadata["cover_title"], "Responsible AI Innovation for British Public")
+
+    def test_title_and_cover_prompts_anchor_on_source_and_form_titles(self):
+        """Prompts must compare the publisher title with the transcript主线."""
+        llm_client = MagicMock()
+        subtitle_title = MagicMock()
+        subtitle_title.SubtitleTitleError = ValueError
+        subtitle_title.parse_llm_title_candidates.return_value = (
+            "Palantir英国FDE讲真实工作情况和节奏感",
+            (("Palantir英国FDE讲真实工作情况和节奏感", ("Palantir FDE 谈英国公共服务。",)),),
+        )
+        subtitle_title.validate_title_from_subtitle.return_value = (
+            "Palantir FDE 谈英国公共服务。",
+        )
+
+        with patch.dict(sys.modules, {"subtitle_title": subtitle_title}):
+            title = autosub._generate_title_from_description(
+                "Palantir UK FDE interview",
+                "Palantir FDE 谈英国公共服务。",
+                "Palantir FDE 谈英国公共服务。",
+                llm_client,
+                "glm-5.2",
+                48,
+                source_title="Responsible AI Innovation for British Public Services",
+            )
+            with self.assertRaises(ValueError):
+                autosub._generate_cover_title_from_full_subtitle(
+                    "Palantir FDE 谈英国公共服务。",
+                    llm_client,
+                    "glm-5.2",
+                    form_title=title,
+                    source_title="Responsible AI Innovation for British Public Services",
+                )
+
+        title_prompt = llm_client.generate_content.call_args_list[0].args[0]
+        cover_prompt = llm_client.generate_content.call_args_list[-1].args[0]
+        self.assertIn("视频原标题：\nResponsible AI Innovation", title_prompt)
+        self.assertIn("先用它判断视频场景和受益者", title_prompt)
+        self.assertIn("封面标题不是表单标题的压缩版", cover_prompt)
+        self.assertIn("不得作为封面标题的主要模板", cover_prompt)
+        self.assertIn("B站表单标题：\nPalantir英国FDE讲真实工作情况和节奏感", cover_prompt)
+
+    def test_title_scoring_prefers_transcript_mainline_over_source_topic(self):
+        """The publisher title must not outweigh the transcript's main subject."""
+        llm_client = MagicMock()
+        subtitle_title = MagicMock()
+        subtitle_title.SubtitleTitleError = ValueError
+        subtitle_title._title_has_quality_issue.return_value = False
+        subtitle_title.parse_llm_title_candidates.return_value = (
+            "Palantir英国FDE讲真实工作情况",
+            (
+                (
+                    "为英国公共服务打造负责任AI创新",
+                    ("英国公共服务谈负责任AI创新。",),
+                ),
+                (
+                    "Palantir英国FDE讲真实工作情况和节奏感",
+                    ("Palantir FDE 谈真实工作情况。",),
+                ),
+            ),
+        )
+        subtitle_title.validate_title_from_subtitle.return_value = (
+            "Palantir FDE 谈真实工作情况。",
+        )
+
+        with patch.dict(sys.modules, {"subtitle_title": subtitle_title}):
+            title = autosub._generate_title_from_description(
+                "Palantir员工和英国FDE讲真实工作情况，涉及英国公共服务场景。",
+                "Palantir FDE 谈英国公共服务和真实工作情况。",
+                "Palantir FDE 谈英国公共服务和真实工作情况。",
+                llm_client,
+                "glm-5.2",
+                48,
+                source_title="Responsible AI Innovation for British Public Services",
+            )
+
+        self.assertEqual(title, "Palantir英国FDE讲真实工作情况和节奏感")
+
+    def test_cover_title_prefers_subtitle_hook_over_form_title_duplicate(self):
+        """The form title is context, while the cover carries its own hook."""
+        llm_client = MagicMock()
+        subtitle_title = MagicMock()
+        subtitle_title.SubtitleTitleError = ValueError
+        subtitle_title._title_has_quality_issue.return_value = False
+        subtitle_title.parse_llm_title_candidates.return_value = (
+            "Palantir英国FDE讲真实工作情况",
+            (
+                (
+                    "Palantir英国FDE讲真实工作情况",
+                    ("Palantir英国FDE讲真实工作情况。",),
+                ),
+                (
+                    "一上来就被扔进深水区，还要自己把问题讲清楚",
+                    ("一上来就被扔进深水区，还要自己把问题讲清楚。",),
+                ),
+            ),
+        )
+        subtitle_title.validate_title_from_subtitle.return_value = ()
+
+        with patch.dict(sys.modules, {"subtitle_title": subtitle_title}):
+            cover_title = autosub._generate_cover_title_from_full_subtitle(
+                "Palantir英国FDE讲真实工作情况。一上来就被扔进深水区，还要自己把问题讲清楚。",
+                llm_client,
+                "glm-2",
+                form_title="Palantir英国FDE讲真实工作情况",
+                source_title="Responsible AI Innovation for British Public Services",
+            )
+
+        self.assertEqual(cover_title, "一上来就被扔进深水区，还要自己把问题讲清楚")
 
     def test_generate_upload_metadata_falls_back_when_summary_title_is_bad(self):
         """Invalid summary compression must not bypass subtitle grounding."""
@@ -536,6 +1324,8 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         llm_client = MagicMock()
         llm_client.generate_content.return_value = "{}"
         subtitle_title = MagicMock()
+        subtitle_title.SubtitleTitleError = ValueError
+        subtitle_title._title_has_quality_issue.return_value = False
         subtitle_title.parse_llm_title_candidates.return_value = (
             "Palantir整合数据不做服务，打造产品",
             (
@@ -583,6 +1373,7 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         llm_client = MagicMock()
         llm_client.generate_content.return_value = "{}"
         subtitle_title = MagicMock()
+        subtitle_title.SubtitleTitleError = ValueError
         subtitle_title.parse_llm_title_candidates.return_value = (
             "Palantir整合数据不做服务",
             (
@@ -606,14 +1397,15 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
 
         self.assertEqual(title, "Palantir整合数据不做服务")
         prompt = llm_client.generate_content.call_args.args[0]
-        self.assertIn("把下面的B站表单标题压缩成视频号表单标题", prompt)
-        self.assertIn("必须从B站标题的主张出发", prompt)
+        self.assertIn("为视频号生成更有吸引力的表单标题", prompt)
+        self.assertIn("B站标题只确定主题边界和必须保留的主体", prompt)
+        self.assertIn("优先通读字幕", prompt)
         self.assertIn("不得另起主题", prompt)
         self.assertIn("B站表单标题：\nPalantir为企业整合数据，不做服务，打造产品", prompt)
         self.assertIn("中文最多还能放 8 个字", prompt)
         self.assertIn("必须优先原样保留B站标题开头的主体", prompt)
-        self.assertIn("长度允许时保留两个信息点", prompt)
-        self.assertIn("主体+核心动作+对象+最有力的立场", prompt)
+        self.assertIn("优先保留主体和最有力的后果或立场", prompt)
+        self.assertIn("主体+具体后果/反差", prompt)
         self.assertEqual(
             autosub.normalize_bili_upload_title("Palantir为客户整合数据。"),
             "Palantir为客户整合数据",
@@ -668,6 +1460,7 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         llm_client = MagicMock()
         llm_client.generate_content.return_value = "{}"
         subtitle_title = MagicMock()
+        subtitle_title.SubtitleTitleError = ValueError
         subtitle_title.parse_llm_title_candidates.return_value = (
             "Palantir押注长期问题",
             (
@@ -764,6 +1557,8 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         llm_client = MagicMock()
         llm_client.generate_content.return_value = "{}"
         subtitle_title = MagicMock()
+        subtitle_title.SubtitleTitleError = ValueError
+        subtitle_title._title_has_quality_issue.return_value = False
         subtitle_title.parse_llm_title_candidates.return_value = (
             "Palantir没有销售团队",
             (
@@ -791,7 +1586,7 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         self.assertIn("不要把普通商务反差或抽象结论当成最强钩子", prompt)
         self.assertIn("主语、谓语和比喻/冲突对象要保留", prompt)
         self.assertIn("不得以「就像」「在」「需要」「带着」这类无主语成分开头", prompt)
-        self.assertIn("优先 14-18 个字符", prompt)
+        self.assertIn("优先 18-32 个字符", prompt)
         self.assertIn("不得保留「带着一帮工程师」这类可删修饰", prompt)
         self.assertIn("「正中央」这类承担画面强度的定位词必须保留", prompt)
         self.assertIn("「我们」「的」「了」若承担语法或语境作用必须保留", prompt)
@@ -827,6 +1622,7 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         llm_client = MagicMock()
         llm_client.generate_content.return_value = "共享简介"
         subtitle_title = MagicMock()
+        subtitle_title.SubtitleTitleError = ValueError
         subtitle_title.read_full_subtitle_text.return_value = (
             "中文第一行\nEnglish line\n中文第二行",
             "subtitle.srt",
@@ -861,6 +1657,10 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         self.assertEqual(metadata["title"], "卡普谈Palantir数据整合，不做服务")
         self.assertEqual(metadata["wechat_title"], "Palantir整合数据不做服务")
         self.assertEqual(metadata["cover_title"], "没有销售团队，却看到大规模采用")
+        metadata_path = os.path.join(workdir, "upload_metadata.json")
+        with open(metadata_path, "r", encoding="utf-8") as handle:
+            persisted = json.load(handle)
+        self.assertEqual(persisted, metadata)
         self.assertEqual(mock_title.call_args.args[1], "中文第一行\n中文第二行")
         self.assertEqual(mock_wechat_title.call_args.args[0], "卡普谈Palantir数据整合，不做服务")
         self.assertEqual(mock_wechat_title.call_args.args[2], "中文第一行\n中文第二行")
@@ -989,15 +1789,23 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
                 workdir,
                 bili_upload=True,
                 wechat_upload=True,
+                llm_model="glm-5.3",
+                llm_provider="dashscope",
             )
 
         mock_meta.assert_called_once_with(
             workdir,
             bili_title_max_chars=48,
             wechat_title_max_chars=16,
+            llm_model="glm-5.3",
+            llm_provider="dashscope",
         )
         bili_kwargs = next(call[1] for call in calls if call[0] == "BI")
         wechat_kwargs = next(call[1] for call in calls if call[0] == "WX")
+        self.assertEqual(bili_kwargs["llm_model"], "glm-5.3")
+        self.assertEqual(bili_kwargs["llm_provider"], "dashscope")
+        self.assertEqual(wechat_kwargs["llm_model"], "glm-5.3")
+        self.assertEqual(wechat_kwargs["llm_provider"], "dashscope")
         self.assertEqual(bili_kwargs["title"], metadata["title"])
         self.assertEqual(wechat_kwargs["title"], metadata["wechat_title"])
         self.assertLessEqual(len(wechat_kwargs["title"]), 16)
@@ -1204,6 +2012,50 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         task = engine.task_map[1]
         self.assertEqual(task.pcts["WX"], 100.0)
         self.assertEqual(task.status, "完成")
+        self.assertTrue(engine.do_wechat)
+
+    def test_load_state_preserves_wechat_limit_terminal_state(self):
+        """Restarting the engine must not requeue a WX duration-limit skip."""
+        project_dir = os.path.join(self.temp_dir, "project")
+        task_dir = os.path.join(project_dir, "task_1")
+        os.makedirs(task_dir)
+        state_file = os.path.join(project_dir, "batch_state.json")
+        state = {
+            "wechat": True,
+            "1": {
+                "uid": 1,
+                "url": "http://test.com",
+                "vid_id": "vid1",
+                "title": "Video 1",
+                "status": "超限 (WX)",
+                "pcts": {
+                    "DL": 100.0,
+                    "TR": 100.0,
+                    "TL": 100.0,
+                    "MR": 100.0,
+                    "BR": 100.0,
+                    "GD": 100.0,
+                    "BI": 100.0,
+                    "WX": 0.0,
+                },
+                "workdir": task_dir,
+                "error": "视频时长 10.2 分钟，超过视频号 10 分钟限制",
+            },
+        }
+        with open(state_file, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False)
+
+        engine = BatchEngine(
+            output_dir=self.temp_dir,
+            sub_dir_name="project",
+            state_file=state_file,
+        )
+        engine.load_state()
+
+        task = engine.task_map[1]
+        self.assertEqual(task.status, "超限 (WX)")
+        self.assertIn("超过视频号 10 分钟限制", task.error)
+        self.assertEqual(task.pcts["WX"], 0.0)
         self.assertTrue(engine.do_wechat)
 
 if __name__ == "__main__":

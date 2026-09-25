@@ -11,4 +11,6 @@ google-api-python-client
 google-auth-httplib2
 google-auth-oauthlib
 tqdm
+psutil
 playwright
+pyobjc-framework-cocoa; sys_platform == "darwin"

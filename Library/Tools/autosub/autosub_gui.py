@@ -51,6 +51,13 @@ if COMMON_DIR not in sys.path:
 AUTOSUB_SCRIPT = os.path.join(CURRENT_DIR, "autosub.py")
 SETTINGS_FILE = os.path.join(CURRENT_DIR, "settings.json")
 DEFAULTS_FILE = os.path.join(CURRENT_DIR, "defaults.json")
+DEFAULTS = {}
+if os.path.exists(DEFAULTS_FILE):
+    try:
+        with open(DEFAULTS_FILE, "r", encoding="utf-8") as _defaults_file:
+            DEFAULTS.update(json.load(_defaults_file))
+    except Exception:
+        pass
 
 # --- Base Output Directory (mirrors autosub.py logic) ---
 _tools_dir = os.path.dirname(CURRENT_DIR)
@@ -109,7 +116,7 @@ class AutoSubGUI:
             try:
                 if sys.platform == "darwin":
                     self.icon_img = tk.PhotoImage(file=icon_path)
-                    self.root.tk.call('wm', 'iconphoto', self.root._w, self.icon_img)
+                    self.root.tk.call('wm', 'iconphoto', self.root._w, '-default', self.icon_img)
                 else:
                     self.root.iconbitmap(icon_path)
             except: pass
@@ -145,7 +152,9 @@ class AutoSubGUI:
 
         self.settings = self.load_settings()
         self.vendor_default_models = self.settings.get("vendor_default_models", {})
-        self.key_editor_vendor = self.settings.get("llm_vendor", "Google Vertex AI")
+        self.key_editor_vendor = self.settings.get(
+            "llm_vendor", self.settings.get("vendor", "Google Vertex AI")
+        )
         self.key_editor_env_key = self.vendor_env_keys.get(self.key_editor_vendor, "VERTEX_SA_KEY_PATH")
         self.current_process = None
         self.last_was_progress = False
@@ -165,7 +174,8 @@ class AutoSubGUI:
         # Default fallback values
         defaults = {
             "input": "", "cookies": "chrome", "output_dir": "",
-            "llm_vendor": "Alibaba (Bailian)", "llm_model": "glm-5.2",
+            "llm_vendor": "Alibaba (Bailian)",
+            "llm_model": DEFAULTS.get("llm_model", "glm-5.2"),
             "api_key": "", "model": "large-v2", "style": "auto",
             "trans_mode": "balanced", "quick": False, "remove_ads": False, "quality": "high",
             "layout": "bilingual", "main_lang": "cn",
@@ -230,7 +240,9 @@ class AutoSubGUI:
         f2.pack(fill="x", pady=5)
 
         ttk.Label(f2, text="模型厂商:").grid(row=0, column=0, sticky="w")
-        current_vendor = str(self.settings.get("llm_vendor", ""))
+        current_vendor = str(
+            self.settings.get("llm_vendor", self.settings.get("vendor", ""))
+        )
         vendors = list(self.vendor_map.keys())
         if current_vendor not in vendors:
             current_vendor = "Alibaba (Bailian)"
@@ -341,7 +353,11 @@ class AutoSubGUI:
         ttk.Checkbutton(f4_6, text="公开发布（不勾选则保存草稿）", variable=self.wechat_public_var).grid(row=0, column=1, padx=15, sticky="w", pady=2)
         ttk.Label(f4_6, text="封面标题 (留空自动):").grid(row=1, column=0, padx=10, pady=2, sticky="e")
         self.wechat_cover_title_var = tk.StringVar(value="")
-        ttk.Entry(f4_6, textvariable=self.wechat_cover_title_var, width=32).grid(row=1, column=1, columnspan=2, padx=5, pady=2, sticky="w")
+        ttk.Entry(f4_6, textvariable=self.wechat_cover_title_var, width=64).grid(
+            row=1, column=1, columnspan=2, padx=5, pady=2, sticky="ew"
+        )
+        f4_6.columnconfigure(1, weight=1)
+        f4_6.columnconfigure(2, weight=1)
 
         # 5. Log Area (Parent: tab3)
         f5 = ttk.LabelFrame(self.tab3, text=" 日志与进度 ", padding=10)
@@ -846,6 +862,8 @@ class AutoSubGUI:
                             category_name=bili_category,
                             tags=self.bili_tags_var.get().strip() or None,
                             season=self.bili_season_var.get().strip() or None,
+                            llm_model=self.llm_model_var.get(),
+                            llm_provider=self.vendor_map.get(self.vendor_var.get(), ""),
                         )
                         if bili_cmd:
                             _persist(f"📱 找到生成的视频: {os.path.basename(bili_cmd[2])}")
@@ -864,6 +882,8 @@ class AutoSubGUI:
                             sync_dir,
                             public=self.wechat_public_var.get(),
                             cover_title=self.wechat_cover_title_var.get().strip() or None,
+                            llm_model=self.llm_model_var.get(),
+                            llm_provider=self.vendor_map.get(self.vendor_var.get(), ""),
                         )
                         if wechat_cmd:
                             _persist(f"💬 找到生成的视频: {os.path.basename(wechat_cmd[2])}")
@@ -1028,6 +1048,7 @@ class AutoSubGUI:
             "input": self.input_var.get(),
             "output_dir": self.output_dir_var.get(),
             "vendor": self.vendor_var.get(),
+            "llm_vendor": self.vendor_var.get(),
             "llm_model": self.llm_model_var.get(),
             "trans_mode": self.trans_mode_var.get(),
             "quality": self.quality_var.get(),
@@ -1062,5 +1083,12 @@ if __name__ == "__main__":
     import multiprocessing
     multiprocessing.freeze_support()
     root = tk.Tk()
+    # Set app icon early (before any widgets) so Cmd+Tab switcher picks it up
+    try:
+        from mac_icon import set_macos_app_icon
+        _icon_name = "autosub_vibrant_v2.png" if sys.platform == "darwin" else "autosub.ico"
+        set_macos_app_icon(root, os.path.join(CURRENT_DIR, _icon_name))
+    except Exception:
+        pass
     app = AutoSubGUI(root)
     root.mainloop()

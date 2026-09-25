@@ -59,6 +59,20 @@ class TerminalGUI:
         self.root.title("AutoSub Engine Console")
         self.root.geometry("1100x650")
         self.root.configure(bg="#0B0F19")  # Deep space dark background
+
+        # Set Window Icon (also sets Dock/Cmd+Tab icon on macOS via -default)
+        _dir = os.path.dirname(os.path.abspath(__file__))
+        _icon_name = "autosub_v9.png" if sys.platform == "darwin" else "autosub.ico"
+        _icon_path = os.path.join(_dir, _icon_name)
+        if os.path.exists(_icon_path):
+            try:
+                if sys.platform == "darwin":
+                    self._icon_img = tk.PhotoImage(file=_icon_path)
+                    self.root.tk.call('wm', 'iconphoto', self.root._w, '-default', self._icon_img)
+                else:
+                    self.root.iconbitmap(_icon_path)
+            except Exception:
+                pass
         
         # Configure Grid: row 0 = text area, row 1 = input bar (initially visible)
         self.root.grid_rowconfigure(0, weight=1)
@@ -641,6 +655,14 @@ def find_table_column_indices(lines):
 
 def main():
     root = tk.Tk()
+    # Set app icon early (before any widgets) so Cmd+Tab switcher picks it up
+    try:
+        from mac_icon import set_macos_app_icon
+        _dir = os.path.dirname(os.path.abspath(__file__))
+        _icon_name = "autosub_v9.png" if sys.platform == "darwin" else "autosub.ico"
+        set_macos_app_icon(root, os.path.join(_dir, _icon_name))
+    except Exception:
+        pass
     
     CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
     PYTHON_EXE = sys.executable

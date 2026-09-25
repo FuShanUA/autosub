@@ -1,6 +1,7 @@
 {
     "whisper_model": "large-v2",
-    "llm_model": "gemini-3-flash-preview",
+  "llm_model": "qwen3.7-max",
+    "llm_vendor": "Alibaba (Bailian)",
     "style": "auto",
     "layout": "bilingual",
     "main_lang": "cn",

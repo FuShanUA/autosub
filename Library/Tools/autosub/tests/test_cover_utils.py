@@ -16,6 +16,8 @@ from PIL import Image, ImageFont
 
 from cover_utils import (
     _COVER_STYLE_VERSION,
+    _frame_is_usable,
+    _sample_video_frames,
     cover_output_path,
     generate_cover,
     generate_platform_covers,
@@ -53,6 +55,61 @@ class TestCoverUtils(unittest.TestCase):
         self.assertLess(no_face_score, 2.0)
         self.assertGreater(face_score, 30.0)
         self.assertLess(no_face_score, face_score)
+
+    def test_frame_usability_rejects_dark_frames(self):
+        dark = os.path.join(self.temp_dir, "dark.jpg")
+        bright = os.path.join(self.temp_dir, "bright.jpg")
+        Image.new("RGB", (2000, 2000), (0, 0, 0)).save(dark, "JPEG")
+        Image.new("RGB", (1000, 1000), (180, 190, 200)).save(bright, "JPEG")
+
+        self.assertFalse(_frame_is_usable(dark))
+        self.assertTrue(_frame_is_usable(bright))
+
+    def test_sampling_uses_bounded_timestamp_seeks(self):
+        with patch.object(cover_utils, "subprocess") as subprocess_mock:
+            subprocess_mock.run.return_value = type(
+                "CompletedProcess", (), {"returncode": 0}
+            )()
+            frames = _sample_video_frames(
+                "/tmp/video.mp4",
+                self.temp_dir,
+                "ffmpeg",
+                3600.0,
+            )
+
+        self.assertEqual(frames, [])
+        self.assertEqual(subprocess_mock.run.call_count, 16)
+        for call in subprocess_mock.run.call_args_list:
+            args = call.args[0]
+            self.assertIn("-ss", args)
+            self.assertNotIn("-i", args[: args.index("-ss")])
+            self.assertNotIn("fps=", args)
+
+    def test_extract_best_frame_fails_when_all_candidates_are_dark(self):
+        dark = os.path.join(self.temp_dir, "dark.jpg")
+        Image.new("RGB", (2000, 2000), (0, 0, 0)).save(dark, "JPEG")
+        output = os.path.join(self.temp_dir, "best.jpg")
+
+        with patch.object(cover_utils, "_find_ffmpeg", return_value="ffmpeg"), patch.object(
+            cover_utils, "_video_duration_seconds", return_value=100.0
+        ), patch.object(
+            cover_utils, "_sample_video_frames", return_value=[(10.0, dark)]
+        ):
+            with self.assertRaisesRegex(RuntimeError, "bright enough"):
+                cover_utils.extract_best_frame("/tmp/video.mp4", output)
+
+    def test_generate_cover_rejects_dark_explicit_source(self):
+        dark = os.path.join(self.temp_dir, "dark-source.jpg")
+        Image.new("RGB", (2000, 2000), (0, 0, 0)).save(dark, "JPEG")
+        output = os.path.join(self.temp_dir, "cover.jpg")
+
+        with self.assertRaisesRegex(RuntimeError, "too dark"):
+            generate_cover(
+                "/tmp/does-not-exist.mp4",
+                output,
+                "Palantir FDE",
+                source_path=dark,
+            )
 
     def test_more_faces_win_even_when_each_face_is_smaller(self):
         one_large_face = [(760, 240, 400, 400)]
@@ -397,7 +454,7 @@ class TestCoverUtils(unittest.TestCase):
         top = min(point[1] for point in red_points)
         self.assertGreaterEqual(top, face_bbox[1] + face_bbox[3] + 10)
 
-    def test_title_card_uses_lower_center_and_two_thirds_width(self):
+    def test_title_card_uses_lower_center_and_wide_sentence_layout(self):
         image = Image.new("RGB", (1920, 1080), (42, 82, 126))
         _draw_title(
             image,
@@ -418,8 +475,8 @@ class TestCoverUtils(unittest.TestCase):
         bottom = max(point[1] for point in points)
         card_width = (right - left + 1) / image.width
         card_center_y = (top + bottom) / 2 / image.height
-        self.assertGreaterEqual(card_width, 0.58)
-        self.assertLessEqual(card_width, 0.72)
+        self.assertGreaterEqual(card_width, 0.84)
+        self.assertLessEqual(card_width, 0.96)
         self.assertAlmostEqual((left + right) / 2 / image.width, 0.5, delta=0.01)
         self.assertGreaterEqual(card_center_y, 0.58)
         self.assertLessEqual(card_center_y, 0.68)
@@ -428,6 +485,17 @@ class TestCoverUtils(unittest.TestCase):
         fonts, lines = _fit_font("抽象产品", 1920, 94)
         self.assertEqual(fonts[0].size, 94)
         self.assertEqual(lines, ["抽象产品"])
+
+    def test_sentence_title_fits_full_width_in_at_most_two_lines(self):
+        title = "Palantir英国FDE的真实情况：一上来就被扔进深水区，还要自己把问题讲清楚"
+        fonts, lines = _fit_font(title, 1920, 94)
+        self.assertLessEqual(len(lines), 2)
+        self.assertGreaterEqual(fonts[0].size, 30)
+        for line in lines:
+            self.assertLessEqual(
+                cover_utils._line_metrics(line, fonts)[0],
+                int(1920 * 0.88),
+            )
 
     def _assert_frame_overlay_style(self, image):
         rgb = image.convert("RGB")

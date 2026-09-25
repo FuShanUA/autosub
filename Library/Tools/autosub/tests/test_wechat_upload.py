@@ -1,5 +1,6 @@
 import asyncio
 import importlib.util
+import json
 import os
 from pathlib import Path
 import shutil
@@ -22,7 +23,7 @@ class FakeLLM:
     def __init__(self, response):
         self.response = response
 
-    def generate_content(self, prompt, model_name=None):
+    def generate_content(self, prompt, model_name=None, provider=None):
         return self.response
 
 
@@ -134,7 +135,7 @@ class TestAutosubWechatCommand(unittest.TestCase):
 
                 self.assertFalse(ok)
                 self.assertTrue(
-                    any("10-min limit" in message for message in logs)
+                    any("10 分钟限制" in message for message in logs)
                 )
         finally:
             sys.modules.pop("autosub_wechat_command_under_test", None)
@@ -327,6 +328,58 @@ class TestWechatUploadTitle(unittest.TestCase):
             )
 
         self.assertEqual(calls, ["FDE的核心职能：抽象产品"])
+
+    def test_upload_uses_cached_metadata_before_llm(self):
+        metadata_path = os.path.join(self.temp_dir, "upload_metadata.json")
+        with open(metadata_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "description": "cached description",
+                    "wechat_title": "cached title",
+                    "cover_title": "cached cover",
+                },
+                handle,
+                ensure_ascii=False,
+            )
+
+        seen = {}
+
+        def fake_build_description(_video, _title, description=None, *_args, **_kwargs):
+            seen["description"] = description
+            return description or "fallback"
+
+        def fake_generate_covers(video, title, cover_title=None):
+            seen["title"] = title
+            seen["cover_title"] = cover_title
+            return None, None
+
+        with patch.object(
+            self.module, "_within_wechat_duration_limit", lambda _path: True
+        ), patch.object(
+            self.module,
+            "build_title",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("cached title must bypass LLM")
+            ),
+        ), patch.object(
+            self.module, "build_description", fake_build_description
+        ), patch.object(
+            self.module,
+            "build_cover_title",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("cached cover title must bypass LLM")
+            ),
+        ), patch.object(
+            self.module, "_generate_wechat_covers", fake_generate_covers
+        ):
+            ok = asyncio.run(
+                self.module.upload_one_video(self.video, "Filename-derived title")
+            )
+
+        self.assertFalse(ok)
+        self.assertEqual(seen["description"], "cached description")
+        self.assertEqual(seen["title"], "cached title")
+        self.assertEqual(seen["cover_title"], "cached cover")
 
     def test_wait_cover_editor_ready_waits_for_video_processing(self):
         texts = [
@@ -528,6 +581,40 @@ class TestWechatUploadTitle(unittest.TestCase):
 
         self.assertTrue(ok)
         self.assertEqual(opened, [1])
+
+    def test_wait_draft_list_ready_accepts_zero_count_empty_state(self):
+        class FakePage:
+            url = self.module.WECHAT_DRAFT_URL
+
+        async def fake_entries(_page):
+            return []
+
+        async def fake_text(_page):
+            return "草稿箱 (0)"
+
+        with patch.object(self.module, "_draft_list_entries", fake_entries), \
+             patch.object(self.module, "_wujie_text", fake_text):
+            ready = asyncio.run(
+                self.module._wait_draft_list_ready(FakePage(), timeout=1)
+            )
+
+        self.assertTrue(ready)
+
+    def test_menu_draft_click_expands_folded_sidebar(self):
+        scripts = []
+
+        class FakePage:
+            async def evaluate(self, script, *args):
+                scripts.append(script)
+                return True
+
+        with patch.object(self.module.asyncio, "sleep", _noop_sleep):
+            clicked = asyncio.run(self.module._click_menu_draft_link(FakePage()))
+
+        self.assertTrue(clicked)
+        self.assertTrue(any("fold-sidebar" in script for script in scripts))
+        self.assertTrue(any("内容管理" in script for script in scripts))
+        self.assertTrue(any("草稿箱" in script for script in scripts))
 
     def test_cover_failure_stops_upload_instead_of_saving_draft(self):
         async def fake_same_page(*args, **kwargs):

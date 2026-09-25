@@ -306,7 +306,7 @@ If no ads are found, return [].
     return ad_segments
 
 
-def smart_translate_chunk(chunk_blocks: List[Dict], style: str = "casual", model_name: str = "gemini-3.1-pro-preview") -> List[Dict]:
+def smart_translate_chunk(chunk_blocks: List[Dict], style: str = "casual", model_name: str = "glm-5.3") -> List[Dict]:
     """
     Translates a chunk of subtitle blocks using context-aware prompting.
     """
@@ -1006,13 +1006,37 @@ Reply with ONLY the Chinese translation."""
 
     return final_blocks
 
+
+_PROPER_NOUN_ASR_CORRECTIONS = {
+    "Ermann": "Ermon",
+    "Walkwest": "Wahlquist",
+}
+
+
+def _correct_known_asr_proper_nouns(blocks: List[Dict]) -> List[Dict]:
+    """Correct high-confidence ASR name errors before they enter the cache."""
+    for block in blocks:
+        corrected_lines = []
+        for line in block.get("lines", []):
+            value = str(line)
+            for wrong, right in _PROPER_NOUN_ASR_CORRECTIONS.items():
+                value = re.sub(
+                    rf"(?<![A-Za-z]){re.escape(wrong)}(?![A-Za-z])",
+                    right,
+                    value,
+                )
+            corrected_lines.append(value)
+        block["lines"] = corrected_lines
+    return blocks
+
+
 def main():
     parser = argparse.ArgumentParser(description="Smart Translation with Context & Style")
     parser.add_argument("input", help="Input English SRT file")
     parser.add_argument("--style", default="auto", choices=["auto", "casual", "formal", "edgy"])
-    default_model = os.environ.get("GOOGLE_GENAI_MODEL") or "gemini-3.1-pro-preview"
+    default_model = os.environ.get("GOOGLE_GENAI_MODEL") or "glm-5.3"
     parser.add_argument("--model", default=default_model, help="LLM Model to use for translation")
-    parser.add_argument("--provider", default=None, help="Explicit LLM Provider")
+    parser.add_argument("--provider", default="dashscope", help="Explicit LLM Provider")
     parser.add_argument("--chunk-size", type=int, default=50, help="Number of blocks per batch")
     parser.add_argument("--trans-mode", default="balanced", choices=["paraphrase", "balanced"], help="Translation Mode")
 
@@ -1031,6 +1055,7 @@ def main():
     if not blocks:
         print("Error parsing SRT file.")
         return
+    blocks = _correct_known_asr_proper_nouns(blocks)
 
     # Snapshot the English source text per block BEFORE translation/cache overwrite.
     # Needed later by detect_misaligned_blocks / clean_untranslated_english to
@@ -1111,6 +1136,7 @@ def main():
         idx = str(block['index'])
         if idx in translated_map:
             block['lines'] = [translated_map[idx]]
+    blocks = _correct_known_asr_proper_nouns(blocks)
 
     final_blocks = []
 
@@ -1156,6 +1182,19 @@ def main():
 - Qwen: 通义千问 (Alibaba's LLM; use "千问" after first mention)
 - telemetry: 运行数据 (NOT "遥测"; in enterprise context means operational/usage data)
 - Conviction: Keep in English when referring to Sarah Guo's venture capital FUND/FIRM (e.g. "inside of Conviction", "when you started Conviction", "Conviction内部最大的分歧"). Translate as "确信" or "信念" when used as a common noun meaning personal belief or investment conviction (e.g. "leap of conviction" -> "纵身一跃的确信", "climb to conviction" -> "慢慢建立确信", "behind conviction" -> "在确信的背后", "what conviction looks like" -> "确信是什么样的"). Context determines which sense applies.
+- diffusion model: 扩散模型
+- diffusion-based LLM: 基于扩散模型的大语言模型
+- serve a model / serving models: 提供模型推理服务 (never compress this into fragments such as "快么服务")
+- service (technical deployment context): 服务 (translate the complete word; never truncate or phoneticize it)
+- trial (CEO/job context): 试用期 or 试任 (NOT "审判"; a legal trial is "审判")
+- Varun Mohan: 瓦伦·莫汉 (correct ASR variants include Baron/Barron Millich)
+- John Schulman: 约翰·舒尔曼
+- Charlie O'Neill: 查理·奥尼尔
+- Ali Ghodsi: 阿里·戈德西 (correct ASR variants include Ali Goetze)
+- Stefano Ermon: Stefano Ermon (correct ASR variant "Ermann")
+- Chad Wahlquist: Chad Wahlquist (correct ASR variant "Walkwest")
+- Baseten: Baseten (company name; correct ASR variant "Base10")
+- Zyphra / Thinking Machines / OpenAI: keep the established company spelling unless a standard Chinese name is explicitly required
 """
         knowledge_snippet = (knowledge_snippet or "") + PREBUILT_GLOSSARY
 
@@ -1244,7 +1283,7 @@ def main():
 
         # Execute Batch
         try:
-            # Use user-specified model, or default to gemini-3-flash-preview.
+            # Use user-specified model, or default to the main AutoSub model.
             target_model = args.model
             print(f"🚀 Using LLM: {target_model}...")
 

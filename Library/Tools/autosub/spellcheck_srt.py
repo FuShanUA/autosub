@@ -89,6 +89,14 @@ def load_asr_corrections() -> List[Tuple[str, str]]:
         # Sam Altman (OpenAI CEO)
         (r'\bSam\s+Alterman\b', 'Sam Altman'),
         (r'\bAlterman\b', 'Altman'),
+        # Varun Mohan (Codeium/Windsurf; ASR often produces Baron Millich)
+        (r'\bBarr?on\s+Millich\b', 'Varun Mohan'),
+        (r'\bMillich\b', 'Mohan'),
+        # Baseten infrastructure company
+        (r'\bBase\s*10\b', 'Baseten'),
+        # Ali Ghodsi (Databricks CEO)
+        (r'\bAli\s+Goetze\b', 'Ali Ghodsi'),
+        (r'\bGoetze\b', 'Ghodsi'),
     ]
     corrections.extend(HARDCODED_ASR_FIXES)
 
@@ -322,7 +330,7 @@ Example:
         return chunk_blocks  # Graceful fallback to original chunk
 
 
-def run_spellcheck(srt_path: str, model_name: str = "gemini-3.1-flash-preview", provider=None) -> bool:
+def run_spellcheck(srt_path: str, model_name: str = "glm-5.3", provider="dashscope") -> bool:
     """Parses, spellchecks, and overwrites the target srt file.
     Uses a three-pass approach:
       Pass 1: Global name scan (whole transcript → name-correction map)
@@ -404,8 +412,8 @@ def run_spellcheck(srt_path: str, model_name: str = "gemini-3.1-flash-preview", 
 def main():
     parser = argparse.ArgumentParser(description="Context-Aware Acoustic/Phonetic Spellcheck for SRT files.")
     parser.add_argument("srt_path", help="Path to the SRT subtitle file to spellcheck.")
-    parser.add_argument("--model", default="gemini-3.1-flash-preview", help="Gemini LLM model name.")
-    parser.add_argument("--provider", default=None, help="Explicit LLM Provider.")
+    parser.add_argument("--model", default="glm-5.3", help="LLM model name.")
+    parser.add_argument("--provider", default="dashscope", help="Explicit LLM Provider.")
     args = parser.parse_args()
 
     provider_enum = None

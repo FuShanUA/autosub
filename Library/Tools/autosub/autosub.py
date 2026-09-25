@@ -332,7 +332,20 @@ def normalize_bili_upload_title(
         return ""
     return value
 
-def build_bili_cmd(workdir, title=None, tid=None, category_name=None, tags=None, season=None, desc=None, public=False, cover_title=None):
+def build_bili_cmd(
+    workdir,
+    title=None,
+    tid=None,
+    category_name=None,
+    tags=None,
+    season=None,
+    desc=None,
+    public=False,
+    cover_title=None,
+    llm_model=None,
+    llm_provider=None,
+    require_complete_metadata=False,
+):
     """Build the Bilibili upload command for the hardsub video in workdir.
     Metadata (tid/tags/desc/season) is auto-generated per-video by bili_upload.py's
     built-in LLM logic unless explicitly overridden. Returns the cmd list or None."""
@@ -340,6 +353,11 @@ def build_bili_cmd(workdir, title=None, tid=None, category_name=None, tags=None,
         return None
     hardsub_path = find_hardsub_video(workdir)
     if not hardsub_path:
+        return None
+    metadata_values = (title, desc, cover_title)
+    if require_complete_metadata and not all(
+        str(value or "").strip() for value in metadata_values
+    ):
         return None
     # When title/desc/cover_title are all provided, the caller has pre-generated
     # metadata; tell bili_upload.py to skip its own LLM title generation.
@@ -361,6 +379,10 @@ def build_bili_cmd(workdir, title=None, tid=None, category_name=None, tags=None,
         cmd.extend(["--cover-title", str(cover_title).strip()])
     if _pre_generated:
         cmd.append("--no_auto_title")
+    if llm_model:
+        cmd.extend(["--llm-model", str(llm_model)])
+    if llm_provider:
+        cmd.extend(["--llm-provider", str(llm_provider)])
     if public:
         cmd.append("--public")
     return cmd
@@ -427,10 +449,37 @@ def run_bili_cmd(cmd, on_progress=None, on_log=None, abort_flag=None):
     p.wait()
     return p.returncode == 0
 
-def trigger_bili_upload(workdir, title=None, tid=None, category_name=None, tags=None, season=None, desc=None, public=False, cover_title=None, on_progress=None, on_log=None, abort_flag=None):
+def trigger_bili_upload(
+    workdir,
+    title=None,
+    tid=None,
+    category_name=None,
+    tags=None,
+    season=None,
+    desc=None,
+    public=False,
+    cover_title=None,
+    llm_model=None,
+    llm_provider=None,
+    on_progress=None,
+    on_log=None,
+    abort_flag=None,
+):
     """Build and run a Bilibili upload for the hardsub video in workdir.
     Convenience wrapper: build_bili_cmd + run_bili_cmd. Returns True on success."""
-    cmd = build_bili_cmd(workdir, title=title, tid=tid, category_name=category_name, tags=tags, season=season, desc=desc, public=public, cover_title=cover_title)
+    cmd = build_bili_cmd(
+        workdir,
+        title=title,
+        tid=tid,
+        category_name=category_name,
+        tags=tags,
+        season=season,
+        desc=desc,
+        public=public,
+        cover_title=cover_title,
+        llm_model=llm_model,
+        llm_provider=llm_provider,
+    )
     if not cmd:
         print("⚠️  [Bilibili] upload skipped (script/venv/hardsub not found)", flush=True)
         return False
@@ -456,16 +505,21 @@ if _COMMON_DIR not in sys.path:
     sys.path.insert(0, _COMMON_DIR)
 
 def _load_llm_defaults():
-    """Read model/vendor from autosub settings.json, matching bili_upload.py."""
+    """Read the model/vendor selected by the main AutoSub configuration."""
     try:
         p = os.path.join(CURRENT_DIR, "settings.json")
         if os.path.exists(p):
             with open(p, "r", encoding="utf-8") as f:
                 s = json.load(f)
-            return s.get("llm_model", "glm-5.2"), s.get("llm_vendor", "dashscope").lower().replace(" (bailian)", "dashscope")
+            model = s.get("llm_model") or DEFAULTS.get("llm_model") or "glm-5.2"
+            vendor = s.get("llm_vendor") or s.get("vendor") or ""
+            provider = VENDOR_MAP.get(vendor, str(vendor).strip().lower() or "dashscope")
+            return model, provider
     except Exception:
         pass
-    return "glm-5.2", "dashscope"
+    return DEFAULTS.get("llm_model", "glm-5.2"), VENDOR_MAP.get(
+        DEFAULTS.get("llm_vendor", ""), "dashscope"
+    )
 
 
 _SHARED_TITLE_BANNED_TERMS = (
@@ -476,11 +530,13 @@ _SHARED_TITLE_BANNED_TERMS = (
 _SHARED_TITLE_ACTION_MARKERS = (
     "谈", "讲", "靠", "用", "做", "让", "成为", "押",
     "招", "卖", "买", "建立", "打造", "解决", "守住", "聚焦", "变成", "保护",
-    "整合", "引领", "炮轰", "反对", "支持",
+    "整合", "引领", "炮轰", "反对", "支持", "梳理", "展示",
+    "被裁", "烂掉",
 )
 _SHARED_TITLE_CONTEXT_MARKERS = (
     "访谈", "对话", "谈", "讲", "为", "帮", "给", "客户", "企业",
     "问题", "不做", "不是", "不招", "押注", "才是", "隐私",
+    "被裁", "烂掉",
 )
 _PUBLIC_TITLE_STYLE_EXAMPLES = (
     "Palantir才是引领应用层的公司，客户从没见过这种阵势",
@@ -554,16 +610,94 @@ def _shared_title_score(title, max_chars=SHARED_UPLOAD_TITLE_MAX_CHARS):
     return score
 
 
+_TITLE_LATIN_STOPWORDS = {
+    "a", "an", "and", "as", "at", "for", "in", "of", "on",
+    "the", "to", "with",
+}
+_TITLE_CJK_FUNCTION_CHARS = set("的了着是在和与把被给对向就都很也又再")
+
+
+def _title_scoring_tokens(value):
+    """Extract stable reference tokens from a mixed Chinese/English title."""
+    normalized = re.sub(r"\s+", " ", str(value or "")).strip().casefold()
+    tokens = {
+        token
+        for token in re.findall(r"[a-z][a-z0-9_-]*", normalized)
+        if token not in _TITLE_LATIN_STOPWORDS
+    }
+    for run in re.findall(r"[\u3400-\u9fff]+", normalized):
+        compact = "".join(
+            char for char in run if char not in _TITLE_CJK_FUNCTION_CHARS
+        )
+        if len(compact) == 1:
+            tokens.add(compact)
+        tokens.update(
+            compact[index:index + 2]
+            for index in range(len(compact) - 1)
+        )
+    return tokens
+
+
+def _title_reference_coverage(title, reference):
+    """Measure how much of a candidate is covered by a reference text."""
+    title_tokens = _title_scoring_tokens(title)
+    if not title_tokens:
+        return 0.0
+    reference_tokens = _title_scoring_tokens(reference)
+    if not reference_tokens:
+        return 0.0
+    return len(title_tokens & reference_tokens) / len(title_tokens)
+
+
+def _title_candidate_score(
+    title,
+    max_chars,
+    central_claim="",
+    description="",
+    source_title="",
+):
+    """Combine editorial structure with semantic alignment to the video."""
+    score = _shared_title_score(title, max_chars=max_chars)
+    if central_claim:
+        score += 6.0 * _title_reference_coverage(title, central_claim)
+    if description:
+        first_sentence = re.split(
+            r"[。！？\n]",
+            str(description).strip(),
+            maxsplit=1,
+        )[0]
+        score += 5.0 * _title_reference_coverage(title, first_sentence)
+        score += 2.0 * _title_reference_coverage(title, description)
+    if source_title:
+        # The publisher title anchors the topic, but cannot outweigh the
+        # transcript-derived description and central claim.
+        score += 1.5 * _title_reference_coverage(title, source_title)
+    return score
+
+
+def _cover_title_repeats_form_title(title, form_title):
+    """Reject generated covers that merely restate the form title."""
+    normalize = lambda value: re.sub(r"\s+", "", str(value or ""))
+    return bool(form_title) and normalize(title) == normalize(form_title)
+
+
 def _cover_title_has_quality_issue(title):
     value = re.sub(r"\s+", " ", str(title or "")).strip()
     if not value:
         return True
+    try:
+        from subtitle_title import _title_has_quality_issue
+        if _title_has_quality_issue(value, allow_first_person=True):
+            return True
+    except ImportError:
+        pass
     if re.match(r"^(?:就像|好像|仿佛|在|需要|带着|做多|做空)", value):
         return True
     predicate_markers = (
-        "是", "像", "就像", "不是", "没有", "开", "做", "看", "说",
+        "是", "像", "就像", "不是", "没有", "开", "做", "看", "说", "谈",
         "解决", "变成", "成为", "却", "并", "让", "把", "给", "在",
         "对付", "阻止", "提供", "押注", "坚持", "拒绝",
+        "没了", "断了", "烂掉",
     )
     return not any(marker in value for marker in predicate_markers)
 
@@ -604,6 +738,8 @@ def _generate_title_from_description(
     llm_client,
     model_name,
     max_chars,
+    provider=None,
+    source_title=None,
 ):
     """Summarize the whole interview into a fuller Bilibili form title."""
     from subtitle_title import (
@@ -616,6 +752,16 @@ def _generate_title_from_description(
         return None
 
     min_chars = min(BILI_UPLOAD_TITLE_TARGET_MIN_CHARS, max_chars)
+    source_title_reference = ""
+    if source_title:
+        source_title_reference = (
+            "视频原标题是作者或平台给出的题材参考，不是唯一事实来源。"
+            "先用它判断视频场景和受益者，再通读字幕确认实际主线。"
+            "如果字幕反复聚焦另一个主体，标题应优先反映字幕主线，"
+            "同时保留原标题中有用的场景或受益者。"
+            "不要逐字翻译原标题，也不要只抽原标题里的一个词。"
+            f"\n视频原标题：\n{source_title}\n\n"
+        )
     base_prompt = (
         "基于完整中文字幕和视频简介，生成B站表单标题。"
         f"标题长度必须为 {min_chars}-{max_chars} 个字符，英文字母逐字符计数。"
@@ -663,6 +809,7 @@ def _generate_title_from_description(
         "只输出 JSON："
         '{"central_claim":"...","candidates":['
         '{"title":"...","evidence":["..."]}]}\n\n'
+        f"{source_title_reference}"
         f"视频简介：\n{description}\n\n"
         f"完整中文字幕：\n{subtitle_text}"
     )
@@ -676,7 +823,9 @@ def _generate_title_from_description(
                 "请只修正标题措辞和 evidence，保持全片概括不变。"
             )
         try:
-            raw = llm_client.generate_content(prompt, model_name=model_name)
+            raw = llm_client.generate_content(
+                prompt, model_name=model_name, provider=provider
+            )
             _central_claim, candidates = parse_llm_title_candidates(raw)
             candidate_errors = []
             valid_candidates = []
@@ -705,7 +854,13 @@ def _generate_title_from_description(
             if valid_candidates:
                 return max(
                     valid_candidates,
-                    key=lambda item: _shared_title_score(item[0], max_chars),
+                    key=lambda item: _title_candidate_score(
+                        item[0],
+                        max_chars,
+                        central_claim=_central_claim,
+                        description=description,
+                        source_title=source_title,
+                    ),
                 )[0]
             if candidate_errors:
                 raise SubtitleTitleError("；".join(candidate_errors[:3]))
@@ -719,6 +874,7 @@ def _generate_title_from_description(
         llm_client,
         model_name,
         max_chars,
+        source_title=source_title,
     )
     if structured_title:
         return structured_title
@@ -733,6 +889,7 @@ def _generate_structured_title_from_description(
     llm_client,
     model_name,
     max_chars,
+    source_title=None,
 ):
     """Build a budgeted Bilibili title from semantic fields."""
     from subtitle_title import SubtitleTitleError, validate_title_from_subtitle
@@ -741,6 +898,13 @@ def _generate_structured_title_from_description(
         return None
 
     min_chars = min(BILI_UPLOAD_TITLE_TARGET_MIN_CHARS, max_chars)
+    source_title_reference = ""
+    if source_title:
+        source_title_reference = (
+            "视频原标题只作题材和场景参考，不是唯一事实来源。"
+            "若字幕主线与原标题侧重点不同，以字幕主线为主。"
+            f"\n视频原标题：\n{source_title}\n\n"
+        )
     base_prompt = (
         "把视频简介和完整中文字幕概括成B站表单标题。"
         "输出5个结构化候选，按全片概括强度排序。"
@@ -766,6 +930,7 @@ def _generate_structured_title_from_description(
         '{"candidates":[{"subject":"...","beneficiary":"...",'
         '"action":"...","object":"...","second_claim":"...",'
         '"evidence":["..."]}]}\n\n'
+        f"{source_title_reference}"
         f"视频简介：\n{description}\n\n"
         f"完整中文字幕：\n{subtitle_text}"
     )
@@ -802,6 +967,7 @@ def _generate_structured_title_from_description(
                 raise SubtitleTitleError("结构化标题未返回候选")
 
             candidate_errors = []
+            valid_candidates = []
             for item in raw_candidates:
                 if not isinstance(item, dict):
                     continue
@@ -855,9 +1021,19 @@ def _generate_structured_title_from_description(
                         min_chars=min_chars,
                         max_chars=max_chars,
                     )
-                    return title
+                    valid_candidates.append(title)
                 except SubtitleTitleError as exc:
                     candidate_errors.append(f"{title}: {exc}")
+            if valid_candidates:
+                return max(
+                    valid_candidates,
+                    key=lambda title: _title_candidate_score(
+                        title,
+                        max_chars,
+                        description=description,
+                        source_title=source_title,
+                    ),
+                )
             if candidate_errors:
                 raise SubtitleTitleError("；".join(candidate_errors[:3]))
             raise SubtitleTitleError("未返回可校验结构化标题候选")
@@ -1002,8 +1178,10 @@ def _derive_wechat_title_from_bili_title(
     llm_client,
     model_name,
     max_chars=SHARED_UPLOAD_TITLE_MAX_CHARS,
+    provider=None,
+    source_title=None,
 ):
-    """Compress the Bilibili title into WeChat's short-title limit."""
+    """Choose a transcript-grounded hook within the Bilibili title's topic."""
     from subtitle_title import (
         parse_llm_title_candidates,
         SubtitleTitleError,
@@ -1014,22 +1192,30 @@ def _derive_wechat_title_from_bili_title(
         return None
 
     min_chars = min(12, max_chars)
+    source_title_reference = ""
+    if source_title:
+        source_title_reference = (
+            "视频原标题只用于校验题材和场景，不得取代B站标题的中心主张。"
+            f"\n视频原标题：\n{source_title}\n\n"
+        )
     base_prompt = (
-        "把下面的B站表单标题压缩成视频号表单标题。"
-        "必须从B站标题的主张出发，不得另起主题，也不得换成字幕外的概括。"
+        "为视频号生成更有吸引力的表单标题。"
+        "B站标题只确定主题边界和必须保留的主体，不是逐字压缩模板。"
+        "优先通读字幕，找出同一主线里最具体的冲突、后果、反差或人物立场；"
+        "可以选字幕钩子，不得另起主题，也不得换成字幕外的概括。"
         f"标题长度必须为 {min_chars}-{max_chars} 个字符，英文字母逐字符计数。"
         "例如 Palantir 为 8 字符，中文最多还能放 8 个字。"
         "必须优先原样保留B站标题开头的主体，例如 Palantir、卡普或 OpenAI研究员；"
         "只有主体过长导致无法保留核心谓语时才允许省略。"
         "先计算主体字符数，再用标题上限减去主体字符数得到剩余额度；"
         "每个候选的其余文字都必须落在这个额度内，超限候选直接作废。"
-        "优先保留B站标题里的核心业务/做法，"
-        "长度允许时保留两个信息点：核心业务/做法，"
-        "以及最有力的受益者、问题、立场或结果；"
+        "优先保留主体和最有力的后果或立场；"
+        "长度允许时再保留核心业务/做法或受益者；"
         "不要只留「主体+核心对象」的单信息点标题。"
         "禁止只留「主体+对象」或「主体+动作+对象」的分类标签。"
-        "16字允许时优先输出「主体+核心动作+对象+最有力的立场」，"
-        "例如主体后接「整合数据不招销售」这类两个信息点的自然短句。"
+        "16字允许时优先输出「主体+具体后果/反差」或"
+        "「主体+核心动作+对象+最有力的立场」，"
+        "例如主体后接「被裁后组织会烂掉」或「整合数据不招销售」。"
         "禁用「把」字句，输出必须能独立读成一句完整陈述。"
         "不要为了凑满 16 字新增字幕没有的连接短语。"
         "生成 5 个候选，按编辑质量从高到低排列。"
@@ -1037,6 +1223,7 @@ def _derive_wechat_title_from_bili_title(
         "只输出 JSON："
         '{"central_claim":"...","candidates":['
         '{"title":"...","evidence":["..."]}]}\n\n'
+        f"{source_title_reference}"
         f"B站表单标题：\n{bili_title}\n\n"
         f"视频简介：\n{description}\n\n"
         f"完整中文字幕：\n{subtitle_text}"
@@ -1052,7 +1239,9 @@ def _derive_wechat_title_from_bili_title(
                 "请只修正措辞和 evidence，保持B站标题的核心主张不变。"
             )
         try:
-            raw = llm_client.generate_content(prompt, model_name=model_name)
+            raw = llm_client.generate_content(
+                prompt, model_name=model_name, provider=provider
+            )
             _central_claim, candidates = parse_llm_title_candidates(raw)
             candidate_errors = []
             valid_candidates = []
@@ -1097,6 +1286,8 @@ def _derive_wechat_title_from_bili_title(
                     key=lambda item: (
                         _shared_title_score(item[0], max_chars)
                         + (6.0 if subject and subject in item[0] else 0.0)
+                        + 8.0 * _title_reference_coverage(item[0], bili_title)
+                        + 1.5 * _title_reference_coverage(item[0], source_title)
                     ),
                 )[0]
             if candidate_errors:
@@ -1130,6 +1321,9 @@ def _generate_cover_title_from_full_subtitle(
     model_name,
     min_chars=12,
     max_chars=48,
+    provider=None,
+    form_title=None,
+    source_title=None,
 ):
     """Generate a cover headline by scanning the complete subtitle transcript."""
     from subtitle_title import (
@@ -1141,18 +1335,34 @@ def _generate_cover_title_from_full_subtitle(
     if not full_subtitle_text or llm_client is None:
         return None
 
+    title_context = ""
+    if form_title or source_title:
+        title_context = (
+            "封面标题不是表单标题的压缩版。表单标题只用于判断主题边界和兜底，"
+            "不得作为封面标题的主要模板。请从完整字幕中选一个具体原话或克制复述，"
+            "让它与表单标题呼应同一主题，但呈现更具体的钩子、画面或冲突。"
+        )
+        if form_title:
+            title_context += f"\nB站表单标题：\n{form_title}\n"
+        if source_title:
+            title_context += (
+                "\n视频原标题（题材参考，不是唯一事实来源）：\n"
+                f"{source_title}\n"
+            )
+        title_context += "\n"
+
     base_prompt = (
         "你是资深中文科技内容编辑。请通读下面的完整中文字幕，"
         "不要只看开头、结尾或采样片段。"
         "先在内部列出 5-8 个有潜力的原话钩子，按话题感、画面感、"
         "反常识程度和对全片主题的代表性排序，再生成封面标题候选。"
-        "封面标题必须是比表单标题更短但语义完整的句子，"
+        "封面标题必须是语义完整的句子，可以比表单标题更具体，不必刻意压短。"
         "主语、谓语和比喻/冲突对象要保留，目标形态例如"
         "「我们就像在帕罗奥图正中央开马戏团」。"
         "候选必须以具体主体或完整分句主语开头，"
         "不得以「就像」「在」「需要」「带着」这类无主语成分开头。"
-        "标题长度优先 14-18 个字符；超过 18 字时先删除修饰性短语，"
-        "保留主语、比喻核心和地点，不得保留「带着一帮工程师」这类可删修饰。"
+        "标题长度优先 18-32 个字符；超过 32 字时先删除修饰性短语，"
+        "保留主语、谓语、比喻核心和地点，不得保留「带着一帮工程师」这类可删修饰。"
         "「正中央」这类承担画面强度的定位词必须保留。"
         "这个例子只学结构，不得把示例事实带入当前字幕。"
         "优先选具体画面、比喻、冲突或人物立场强烈的原话；"
@@ -1166,11 +1376,12 @@ def _generate_cover_title_from_full_subtitle(
         "不得输出无语境的反常识短语或名词短语拼接。"
         "复述要保留原句的具体对象和语气，不得引入字幕外事实，"
         "不得使用市井口语、夸张营销或AI套话。"
-        "标题长度 12-48 个字符，优先 14-18 个字符。"
+        "标题长度 12-48 个字符，优先 18-32 个字符。"
         "每个候选给出 1-2 条 evidence，必须逐字复制字幕原文。"
         "只输出 JSON："
         '{"central_claim":"...","candidates":['
         '{"title":"...","evidence":["..."]}]}'
+        f"\n{title_context}"
         f"\n\n完整字幕：\n{full_subtitle_text}"
     )
 
@@ -1184,7 +1395,9 @@ def _generate_cover_title_from_full_subtitle(
                 "请只修正标题措辞和 evidence，保持钩子不变。"
             )
         try:
-            raw = llm_client.generate_content(prompt, model_name=model_name)
+            raw = llm_client.generate_content(
+                prompt, model_name=model_name, provider=provider
+            )
             _central_claim, candidates = parse_llm_title_candidates(raw)
             valid_candidates = []
             candidate_errors = []
@@ -1193,6 +1406,8 @@ def _generate_cover_title_from_full_subtitle(
                     title = _normalize_cover_simile_title(title, full_subtitle_text)
                     if _cover_title_has_quality_issue(title):
                         raise SubtitleTitleError("封面标题不是完整短句")
+                    if _cover_title_repeats_form_title(title, form_title):
+                        raise SubtitleTitleError("封面标题复写表单标题")
                     validate_title_from_subtitle(
                         title,
                         full_subtitle_text,
@@ -1210,6 +1425,7 @@ def _generate_cover_title_from_full_subtitle(
                     title = item[0]
                     compact_title = re.sub(r"\s+", "", title)
                     score = 0.0
+                    score += 0.5 * _title_reference_coverage(title, source_title)
                     # The model orders its strongest hooks first. Local scoring
                     # only corrects obvious filler and abstract-business bias.
                     score -= index * 0.25
@@ -1219,9 +1435,9 @@ def _generate_cover_title_from_full_subtitle(
                         score += 1.0
                     if any(marker in title for marker in ("就像", "像")):
                         score += 2.0
-                    if 12 <= len(title) <= 18:
+                    if 18 <= len(title) <= 32:
                         score += 3.0
-                    elif 12 <= len(title) <= 24:
+                    elif 14 <= len(title) <= 36:
                         score += 1.0
                     # A concrete scene or metaphor is the cover's strongest
                     # hook. Ordinary business contrasts remain valid candidates
@@ -1229,7 +1445,8 @@ def _generate_cover_title_from_full_subtitle(
                     scene_markers = (
                         "马戏团", "帕罗奥图", "工程师", "西装", "被车撞",
                         "战争", "武器", "核弹", "恐怖", "袭击", "网络攻击",
-                        "欺诈", "算法", "人脑", "大脑",
+                        "欺诈", "算法", "人脑", "大脑", "深水区", "警局",
+                        "医院", "前线", "病房", "临床",
                     )
                     if any(marker in title for marker in scene_markers):
                         score += 6.0
@@ -1265,11 +1482,396 @@ def _extract_chinese_subtitle_lines(full_subtitle_text):
     return "\n".join(lines)
 
 
+_PROPER_NOUN_ASR_CORRECTIONS = {
+    "Ermann": "Ermon",
+    "Walkwest": "Wahlquist",
+}
+
+
+def _correct_known_asr_proper_nouns(value):
+    """Apply deterministic ASR corrections before metadata generation."""
+    corrected = str(value or "")
+    for wrong, right in _PROPER_NOUN_ASR_CORRECTIONS.items():
+        corrected = re.sub(
+            rf"(?<![A-Za-z]){re.escape(wrong)}(?![A-Za-z])",
+            right,
+            corrected,
+        )
+    return corrected
+
+
+def _metadata_text_issues(text, subtitle_text, video_path):
+    """Check generated metadata against subtitle and filename proper nouns."""
+    value = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not value:
+        return ["description is empty"]
+    if any(fragment in value for fragment in ("快么服务", "集成么服务", "么服务")):
+        return ["description contains a truncated service fragment"]
+    for wrong in _PROPER_NOUN_ASR_CORRECTIONS:
+        if re.search(rf"(?<![A-Za-z]){re.escape(wrong)}(?![A-Za-z])", value):
+            return [f"known ASR proper noun misspelling: {wrong}"]
+
+    allowed_text = (
+        re.sub(r"\s+", " ", str(subtitle_text or ""))
+        + " "
+        + os.path.basename(str(video_path or ""))
+    ).casefold()
+    allowed_text = re.sub(r"[^a-z0-9'\- ]+", " ", allowed_text)
+    allowed_tokens = set(allowed_text.split())
+
+    # A Chinese summary should only introduce English tokens that are proper
+    # nouns. Common sentence words are ignored so an English fallback summary
+    # is not rejected merely for grammar words.
+    ignored = {"a", "an", "and", "as", "at", "for", "in", "of", "on", "the", "to", "with"}
+    tokens = re.findall(r"(?<![A-Za-z0-9])[A-Z][A-Za-z0-9'-]*(?![A-Za-z0-9])", value)
+    unsupported = []
+    for token in tokens:
+        normalized = token.casefold().strip("'-")
+        if not normalized or normalized in ignored:
+            continue
+        if normalized not in allowed_tokens:
+            unsupported.append(token)
+    return [f"unsupported proper noun: {token}" for token in unsupported]
+
+
+def _extract_source_title(video_path):
+    """Recover the publisher title from an info file or the video filename."""
+    path = str(video_path or "")
+    directory = os.path.dirname(path) or "."
+    base = os.path.splitext(os.path.basename(path))[0]
+    base = re.sub(r"_hardsub$", "", base)
+
+    info_candidates = [os.path.join(directory, base + ".info.json")]
+    info_candidates.extend(glob.glob(os.path.join(directory, "*.info.json")))
+    for info_path in info_candidates:
+        try:
+            with open(info_path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            title = str(data.get("title") or "").strip()
+            normalized_title = re.sub(r"[\s_\-]+", " ", title).strip().casefold()
+            if title and normalized_title not in {
+                "video", "hardsub", "video hardsub", "output", "untitled",
+            }:
+                return title
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+
+    # Downloaded names normally end with the video id and quality labels.
+    for _ in range(2):
+        base = re.sub(r"\s*\[[^\]]+\]\s*$", "", base).strip()
+    base = base.replace("_", " ")
+    value = re.sub(r"\s+", " ", base).strip()
+    normalized = value.casefold()
+    return "" if normalized in {
+        "video", "hardsub", "video hardsub", "output", "untitled",
+    } else value
+
+
+def _fallback_bili_title_from_source_title(source_title, max_chars):
+    """Use the publisher title when model and subtitle titles both fail."""
+    value = re.sub(r"\s+", " ", str(source_title or "")).strip()
+    if not value:
+        return ""
+    if len(value) > max_chars:
+        cut = value.rfind(" ", 0, max_chars + 1)
+        if cut < max_chars // 2:
+            cut = max_chars
+        value = value[:cut].rstrip(" .,:;!?")
+    return value
+
+
+def _fallback_wechat_title_from_source_title(source_title, max_chars):
+    """Keep a word-boundary prefix of the publisher title for WeChat."""
+    value = _fallback_bili_title_from_source_title(source_title, max_chars)
+    return sanitize_wechat_title(value, max_chars=max_chars)
+
+
+_SUBTITLE_HOOK_MARKERS = (
+    "穿针引线", "结缔组织", "筋膜", "烂掉", "裁掉", "人格分裂",
+    "深水区", "马戏团", "正中央", "没有销售", "不招销售", "不做服务",
+    "一半", "断了", "没了",
+)
+_GENERIC_TITLE_MARKERS = (
+    "帮助", "贡献", "展现价值", "时代", "生态", "可靠", "赋能",
+    "打造", "构建", "保障", "创新", "从业者",
+)
+
+
+def _clean_subtitle_hook_line(line):
+    """Turn one subtitle line into a headline-shaped local fallback."""
+    value = re.sub(r"\s+", " ", str(line or "")).strip()
+    value = value.strip("“”\"' 　")
+    value = re.sub(r"^(?:嗯|哦|对|就是)[，,：: ]+", "", value)
+    return value.rstrip(" 。.！!？?；;，,、")
+
+
+def _subtitle_hook_score(value):
+    """Prefer concrete images and consequences over generic value claims."""
+    score = 0.0
+    score += 16.0 * sum(
+        marker in value
+        for marker in ("结缔组织", "筋膜", "马戏团", "正中央", "深水区")
+    )
+    score += 8.0 * sum(
+        marker in value
+        for marker in _SUBTITLE_HOOK_MARKERS
+    )
+    score += 4.0 * sum(marker in value for marker in ("被", "没了", "断了"))
+    score -= 10.0 * sum(marker in value for marker in _GENERIC_TITLE_MARKERS)
+    if re.search(r"[?？]$", value):
+        score -= 8.0
+    if len(value) < 12:
+        score -= 4.0
+    return score
+
+
+def _compress_subtitle_hook_for_wechat(line, max_chars):
+    """Compress one grounded subtitle hook into WeChat's 16-character limit."""
+    value = _clean_subtitle_hook_line(line)
+    # Subtitles often break in the middle of an enumeration. The first clause
+    # is the complete hook; the truncated remainder belongs to the next line.
+    if "、" in value:
+        value = value.split("、", 1)[0]
+    replacements = (
+        ("有一半的工作是在当", "一半是在"),
+        ("有一半工作是", "一半是"),
+        ("有一半的工作是", "一半是"),
+        ("是在当", "是在"),
+        ("的人", ""),
+        ("的时候", ""),
+    )
+    for old, new in replacements:
+        value = value.replace(old, new)
+    value = value.rstrip("的了着")
+    if not value or len(value) > max_chars:
+        return ""
+    candidate = sanitize_wechat_title(value, max_chars=max_chars)
+    if (
+        not candidate
+        or candidate == "未命名视频"
+        or any(marker in candidate for marker in _GENERIC_TITLE_MARKERS)
+    ):
+        return ""
+    return candidate
+
+
+def _fallback_consequence_wechat_title(subtitle_text, form_title, max_chars):
+    """Turn a transcript cause and consequence into a short form title."""
+    subject = _extract_bili_title_subject(form_title)
+    compact_text = re.sub(r"\s+", "", str(subtitle_text or ""))
+    if not subject:
+        return ""
+    if not re.search(r"被.{0,8}裁掉", compact_text) or "烂掉" not in compact_text:
+        return ""
+    candidate = f"{subject}被裁后组织会烂掉"
+    candidate = sanitize_wechat_title(candidate, max_chars=max_chars)
+    if (
+        len(candidate) <= max_chars
+        and not _shared_title_has_quality_issue(candidate)
+        and subject in candidate
+    ):
+        return candidate
+    return ""
+
+
+def _fallback_consequence_cover_title(subtitle_text):
+    """Combine a metaphor loss with its later consequence in the transcript."""
+    compact_text = re.sub(r"\s+", "", str(subtitle_text or ""))
+    match = re.search(r"没了([\u4e00-\u9fff]{1,6})，([^，。？！]{1,20})", compact_text)
+    if not match or "烂掉" not in compact_text:
+        return ""
+    lost_object = match.group(1)
+    affected = match.group(2).replace("、", "")
+    candidate = f"没了{lost_object}，{affected}慢慢烂掉"
+    if 12 <= len(candidate) <= 48 and not _cover_title_has_quality_issue(candidate):
+        return candidate
+    return ""
+
+
+def _fallback_wechat_title_from_subtitle(
+    subtitle_text,
+    max_chars=16,
+    form_title=None,
+):
+    """Choose a concrete transcript hook when the title model times out."""
+    candidates = []
+    consequence_title = _fallback_consequence_wechat_title(
+        subtitle_text,
+        form_title,
+        max_chars,
+    )
+    if consequence_title:
+        candidates.append((24.0, consequence_title))
+    for line in str(subtitle_text or "").splitlines():
+        cleaned = _clean_subtitle_hook_line(line)
+        if not any(marker in cleaned for marker in _SUBTITLE_HOOK_MARKERS):
+            continue
+        candidate = _compress_subtitle_hook_for_wechat(cleaned, max_chars)
+        if candidate:
+            score = _subtitle_hook_score(candidate)
+            if candidate.startswith("我们"):
+                score -= 6.0
+            if "数据治理" in candidate:
+                score += 6.0
+            candidates.append((score, candidate))
+    if not candidates:
+        return ""
+    return max(
+        candidates,
+        key=lambda item: (
+            not item[1].startswith("我们"),
+            "数据治理" in item[1],
+            item[0],
+            len(item[1]),
+        ),
+    )[1]
+
+
+def _fallback_cover_title_from_subtitle(
+    subtitle_text,
+    form_title=None,
+    max_chars=48,
+):
+    """Use a complete subtitle hook instead of repeating the form title."""
+    candidates = []
+    consequence_cover = _fallback_consequence_cover_title(subtitle_text)
+    if consequence_cover and not _cover_title_repeats_form_title(
+        consequence_cover,
+        form_title,
+    ):
+        candidates.append((100.0, consequence_cover))
+    for line in str(subtitle_text or "").splitlines():
+        cleaned = _clean_subtitle_hook_line(line)
+        if "、" in cleaned:
+            first_clause = cleaned.split("、", 1)[0]
+            if len(first_clause) >= 12:
+                cleaned = first_clause
+        if not 12 <= len(cleaned) <= max_chars:
+            continue
+        if not any(marker in cleaned for marker in _SUBTITLE_HOOK_MARKERS):
+            continue
+        if _cover_title_has_quality_issue(cleaned):
+            continue
+        if _cover_title_repeats_form_title(cleaned, form_title):
+            continue
+        candidates.append((_subtitle_hook_score(cleaned), cleaned))
+    if not candidates:
+        return ""
+    return max(candidates, key=lambda item: (item[0], len(item[1])))[1]
+
+
+def _persist_upload_metadata(workdir, metadata):
+    """Write generated upload metadata atomically for review and reuse."""
+    if not metadata:
+        return
+    path = os.path.join(workdir, "upload_metadata.json")
+    temp_path = f"{path}.tmp"
+    try:
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            json.dump(metadata, handle, ensure_ascii=False, indent=2)
+        os.replace(temp_path, path)
+    except Exception:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+
+
+def _load_upload_metadata(workdir):
+    """Load persisted metadata so retries do not regenerate completed fields."""
+    path = os.path.join(workdir, "upload_metadata.json")
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _fallback_bili_title_from_description(description, max_chars):
+    """Build a conservative shared title when title-model calls time out."""
+    value = re.sub(r"\s+", " ", str(description or "")).strip()
+    if not value:
+        return ""
+
+    subject_match = re.search(r"((?:[A-Za-z][A-Za-z0-9'&.-]*\s*)?员工)", value)
+    if subject_match and "：" in value:
+        before_colon, after_colon = value.split("：", 1)
+        if "被" in before_colon:
+            hook = re.split(r"[。！？\n]", before_colon)[-1]
+        else:
+            hook = after_colon
+        hook = re.split(r"[。！？\n]", hook, maxsplit=1)[0]
+        hook = re.split(r"[，,；;]", hook, maxsplit=1)[0]
+        hook = hook.replace("“", "").replace("”", "")
+        value = f"{subject_match.group(1)}谈{hook}"
+    else:
+        first_sentence = re.split(r"[。！？\n]", value, maxsplit=1)[0]
+        if "：" in first_sentence:
+            prefix, remainder = first_sentence.split("：", 1)
+            first_clause = re.split(r"[，,；;]", remainder, maxsplit=1)[0]
+            value = f"{prefix}{first_clause}"
+        else:
+            value = re.split(r"[，,；;]", first_sentence, maxsplit=1)[0]
+
+    value = value.replace("“", "").replace("”", "")
+    value = value.replace("现身说法", "谈")
+    if value.startswith("几位 "):
+        value = value[len("几位 "):]
+
+    if len(value) > max_chars:
+        cut = value.rfind(" ", 0, max_chars)
+        if cut < max_chars // 2:
+            cut = max_chars
+        value = value[:cut].rstrip(" ：:，,。.！!？?；;")
+    return normalize_bili_upload_title(value, max_chars=max_chars)
+
+
+def _fallback_wechat_title_from_bili_title(bili_title, max_chars):
+    """Compress the local Bilibili fallback without another model call."""
+    value = re.sub(r"\s+", " ", str(bili_title or "")).strip()
+    marker = value.find("谈")
+    if marker <= 0:
+        return ""
+
+    subject = re.sub(r"\s+", "", value[:marker])
+    body = re.sub(r"\s+", "", value[marker + len("谈"):])
+    body = re.sub(r"一上来就?", "", body)
+    parts = re.split(r"(?:即被|就被|被|[，,；;：:])", body, maxsplit=1)
+    prefix = parts[0]
+    suffix = parts[1] if len(parts) > 1 else ""
+    if suffix:
+        suffix = re.sub(r"^(?:扔进|丢进|放进)", "", suffix)
+        if len(prefix) + len(suffix) <= max_chars - len(subject) - len("谈"):
+            body = prefix + suffix
+        else:
+            body = prefix
+    else:
+        body = prefix
+    remaining = max_chars - len(subject) - len("谈")
+    if remaining <= 0:
+        return ""
+    body = body[:remaining].rstrip("的了着")
+    candidate = f"{subject}谈{body}"
+    return normalize_shared_upload_title(candidate, max_chars=max_chars)
+
+
+def _fallback_cover_title(meta):
+    """Reuse the shortest validated shared title as the cover headline."""
+    for key in ("wechat_title", "title"):
+        value = re.sub(r"\s+", " ", str(meta.get(key) or "")).strip()
+        if 12 <= len(value) <= 48 and not _cover_title_has_quality_issue(value):
+            return value
+    return ""
+
+
 def generate_upload_metadata(
     workdir,
     on_log=None,
     bili_title_max_chars=BILI_UPLOAD_TITLE_MAX_CHARS,
     wechat_title_max_chars=SHARED_UPLOAD_TITLE_MAX_CHARS,
+    llm_model=None,
+    llm_provider=None,
 ):
     """Generate Bilibili/WeChat form titles and shared upload metadata.
 
@@ -1286,36 +1888,71 @@ def generate_upload_metadata(
         _log(f"⚠️ [MetaGen] subtitle_title import failed: {e}")
         return None
     try:
-        from llm_utils import get_client as _get_llm_client
+        from llm_utils import get_client as _get_llm_client, LLMProvider
         llm_client = _get_llm_client()
     except Exception:
         llm_client = None
-    model, vendor = _load_llm_defaults()
+    default_model, default_provider = _load_llm_defaults()
+    model = str(llm_model or default_model or "glm-5.2")
+    provider_name = str(llm_provider or default_provider or "dashscope").strip().lower()
+    provider = None
+    if llm_client is not None:
+        try:
+            provider = LLMProvider(provider_name)
+        except ValueError:
+            provider = None
     hardsub_path = find_hardsub_video(workdir)
     if not hardsub_path:
         _log("⚠️ [MetaGen] No hardsub video found")
         return None
-    meta = {}
+    meta = _load_upload_metadata(workdir)
     sub_text = None
     full_sub_text = None
+    source_title = _extract_source_title(hardsub_path)
+    if source_title:
+        meta["source_title"] = source_title
+
+    required_fields = ("title", "wechat_title", "description", "cover_title")
+    if all(str(meta.get(field) or "").strip() for field in required_fields):
+        return meta
 
     # Generate the description first. The form title is a compressed version of
     # this summary, so sharing its first sentence keeps the title tied to the
     # whole video instead of one striking transcript fragment.
     try:
         full_sub_text, _full_sub_path = read_full_subtitle_text(hardsub_path)
+        full_sub_text = _correct_known_asr_proper_nouns(full_sub_text)
         sub_text = _extract_chinese_subtitle_lines(full_sub_text)
         if sub_text and llm_client:
             prompt = (
                 "根据以下视频字幕，写一段100-200字的视频简介。简洁有力，概括核心内容，不要AI味。\n\n"
+                "视频原标题只作题材和场景参考，不是唯一事实来源。"
+                "简介应先判断字幕实际主线，再吸收原标题中的场景或受益者。"
+                f"\n视频原标题：\n{source_title}\n\n"
                 "所有数字、金额、时间和公司关系必须逐字来自字幕；"
-                "不得换算数量级，也不得新增字幕没有的事实。\n\n"
+                "不得换算数量级，也不得新增字幕没有的事实。\n"
+                "英文人名、公司名、产品名必须逐字使用字幕或视频文件名中的拼写，"
+                "不得改拼、音译回英文或使用相近姓氏。\n\n"
                 f"{sub_text}\n\n只输出简介内容。"
             )
-            desc = llm_client.generate_content(prompt, model_name=model)
-            if desc and desc.strip():
-                meta["description"] = desc.strip()
-                _log(f">>> [MetaGen] 简介: {desc.strip()[:60]}...")
+            for _attempt in range(2):
+                desc = llm_client.generate_content(
+                    prompt, model_name=model, provider=provider
+                )
+                desc = re.sub(r"\s+", " ", str(desc or "")).strip()
+                issues = _metadata_text_issues(desc, full_sub_text, hardsub_path)
+                if not issues:
+                    meta["description"] = desc
+                    _log(f">>> [MetaGen] 简介: {desc[:60]}...")
+                    break
+                _log(f"⚠️ [MetaGen] Description rejected: {'；'.join(issues)}")
+                prompt = (
+                    "上一轮简介未通过专有名词溯源校验："
+                    f"{'；'.join(issues)}。\n"
+                    "请保留原概括，只修正这些英文专名；"
+                    "无法确认的英文专名改用中文字幕中的既有译名。\n\n"
+                    f"{prompt}"
+                )
     except Exception as e:
         _log(f"⚠️ [MetaGen] Description generation failed: {e}")
 
@@ -1331,6 +1968,8 @@ def generate_upload_metadata(
                 llm_client,
                 model,
                 bili_title_max_chars,
+                provider,
+                source_title=source_title,
             )
             if summary_title:
                 meta["title"] = summary_title
@@ -1361,6 +2000,13 @@ def generate_upload_metadata(
             )
             if description_context:
                 platform_hint += f"视频简介第一句：{description_context}"
+            if source_title:
+                platform_hint += (
+                    "视频原标题只作题材和场景参考，不是唯一事实来源。"
+                    "若字幕反复聚焦另一个主体，优先反映字幕主线，"
+                    "并保留原标题中有用的场景或受益者。"
+                    f"视频原标题：{source_title}"
+                )
             grounded = build_subtitle_grounded_title(
                 hardsub_path, llm_client=llm_client, model_name=model,
                 max_title_chars=bili_title_max_chars,
@@ -1370,6 +2016,7 @@ def generate_upload_metadata(
                 ),
                 platform_hint=platform_hint,
                 title_style="plain",
+                provider=provider,
             )
             fallback_title = normalize_bili_upload_title(
                 grounded.title,
@@ -1383,6 +2030,22 @@ def generate_upload_metadata(
         except Exception as e:
             _log(f"⚠️ [MetaGen] Fallback Bilibili title generation failed: {e}")
 
+    if not meta.get("title"):
+        fallback_title = _fallback_bili_title_from_source_title(
+            source_title,
+            max_chars=bili_title_max_chars,
+        )
+        fallback_source = "原标题"
+        if not fallback_title:
+            fallback_title = _fallback_bili_title_from_description(
+                meta.get("description"),
+                max_chars=bili_title_max_chars,
+            )
+            fallback_source = "本地"
+        if fallback_title:
+            meta["title"] = fallback_title
+            _log(f">>> [MetaGen] B站标题 ({fallback_source}兜底): {fallback_title}")
+
     # 2. WeChat form title, derived from the Bilibili title rather than
     # regenerating a separate theme under a tighter character budget.
     if meta.get("title") and meta.get("description") and sub_text and llm_client:
@@ -1394,12 +2057,38 @@ def generate_upload_metadata(
                 llm_client,
                 model,
                 max_chars=wechat_title_max_chars,
+                provider=provider,
+                source_title=source_title,
             )
             if wechat_title:
                 meta["wechat_title"] = wechat_title
                 _log(f">>> [MetaGen] 视频号标题: {wechat_title}")
         except Exception as e:
             _log(f"⚠️ [MetaGen] WeChat title generation failed: {e}")
+
+    if not meta.get("wechat_title") and meta.get("title"):
+        fallback_wechat_title = _fallback_wechat_title_from_subtitle(
+            sub_text,
+            max_chars=wechat_title_max_chars,
+            form_title=meta.get("title"),
+        )
+        fallback_source = "字幕钩子"
+        if not fallback_wechat_title:
+            fallback_wechat_title = _fallback_wechat_title_from_bili_title(
+                meta["title"],
+                max_chars=wechat_title_max_chars,
+            )
+            fallback_source = "本地"
+        if not fallback_wechat_title and source_title:
+            fallback_wechat_title = _fallback_wechat_title_from_source_title(
+                source_title,
+                max_chars=wechat_title_max_chars,
+            )
+            fallback_source = "原标题"
+        if fallback_wechat_title:
+            meta["wechat_title"] = fallback_wechat_title
+            _log(f">>> [MetaGen] 视频号标题 ({fallback_source}兜底): {fallback_wechat_title}")
+
     # 3. Cover title (editorial headline style)
     try:
         cover_title = _generate_cover_title_from_full_subtitle(
@@ -1408,14 +2097,40 @@ def generate_upload_metadata(
             model,
             min_chars=12,
             max_chars=48,
+            provider=provider,
+            form_title=meta.get("title"),
+            source_title=source_title,
         )
         if cover_title:
             meta["cover_title"] = cover_title
             _log(f">>> [MetaGen] 封面标题: {cover_title}")
     except Exception as e:
         _log(f"⚠️ [MetaGen] Cover title generation failed: {e}")
+
+    if not meta.get("cover_title"):
+        fallback_cover_title = _fallback_cover_title_from_subtitle(
+            sub_text,
+            form_title=meta.get("title"),
+            max_chars=48,
+        )
+        fallback_source = "字幕钩子"
+        if not fallback_cover_title:
+            fallback_cover_title = _fallback_cover_title(meta)
+            fallback_source = "本地"
+        if not fallback_cover_title and source_title:
+            fallback_cover_title = _fallback_bili_title_from_source_title(
+                source_title,
+                max_chars=48,
+            )
+            fallback_source = "原标题"
+        if fallback_cover_title:
+            meta["cover_title"] = fallback_cover_title
+            _log(f">>> [MetaGen] 封面标题 ({fallback_source}兜底): {fallback_cover_title}")
+
     if not meta.get("title"):
+        _persist_upload_metadata(workdir, meta)
         return meta
+    _persist_upload_metadata(workdir, meta)
     return meta if meta else None
 
 # --- WeChat Channels Upload (canonical implementation; batch engine + GUI reuse this) ---
@@ -1435,17 +2150,32 @@ def get_wechat_upload_skip_reason(workdir):
         return f"cannot read duration: {os.path.basename(hardsub_path)}"
     if duration > WECHAT_MAX_UPLOAD_SECONDS:
         return (
-            f"video is {duration / 60:.1f} min, exceeding the "
-            f"{WECHAT_MAX_UPLOAD_SECONDS // 60}-min limit"
+            f"视频时长 {duration / 60:.1f} 分钟，超过视频号 "
+            f"{WECHAT_MAX_UPLOAD_SECONDS // 60} 分钟限制"
         )
     return None
 
-def build_wechat_cmd(workdir, title=None, desc=None, tags=None, public=False, cover_title=None):
+def build_wechat_cmd(
+    workdir,
+    title=None,
+    desc=None,
+    tags=None,
+    public=False,
+    cover_title=None,
+    llm_model=None,
+    llm_provider=None,
+    require_complete_metadata=False,
+):
     """Build the WeChat Channels upload command for the hardsub video in workdir.
     Description/tags are auto-generated by the skill unless explicitly overridden.
     The default action saves a draft; public publishing requires an explicit flag."""
     skip_reason = get_wechat_upload_skip_reason(workdir)
     if skip_reason:
+        return None
+    metadata_values = (title, desc, cover_title)
+    if require_complete_metadata and not all(
+        str(value or "").strip() for value in metadata_values
+    ):
         return None
     hardsub_path = find_hardsub_video(workdir)
     # Omit the title by default so wechat_upload.py generates it from the
@@ -1462,6 +2192,10 @@ def build_wechat_cmd(workdir, title=None, desc=None, tags=None, public=False, co
         cmd.extend(["--cover-title", str(cover_title).strip()])
     if _pre_generated:
         cmd.append("--no_auto_title")
+    if llm_model:
+        cmd.extend(["--llm-model", str(llm_model)])
+    if llm_provider:
+        cmd.extend(["--llm-provider", str(llm_provider)])
     if public:
         cmd.append("--public")
     # Login is a separate, visible one-time `--login` flow. Normal uploads use
@@ -1529,7 +2263,19 @@ def run_wechat_cmd(cmd, on_progress=None, on_log=None, abort_flag=None):
     p.wait()
     return p.returncode == 0
 
-def trigger_wechat_upload(workdir, title=None, desc=None, tags=None, public=False, cover_title=None, on_progress=None, on_log=None, abort_flag=None):
+def trigger_wechat_upload(
+    workdir,
+    title=None,
+    desc=None,
+    tags=None,
+    public=False,
+    cover_title=None,
+    llm_model=None,
+    llm_provider=None,
+    on_progress=None,
+    on_log=None,
+    abort_flag=None,
+):
     """Build and run a WeChat Channels upload for the hardsub video in workdir."""
     _log = on_log or (lambda msg: print(msg, flush=True))
     skip_reason = get_wechat_upload_skip_reason(workdir)
@@ -1537,7 +2283,14 @@ def trigger_wechat_upload(workdir, title=None, desc=None, tags=None, public=Fals
         _log(f"⚠️  [WeChat] upload skipped ({skip_reason})")
         return False
     cmd = build_wechat_cmd(
-        workdir, title=title, desc=desc, tags=tags, public=public, cover_title=cover_title
+        workdir,
+        title=title,
+        desc=desc,
+        tags=tags,
+        public=public,
+        cover_title=cover_title,
+        llm_model=llm_model,
+        llm_provider=llm_provider,
     )
     if not cmd:
         _log("⚠️  [WeChat] upload skipped (command could not be built)")
@@ -1565,6 +2318,8 @@ def run_post_processing_uploads(
     bili_cover_title=None,
     wechat_cover_title=None,
     wechat_public=False,
+    llm_model=None,
+    llm_provider=None,
 ):
     """Run GD/BI/WX uploads together and share BI/WX metadata."""
     need_sync = bool(sync_gdrive) and not os.path.exists(os.path.join(workdir, ".synced"))
@@ -1590,10 +2345,18 @@ def run_post_processing_uploads(
             workdir,
             bili_title_max_chars=BILI_UPLOAD_TITLE_MAX_CHARS,
             wechat_title_max_chars=SHARED_UPLOAD_TITLE_MAX_CHARS,
+            llm_model=llm_model,
+            llm_provider=llm_provider,
         )
 
     bili_kwargs = {}
     wechat_kwargs = {"public": wechat_public}
+    if llm_model:
+        bili_kwargs["llm_model"] = llm_model
+        wechat_kwargs["llm_model"] = llm_model
+    if llm_provider:
+        bili_kwargs["llm_provider"] = llm_provider
+        wechat_kwargs["llm_provider"] = llm_provider
     if shared_uploads and not meta:
         print("❌ [MetaGen] shared metadata generation failed; BI/WX uploads stopped", flush=True)
         need_bili = False
@@ -1987,7 +2750,7 @@ def transcribe_video(video_path, workdir, model="large-v2", quick=False, multila
         return None
     except: return None
 
-def merge_bilingual(src_srt, zh_srt, main_lang="cn", llm_model="gemini-3.1-pro-preview"):
+def merge_bilingual(src_srt, zh_srt, main_lang="cn", llm_model=DEFAULTS.get("llm_model", "glm-5.3")):
     print(f"🔀 Smart-Merging into bilingual SRT...")
     bi_path = src_srt[:-7] + ".bi.srt" if src_srt.lower().endswith(".en.srt") else src_srt.replace(".srt", ".bi.srt")
     
@@ -2350,9 +3113,9 @@ def main():
     parser.add_argument("--max-api-calls", type=int, default=20, help="Global concurrency limit for Translation APIs")
 
     parser.add_argument("--model", default=DEFAULTS.get("whisper_model", DEFAULTS.get("model", "large-v2")))
-    parser.add_argument("--llm-model", default=DEFAULTS.get("llm_model", "gemini-3-flash-preview"), help="LLM Model")
-    default_provider = VENDOR_MAP.get(DEFAULTS.get("llm_vendor", ""), None)
-    parser.add_argument("--llm-provider", default=default_provider, help="Explicit LLM Provider (e.g., dashscope, vertex)")
+    default_llm_model, default_llm_provider = _load_llm_defaults()
+    parser.add_argument("--llm-model", default=default_llm_model, help="LLM Model")
+    parser.add_argument("--llm-provider", default=default_llm_provider, help="Explicit LLM Provider (e.g., dashscope, vertex)")
     parser.add_argument("--style", default=DEFAULTS.get("style", "auto"))
     parser.add_argument("--trans-mode", default=DEFAULTS.get("trans_mode", "balanced"), choices=["paraphrase", "balanced"])
     parser.add_argument("--cookies")
@@ -2517,6 +3280,8 @@ def main():
             bili_cover_title=getattr(args, 'bili_cover_title', None),
             wechat_cover_title=getattr(args, 'wechat_cover_title', None),
             wechat_public=getattr(args, 'wechat_public', False),
+            llm_model=getattr(args, 'llm_model', None),
+            llm_provider=getattr(args, 'llm_provider', None),
         )
         print("✅ Upload-only complete!", flush=True)
         return
@@ -2775,6 +3540,8 @@ def main():
         bili_cover_title=getattr(args, 'bili_cover_title', None),
         wechat_cover_title=getattr(args, 'wechat_cover_title', None),
         wechat_public=getattr(args, 'wechat_public', False),
+        llm_model=getattr(args, 'llm_model', None),
+        llm_provider=getattr(args, 'llm_provider', None),
     )
 
     return 0

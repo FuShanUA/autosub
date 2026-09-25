@@ -36,13 +36,13 @@ class FakeLLM:
         self.response = response
         self.calls = []
 
-    def generate_content(self, prompt, model_name=None):
-        self.calls.append((prompt, model_name))
+    def generate_content(self, prompt, model_name=None, provider=None):
+        self.calls.append((prompt, model_name, provider))
         return self.response
 
 
 class ExplodingLLM:
-    def generate_content(self, prompt, model_name=None):
+    def generate_content(self, prompt, model_name=None, provider=None):
         raise RuntimeError("network unavailable")
 
 
@@ -197,6 +197,48 @@ class TestSubtitleTitle(unittest.TestCase):
         self.assertIn("目标是高度概括全片内容", plain_prompt)
         self.assertIn("目标是吸引人点开观看", cover_prompt)
 
+    def test_plain_prompt_requires_full_video_summary_before_title(self):
+        prompt = _llm_prompt(
+            "开场介绍Palantir。中间讲数据整合。结尾讲工程团队。",
+        )
+        self.assertIn("60-100 个字符的全片摘要", prompt)
+        self.assertIn("如实覆盖开场问题、主要过程、关键转折和结尾立场", prompt)
+        self.assertIn("禁止只概括最后一段", prompt)
+        self.assertIn("像视频简介的第一句", prompt)
+
+    def test_cover_prompt_prioritizes_quote_hooks_from_whole_dialogue(self):
+        prompt = _llm_prompt(
+            "做企业软件就像在帕罗奥图开马戏团。Palantir把数据整合做成产品。",
+            title_style="cover_headline",
+        )
+        self.assertIn("通读全部字幕", prompt)
+        self.assertIn("最吸引人、最出位、最有画面的原话钩子", prompt)
+        self.assertIn("不要默认选结尾", prompt)
+        self.assertIn("前 3 个必须是原话钩子", prompt)
+        self.assertIn("尽量逐字保留字幕措辞", prompt)
+
+    def test_cover_scoring_prefers_exact_quote_hook_over_summary(self):
+        subtitle_text = (
+            "做企业软件就像在帕罗奥图正中央开马戏团。"
+            "Palantir把数据整合和隐私保护做成产品。"
+        )
+        claim = "Palantir把数据整合和隐私保护做成产品"
+        quote = _score_title_candidate(
+            "做企业软件就像在帕罗奥图开马戏团",
+            ("做企业软件就像在帕罗奥图正中央开马戏团",),
+            claim,
+            subtitle_text,
+            title_style="cover_headline",
+        )
+        summary = _score_title_candidate(
+            "Palantir把数据整合做成产品",
+            ("Palantir把数据整合和隐私保护做成产品",),
+            claim,
+            subtitle_text,
+            title_style="cover_headline",
+        )
+        self.assertGreater(quote, summary)
+
     def test_primary_claim_hint_prefers_chinese_lines_in_bilingual_srt(self):
         hint = _primary_claim_hint(self.subtitle)
         self.assertIn("一个FDE最主要的职能", hint)
@@ -252,6 +294,18 @@ class TestSubtitleTitle(unittest.TestCase):
         self.assertTrue(_title_has_quality_issue("Palantir主导应用层掌控产品层产品"))
         self.assertTrue(_title_has_quality_issue("FDE贯通全程支持"))
         self.assertFalse(_title_has_quality_issue("FDE守住核心优势"))
+
+    def test_quality_gate_rejects_broken_subtitle_fragments(self):
+        self.assertTrue(_title_has_quality_issue("等你真的用上快么服务模型，就彻底回不去了"))
+        self.assertTrue(_title_has_quality_issue("用更少token做好工程，以低成本交付集成么服务平台"))
+        self.assertTrue(_title_has_quality_issue("低成本交付么服务"))
+        self.assertFalse(_title_has_quality_issue("Databricks交付集成服务平台"))
+
+    def test_prompt_rejects_truncated_service_fragments(self):
+        prompt = _llm_prompt("怎么服务这些模型，怎么造运行这些")
+        self.assertIn("快么服务", prompt)
+        self.assertIn("集成么服务", prompt)
+        self.assertIn("必须拒绝", prompt)
 
     def test_cover_title_can_select_first_person_hook_from_subtitle(self):
         hook_video = os.path.join(self.temp_dir, "hook_hardsub.mp4")
@@ -314,14 +368,14 @@ class TestSubtitleTitle(unittest.TestCase):
         subtitle_text = "Databricks CEO先找出主要瓶颈，再集中精力疏通。"
         claim = "Databricks CEO先找出主要瓶颈"
         colon = _score_title_candidate(
-            "Databricks CEO：先找出主要瓶颈",
+            "Databricks CEO：先找出主要瓶颈再集中疏通",
             ("先找出主要瓶颈",),
             claim,
             subtitle_text,
             title_style="cover_headline",
         )
         no_colon = _score_title_candidate(
-            "Databricks CEO先找出主要瓶颈",
+            "Databricks CEO先找出主要瓶颈再集中疏通",
             ("先找出主要瓶颈",),
             claim,
             subtitle_text,

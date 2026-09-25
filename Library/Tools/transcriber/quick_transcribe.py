@@ -72,7 +72,7 @@ def fetch_youtube_subs(url, output_dir, cookies=None):
         print(f"❌ Failed to fetch subtitles: {e}")
     return None
 
-def resegment_with_llm(input_srt, output_srt, model="gemini-3-flash-preview"):
+def resegment_with_llm(input_srt, output_srt, model="glm-5.3"):
     """
     Uses LLM to re-segment and polish original YouTube subtitles.
     """
@@ -152,7 +152,7 @@ def main():
     parser.add_argument("url_or_file", help="YouTube URL or local video file")
     parser.add_argument("--output", required=True, help="Output directory")
     parser.add_argument("--cookies", help="Path to cookies.txt")
-    parser.add_argument("--model", default="gemini-3-flash-preview", help="LLM model")
+    parser.add_argument("--model", default="glm-5.3", help="LLM model")
     args = parser.parse_args()
 
     os.makedirs(args.output, exist_ok=True)

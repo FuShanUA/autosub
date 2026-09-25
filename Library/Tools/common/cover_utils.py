@@ -65,6 +65,8 @@ _COVER_BACKGROUND = (216, 8, 0)
 _COVER_TITLE = (255, 255, 255)
 _COVER_SHADOW = (255, 255, 255)
 _TITLE_CENTER_Y_RATIO = 0.62
+_MIN_FRAME_BRIGHTNESS = 40.0
+_SAMPLE_FRAME_COUNT = 16
 
 
 def _normalize_orientation(orientation: str) -> Tuple[str, Tuple[int, int]]:
@@ -181,6 +183,21 @@ def _frame_brightness(path: str) -> float:
     with Image.open(path) as image:
         gray = image.convert("L").resize((64, 64))
         return sum(gray.getdata()) / (64 * 64)
+
+
+def _image_brightness(image: Image.Image) -> float:
+    gray = image.convert("L").resize((64, 64))
+    return sum(gray.getdata()) / (64 * 64)
+
+
+def _frame_is_usable(path: str) -> bool:
+    """Reject tiny files and dark frames before they can become black covers."""
+    try:
+        if not os.path.isfile(path) or os.path.getsize(path) < 3000:
+            return False
+        return _frame_brightness(path) >= _MIN_FRAME_BRIGHTNESS
+    except Exception:
+        return False
 
 
 @functools.lru_cache(maxsize=1)
@@ -327,40 +344,55 @@ def _sample_video_frames(
     temp_dir: str,
     ffmpeg: str,
     duration: Optional[float],
-) -> Tuple[float, list[str]]:
-    """Sample the whole video at low resolution to locate a subject frame."""
-    if not duration or duration <= 0:
-        return 0.0, []
+) -> list[Tuple[float, str]]:
+    """Sample a bounded set of timestamps instead of scanning the whole video.
 
-    sample_fps = min(2.0, max(96.0 / duration, 1.0 / 75.0))
-    pattern = os.path.join(temp_dir, "sample-%04d.jpg")
-    try:
-        subprocess.run(
-            [
-                ffmpeg,
-                "-i",
-                video_path,
-                "-vf",
-                f"fps={sample_fps:.6f},scale=640:-2",
-                "-q:v",
-                "3",
-                pattern,
-                "-y",
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=90,
-            check=False,
-        )
-    except Exception:
-        return sample_fps, []
+    A whole-video low-fps scan can exceed its timeout on long files. Seeking a
+    fixed number of timestamps keeps runtime bounded and avoids the fallback
+    path that previously produced a black cover.
+    """
+    if duration and duration > 0:
+        start = duration * 0.05
+        end = duration * 0.95
+        timestamps = [
+            start + (end - start) * index / (_SAMPLE_FRAME_COUNT - 1)
+            for index in range(_SAMPLE_FRAME_COUNT)
+        ]
+    else:
+        timestamps = [1.0, 5.0, 10.0, 20.0, 30.0, 45.0, 60.0, 90.0]
 
-    frames = sorted(
-        path
-        for path in glob.glob(os.path.join(temp_dir, "sample-*.jpg"))
-        if os.path.getsize(path) > 3000
-    )
-    return sample_fps, frames
+    frames = []
+    for index, timestamp in enumerate(timestamps, start=1):
+        candidate = os.path.join(temp_dir, f"sample-{index:04d}.jpg")
+        try:
+            subprocess.run(
+                [
+                    ffmpeg,
+                    "-ss",
+                    f"{max(0.0, timestamp):.3f}",
+                    "-i",
+                    video_path,
+                    "-frames:v",
+                    "1",
+                    "-vf",
+                    "scale=640:-2",
+                    "-q:v",
+                    "3",
+                    candidate,
+                    "-y",
+                    "-update",
+                    "1",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=15,
+                check=False,
+            )
+        except Exception:
+            continue
+        if _frame_is_usable(candidate):
+            frames.append((max(0.0, timestamp), candidate))
+    return frames
 
 
 def extract_best_frame(video_path: str, output_path: str) -> str:
@@ -373,84 +405,21 @@ def extract_best_frame(video_path: str, output_path: str) -> str:
     os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
     candidates = []
     with tempfile.TemporaryDirectory(prefix="autosub-cover-") as temp_dir:
-        sample_fps, frames = _sample_video_frames(
+        sampled_frames = _sample_video_frames(
             video_path, temp_dir, ffmpeg, duration
         )
-        for frame in frames:
-            candidates.append((_frame_face_score(frame), frame))
+        for timestamp, frame in sampled_frames:
+            candidates.append((_frame_face_score(frame), frame, timestamp))
 
         if not candidates:
-            timestamps = (
-                [duration * ratio for ratio in (0.25, 1 / 3, 0.5)]
-                if duration
-                else [1.0, 5.0, 10.0]
+            raise RuntimeError(
+                "ffmpeg could not extract a bright enough cover frame"
             )
-            for index, timestamp in enumerate(timestamps):
-                candidate = os.path.join(temp_dir, f"frame-{index}.jpg")
-                try:
-                    subprocess.run(
-                        [
-                            ffmpeg,
-                            "-ss",
-                            f"{max(0.0, timestamp):.3f}",
-                            "-i",
-                            video_path,
-                            "-frames:v",
-                            "1",
-                            "-q:v",
-                            "2",
-                            candidate,
-                            "-y",
-                            "-update",
-                            "1",
-                        ],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        timeout=20,
-                        check=False,
-                    )
-                    if os.path.isfile(candidate) and os.path.getsize(candidate) > 5000:
-                        candidates.append((_frame_face_score(candidate), candidate))
-                except Exception:
-                    continue
-
-        if not candidates:
-            fallback = os.path.join(temp_dir, "fallback.jpg")
-            try:
-                subprocess.run(
-                    [
-                        ffmpeg,
-                        "-ss",
-                        "1",
-                        "-i",
-                        video_path,
-                        "-frames:v",
-                        "1",
-                        "-q:v",
-                        "2",
-                        fallback,
-                        "-y",
-                        "-update",
-                        "1",
-                    ],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=20,
-                    check=False,
-                )
-            except Exception:
-                pass
-            if not os.path.isfile(fallback) or os.path.getsize(fallback) < 5000:
-                raise RuntimeError("ffmpeg could not extract a usable cover frame")
-            candidates.append((_frame_face_score(fallback), fallback))
 
         ranked = sorted(candidates, key=lambda item: item[0], reverse=True)
         validated = []
         selected = None
-        for rank, (sample_score, sample_path) in enumerate(ranked[:8], start=1):
-            match = re.search(r"sample-(\d+)\.jpg$", sample_path)
-            frame_index = int(match.group(1)) - 1 if match else 0
-            timestamp = max(0.0, frame_index / sample_fps) if sample_fps else 1.0
+        for rank, (sample_score, sample_path, timestamp) in enumerate(ranked[:8], start=1):
             full_frame = os.path.join(temp_dir, f"validated-{rank}.jpg")
             extracted = False
             try:
@@ -475,10 +444,7 @@ def extract_best_frame(video_path: str, output_path: str) -> str:
                     timeout=25,
                     check=False,
                 )
-                extracted = (
-                    os.path.isfile(full_frame)
-                    and os.path.getsize(full_frame) > 5000
-                )
+                extracted = _frame_is_usable(full_frame)
             except Exception:
                 extracted = False
 
@@ -495,11 +461,7 @@ def extract_best_frame(video_path: str, output_path: str) -> str:
         if selected is None and validated:
             selected = max(validated, key=lambda item: item[0])
         if selected is None:
-            sample_score, sample_path = ranked[0]
-            match = re.search(r"sample-(\d+)\.jpg$", sample_path)
-            frame_index = int(match.group(1)) - 1 if match else 0
-            timestamp = max(0.0, frame_index / sample_fps) if sample_fps else 1.0
-            selected = (sample_score, sample_path, timestamp)
+            raise RuntimeError("ffmpeg could not extract a bright enough cover frame")
 
         best_score, best, timestamp = selected
         shutil.copy2(best, output_path)
@@ -721,8 +683,9 @@ def _truncate_line(line: str, fonts: Tuple[object, object], max_width: int) -> s
 
 
 def _fit_font(title: str, width: int, start_size: int) -> Tuple[Tuple[object, object], Sequence[str]]:
-    # A 2/3-page card needs room for padding; keep the text itself narrower.
-    max_width = int(width * 0.64)
+    # Sentence-style headlines may span nearly the full cover. Keep a small
+    # margin for the card padding and the hard shadow.
+    max_width = int(width * 0.88)
     size = start_size
     while size >= 30:
         fonts = _load_title_fonts(size)
@@ -796,9 +759,11 @@ def _draw_title(
 
     horizontal_padding = max(34, int(fonts[0].size * 0.58))
     vertical_padding = max(20, int(fonts[0].size * 0.34))
+    compact_title_length = len(re.sub(r"\s+", "", str(title)))
+    box_min_ratio = 0.88 if compact_title_length >= 14 else 0.70
     box_width = min(
-        int(width * 0.74),
-        max(int(width * 0.55), text_width + horizontal_padding * 2),
+        int(width * 0.94),
+        max(int(width * box_min_ratio), text_width + horizontal_padding * 2),
     )
     box_height = min(height, text_height + vertical_padding * 2)
     box_x = (width - box_width) // 2
@@ -946,6 +911,8 @@ def _choose_source_frame(
         return source_path
 
     existing = find_existing_frame(video_path)
+    if existing and not _frame_is_usable(existing):
+        existing = None
     extract_best_frame(video_path, temporary_path)
     if existing:
         existing_score = _frame_face_score(existing)
@@ -1080,6 +1047,8 @@ def generate_cover(
         return output_path
 
     source = _load_source_frame(video_path, source_path)
+    if _image_brightness(source) < _MIN_FRAME_BRIGHTNESS:
+        raise RuntimeError("cover source frame is too dark")
     centering = _centering_for_faces(source.size, size, _face_bboxes(source))
     cover = ImageOps.fit(
         source,

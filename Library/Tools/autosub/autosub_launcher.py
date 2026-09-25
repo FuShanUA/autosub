@@ -175,6 +175,9 @@ def check_all_completed(state_data: Any) -> bool:
                 continue
             status = task_d.get("status", "")
             pcts = task_d.get("pcts", {})
+            if status.startswith("超限"):
+                # A platform duration limit is terminal, but it is not success.
+                return False
             base_done = (status == "完成") or (
                 isinstance(pcts, dict) and 
                 pcts.get("BR", 0.0) >= 100.0 and 
@@ -489,7 +492,7 @@ def _load_settings() -> dict:
                 return json.load(f)
         except:
             pass
-    return {"llm_model": "gemini-3-flash-preview", "style": "auto"}
+    return {"llm_model": "glm-5.3", "llm_vendor": "Alibaba (Bailian)", "style": "auto"}
 
 
 def _save_settings(data: dict):
@@ -584,7 +587,7 @@ def onboard_model_selection():
     """Interactive model provider / model selection step.
     Called during launcher onboarding; defaults to no change."""
     settings = _load_settings()
-    current_model = settings.get("llm_model", "gemini-3-flash-preview")
+    current_model = settings.get("llm_model", "glm-5.3")
 
     console.print(f"\n[dim]翻译模型: [bold cyan]{current_model}[/bold cyan][/dim]")
     if not Confirm.ask("是否修改模型设置?", default=False):

@@ -18,7 +18,10 @@ import argparse
 import shutil
 import glob
 import logging
-import psutil
+try:
+    import psutil
+except ModuleNotFoundError:
+    psutil = None
 try:
     import msvcrt
 except ImportError:
@@ -29,6 +32,10 @@ except ImportError:
     msvcrt = _msvcrt_mock()
 import atexit
 import ctypes
+
+# Keep upload metadata generation responsive when the LLM endpoint stalls.
+os.environ.setdefault("LLM_REQUEST_TIMEOUT", "30")
+os.environ.setdefault("LLM_MAX_RETRIES", "1")
 
 CREATE_NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 import select
@@ -185,7 +192,16 @@ DEFAULT_OUTPUT_ROOT = os.path.join(PROJECT_ROOT, "Projects")
 
 # Reuse the canonical Bilibili upload API from the base autosub module.
 sys.path.insert(0, CURRENT_DIR)
-from autosub import build_bili_cmd, build_wechat_cmd, run_bili_cmd, run_wechat_cmd, generate_upload_metadata  # noqa: E402
+from autosub import (  # noqa: E402
+    DEFAULTS,
+    VENDOR_MAP,
+    build_bili_cmd,
+    build_wechat_cmd,
+    get_wechat_upload_skip_reason,
+    run_bili_cmd,
+    run_wechat_cmd,
+    generate_upload_metadata,
+)
 
 BROWSER_COOKIE_NAMES = {"chrome", "firefox", "safari", "edge"}
 
@@ -439,6 +455,12 @@ class SubTask:
             data['workdir'] = data['workdir'].strip().rstrip('. ')
         return cls(**data)
 
+
+def is_wechat_over_limit_reason(reason: Optional[str]) -> bool:
+    """Whether a WeChat upload stop reason is the platform duration limit."""
+    value = str(reason or "")
+    return "超过视频号" in value and "分钟限制" in value
+
 # --- 资源管理器 ---
 class ResourceManager:
     def __init__(self):
@@ -542,8 +564,7 @@ class BatchEngine:
                 with open(self.lock_file, "r") as f:
                     old_pid = int(f.read().strip())
                 running = False
-                import psutil
-                if psutil.pid_exists(old_pid):
+                if psutil is not None and psutil.pid_exists(old_pid):
                     try:
                         p = psutil.Process(old_pid)
                         cmdline = p.cmdline()
@@ -604,7 +625,9 @@ class BatchEngine:
         belonging to this project (transcribe_engine, smart_translate, burn_engine)
         to prevent resource leaks and concurrent execution of duplicate engines."""
         logger.info("🧹 Scanning for orphaned child engines from previous runs...")
-        import psutil
+        if psutil is None:
+            logger.warning("psutil is unavailable; orphaned process cleanup skipped")
+            return
         cleaned_count = 0
         current_pid = os.getpid()
         
@@ -768,7 +791,25 @@ class BatchEngine:
                 with open(target, 'r', encoding='utf-8') as f:
                     return json.load(f)
             except: pass
-        return {"llm_model": "gemini-3-flash-preview", "style": "auto"}
+        return {
+            "llm_model": DEFAULTS.get("llm_model", "glm-5.2"),
+            "llm_vendor": DEFAULTS.get("llm_vendor", DEFAULTS.get("vendor", "")),
+            "style": "auto",
+        }
+
+    def _get_upload_llm_settings(self):
+        """Resolve the main AutoSub model/provider for upload metadata."""
+        settings = self._load_global_settings()
+        model = settings.get("llm_model") or DEFAULTS.get("llm_model") or "glm-5.2"
+        vendor = (
+            settings.get("llm_vendor")
+            or settings.get("vendor")
+            or DEFAULTS.get("llm_vendor")
+            or DEFAULTS.get("vendor")
+            or ""
+        )
+        provider = VENDOR_MAP.get(vendor, str(vendor).strip().lower())
+        return model, provider
 
     @contextlib.contextmanager
     def use_temp_cookies(self, cookies_path):
@@ -795,7 +836,9 @@ class BatchEngine:
 
     def kill_children(self):
         """Kill all child subprocesses on exit to prevent orphaned processes."""
-        import psutil
+        if psutil is None:
+            logger.warning("psutil is unavailable; child process cleanup skipped")
+            return
         try:
             parent = psutil.Process(os.getpid())
             for child in parent.children(recursive=True):
@@ -886,6 +929,12 @@ class BatchEngine:
                             t.pcts["WX"] = 100.0
                         if os.path.exists(os.path.join(t.workdir, ".burn_complete")):
                             t.pcts["BR"] = 100.0
+
+                    # Duration-limit skips are terminal, but they are not successes.
+                    # Keep the persisted status/error so a restart does not requeue WX.
+                    if t.status.startswith("超限") and t.pcts.get("WX", 0.0) < 100.0:
+                        t.pid = None
+                        continue
 
                     # 彻底自愈：不再解析可能损坏的 status 字符串，而是根据 pcts 数据重新推导
                     current_stage = "DL"
@@ -1022,6 +1071,9 @@ class BatchEngine:
 
     def disk_truth(self, task: SubTask):
         """物理文件扫描，决定任务当前该处于哪个环节。"""
+        if task.status.startswith("超限"):
+            return
+
         # 如果是暂停状态，保持文字，只做物理搜索
         is_p = task.is_paused or self.res.global_pause
         try:
@@ -1365,7 +1417,7 @@ class BatchEngine:
             self.active_workers.add(task.uid)
 
         try:
-            while not self.abort and task.status != "完成" and not task.status.startswith("失败"):
+            while not self.abort and task.status != "完成" and not task.status.startswith("失败") and not task.status.startswith("超限"):
                 # 1. 暂停检查
                 if task.is_paused or self.res.global_pause:
                     curr_stage = "排队中"
@@ -1434,7 +1486,7 @@ class BatchEngine:
                     stage = "TL"
                     srts = [f for f in os.listdir(workdir) if f.endswith(".srt") and not re.search(r'(\.zh|\.cn|\.bi)\.srt$', f)]
                     settings = self._load_global_settings()
-                    model = settings.get("llm_model", "gemini-3-flash-preview")
+                    model = settings.get("llm_model", DEFAULTS.get("llm_model", "glm-5.3"))
                     style = settings.get("style", "auto")
                     cmd = list(SMART_TRANSLATE_CMD) + [os.path.join(workdir, srts[0]), "--model", model, "--style", style]
                 elif "MR" in task.status:
@@ -1491,6 +1543,7 @@ class BatchEngine:
                     need_gd = self.do_gdsync and not os.path.exists(os.path.join(workdir, ".synced"))
                     need_bi = self.do_bili and not os.path.exists(os.path.join(workdir, ".bili_uploaded"))
                     need_wx = self.do_wechat and not os.path.exists(os.path.join(workdir, ".wechat_uploaded"))
+                    upload_llm_model, upload_llm_provider = self._get_upload_llm_settings()
 
                     # Count how many uploads are needed
                     active = sum([bool(need_gd), bool(need_bi), bool(need_wx)])
@@ -1503,72 +1556,140 @@ class BatchEngine:
                             cmd = [PYTHON_EXE, SYNC_SCRIPT, "--local-dir", workdir, "--remote-id", self.gdsync_id, "--wrap-folder", "--headless"]
                         elif need_bi:
                             stage = "BI"
-                            cmd = self._build_bili_cmd(workdir)
+                            cmd = self._build_bili_cmd(
+                                workdir,
+                                llm_model=upload_llm_model,
+                                llm_provider=upload_llm_provider,
+                            )
                             if not cmd:
-                                try:
-                                    with open(os.path.join(workdir, ".bili_uploaded"), "w") as f: f.write("1")
-                                except: pass
-                                cmd = []
+                                task.status = "失败 (BI)"
+                                task.error = "B站上传命令构建失败，未开始上传"
+                                self.save_state()
+                                break
                         elif need_wx:
                             stage = "WX"
-                            cmd = self._build_wechat_cmd(workdir)
+                            wx_skip_reason = get_wechat_upload_skip_reason(workdir)
+                            cmd = self._build_wechat_cmd(
+                                workdir,
+                                llm_model=upload_llm_model,
+                                llm_provider=upload_llm_provider,
+                            )
                             if not cmd:
-                                try:
-                                    with open(os.path.join(workdir, ".wechat_uploaded"), "w") as f: f.write("1")
-                                except: pass
-                                cmd = []
+                                task.status = (
+                                    "超限 (WX)"
+                                    if is_wechat_over_limit_reason(wx_skip_reason)
+                                    else "失败 (WX)"
+                                )
+                                task.error = wx_skip_reason or "视频号上传命令构建失败，未开始上传"
+                                self.save_state()
+                                break
                     else:
-                        # === THREE-WAY PARALLEL: GD + BI + WX simultaneously ===
-                        # GD starts immediately; shared metadata is generated for
-                        # BI/WX. Bilibili gets the fuller title, WeChat gets a
-                        # 16-character title derived from it, and both share the
-                        # description and cover title.
+                        # === OVERLAPPING UPLOAD PIPELINE ===
+                        # GD sync starts immediately (it doesn't need MetaGen).
+                        # MetaGen runs in a parallel thread; BI/WX uploads start
+                        # as soon as MetaGen finishes. This eliminates the
+                        # scenario where slow LLM calls delay GD sync by 20+ min.
                         sync_cmd = [str(x) for x in [PYTHON_EXE, SYNC_SCRIPT, "--local-dir", workdir, "--remote-id", self.gdsync_id, "--wrap-folder", "--headless"] if x is not None] if need_gd else None
 
-                        # Build BI/WX cmds with pre-generated metadata
-                        meta = None
+                        # Phase 1: kick off GD sync + MetaGen concurrently
+                        gd_result = [False]
+                        bi_result = [False]
+                        wx_result = [False]
+                        meta_box = [None]
+
+                        gd_thread = None
+                        if need_gd and sync_cmd:
+                            def _run_gd():
+                                gd_result[0] = self.run_process(task, "GD", sync_cmd, start_pct=0.0, end_pct=100.0)
+                            gd_thread = threading.Thread(target=_run_gd, daemon=True)
+                            gd_thread.start()
+
+                        meta_thread = None
                         if need_bi or need_wx:
-                            meta = generate_upload_metadata(workdir, on_log=lambda msg: logger.info(f"Task {task.uid} | MetaGen | {msg}"))
+                            def _run_meta():
+                                meta_box[0] = generate_upload_metadata(
+                                    workdir,
+                                    on_log=lambda msg: logger.info(f"Task {task.uid} | MetaGen | {msg}"),
+                                    llm_model=upload_llm_model,
+                                    llm_provider=upload_llm_provider,
+                                )
+                            meta_thread = threading.Thread(target=_run_meta, daemon=True)
+                            meta_thread.start()
+
+                        # Phase 2: wait for MetaGen, then build and launch BI/WX
+                        if meta_thread:
+                            meta_thread.join()
+                        meta = meta_box[0]
+                        required_meta_fields = ("title", "description", "cover_title")
+                        meta_is_complete = bool(meta) and all(
+                            str(meta.get(field) or "").strip()
+                            for field in required_meta_fields
+                        )
+                        metadata_failed = False
+                        upload_failure_reasons = []
+                        permanent_upload_failure = False
+                        if need_wx and meta and not str(meta.get("wechat_title") or "").strip():
+                            meta_is_complete = False
+                        if (need_bi or need_wx) and not meta_is_complete:
+                            logger.error(
+                                f"Task {task.uid} | MetaGen | shared metadata incomplete; "
+                                "BI/WX uploads stopped"
+                            )
+                            metadata_failed = True
+                            upload_failure_reasons.append("上传元数据不完整，BI/WX上传未启动")
+                            need_bi = False
+                            need_wx = False
+
                         bili_cmd = None
                         wechat_cmd = None
                         if need_bi:
                             bili_cmd = build_bili_cmd(workdir, title=meta.get("title") if meta else None,
                                 desc=meta.get("description") if meta else None,
-                                cover_title=meta.get("cover_title") if meta else None)
+                                cover_title=meta.get("cover_title") if meta else None,
+                                llm_model=upload_llm_model,
+                                llm_provider=upload_llm_provider,
+                                require_complete_metadata=True)
                             if not bili_cmd:
-                                try:
-                                    with open(os.path.join(workdir, ".bili_uploaded"), "w") as f: f.write("1")
-                                except: pass
+                                logger.error(
+                                    f"Task {task.uid} | BI | upload stopped: "
+                                    "complete pre-generated metadata is required"
+                                )
+                                upload_failure_reasons.append("B站上传命令构建失败，未开始上传")
                                 need_bi = False
                         if need_wx:
+                            wx_skip_reason = get_wechat_upload_skip_reason(workdir)
                             wechat_cmd = build_wechat_cmd(workdir,
                                 title=meta.get("wechat_title") if meta else None,
                                 desc=meta.get("description") if meta else None,
                                 cover_title=meta.get("cover_title") if meta else None,
-                                public=self.wechat_public)
+                                public=self.wechat_public,
+                                llm_model=upload_llm_model,
+                                llm_provider=upload_llm_provider,
+                                require_complete_metadata=True)
                             if not wechat_cmd:
-                                try:
-                                    with open(os.path.join(workdir, ".wechat_uploaded"), "w") as f: f.write("1")
-                                except: pass
+                                logger.error(
+                                    f"Task {task.uid} | WX | upload stopped: "
+                                    "complete pre-generated metadata is required"
+                                )
+                                if wx_skip_reason:
+                                    upload_failure_reasons.append(f"视频号上传未启动：{wx_skip_reason}")
+                                    permanent_upload_failure = True
+                                else:
+                                    upload_failure_reasons.append("视频号上传命令构建失败，未开始上传")
                                 need_wx = False
 
-                        # Launch all active uploads in parallel
-                        gd_result = [False]
-                        bi_result = [False]
-                        wx_result = [False]
-                        threads = []
-
-                        if need_gd and sync_cmd:
-                            def _run_gd():
-                                gd_result[0] = self.run_process(task, "GD", sync_cmd, start_pct=0.0, end_pct=100.0)
-                            threads.append(threading.Thread(target=_run_gd, daemon=True))
+                        # Start BI/WX uploads (GD sync may already be running)
+                        upload_threads = []
                         if need_bi and bili_cmd:
-                            threads.append(threading.Thread(target=self._run_bili_upload, args=(task, bili_cmd, bi_result), daemon=True))
+                            upload_threads.append(threading.Thread(target=self._run_bili_upload, args=(task, bili_cmd, bi_result), daemon=True))
                         if need_wx and wechat_cmd:
-                            threads.append(threading.Thread(target=self._run_wechat_upload, args=(task, wechat_cmd, wx_result), daemon=True))
+                            upload_threads.append(threading.Thread(target=self._run_wechat_upload, args=(task, wechat_cmd, wx_result), daemon=True))
 
-                        for t in threads: t.start()
-                        for t in threads: t.join()
+                        for t in upload_threads: t.start()
+                        # Wait for GD sync (may already be done)
+                        if gd_thread:
+                            gd_thread.join()
+                        for t in upload_threads: t.join()
 
                         # Write markers
                         if gd_result[0]:
@@ -1588,19 +1709,55 @@ class BatchEngine:
                             task.pcts["WX"] = 100.0
                         self.save_state()
 
-                        all_ok = all([
+                        all_ok = (
+                            not metadata_failed
+                            and not upload_failure_reasons
+                            and all([
                             not need_gd or gd_result[0],
                             not need_bi or bi_result[0],
                             not need_wx or wx_result[0],
-                        ])
+                            ])
+                        )
                         if all_ok:
                             self.disk_truth(task)
                         else:
+                            wechat_over_limit = any(
+                                is_wechat_over_limit_reason(reason)
+                                for reason in upload_failure_reasons
+                            )
+                            if (
+                                wechat_over_limit
+                                and not metadata_failed
+                                and len(upload_failure_reasons) == 1
+                                and (not need_gd or gd_result[0])
+                                and (not need_bi or bi_result[0])
+                            ):
+                                task.status = "超限 (WX)"
+                                task.error = "；".join(upload_failure_reasons)
+                                self.save_state()
+                                break
+
+                            task.status = self._classify_upload_failure(
+                                upload_failure_reasons,
+                                metadata_failed,
+                                need_gd,
+                                need_bi,
+                                need_wx,
+                                gd_result,
+                                bi_result,
+                                wx_result,
+                            )
+                            if permanent_upload_failure:
+                                task.error = "；".join(upload_failure_reasons)
+                                self.save_state()
+                                break
                             if task.retries < 3:
                                 task.retries += 1
                                 task.status = "排队中 (GD)"
                                 time.sleep(5)
                                 continue
+                            task.error = "；".join(upload_failure_reasons) or "BI/WX上传未完成"
+                            self.save_state()
                             break
                         cmd = []  # already handled, skip shared block
 
@@ -1638,20 +1795,56 @@ class BatchEngine:
             with self.lock:
                 self.active_workers.discard(task.uid)
 
-    def _build_bili_cmd(self, workdir):
+    @staticmethod
+    def _classify_upload_failure(
+        upload_failure_reasons,
+        metadata_failed,
+        need_gd,
+        need_bi,
+        need_wx,
+        gd_result,
+        bi_result,
+        wx_result,
+    ):
+        """Map an upload-stage failure to the platform that actually failed."""
+        has_bili_reason = any(
+            "B站" in reason or "BI" in reason
+            for reason in upload_failure_reasons
+        )
+        has_wechat_reason = any(
+            "视频号" in reason or "WX" in reason
+            for reason in upload_failure_reasons
+        )
+        if has_bili_reason != has_wechat_reason:
+            return "失败 (BI)" if has_bili_reason else "失败 (WX)"
+        if metadata_failed or upload_failure_reasons:
+            return "失败 (上传)"
+        if (need_bi and not bi_result[0]) or (need_wx and not wx_result[0]):
+            return "失败 (上传)"
+        if need_gd and not gd_result[0]:
+            return "失败 (GD)"
+        return "失败 (上传)"
+
+    def _build_bili_cmd(self, workdir, llm_model=None, llm_provider=None):
         """Build Bilibili upload command via the canonical autosub.build_bili_cmd.
         All metadata (tid, tags, desc, season) is auto-generated per-video by
         bili_upload.py's built-in LLM logic."""
-        cmd = build_bili_cmd(workdir)
+        cmd = build_bili_cmd(
+            workdir,
+            llm_model=llm_model,
+            llm_provider=llm_provider,
+        )
         if cmd is None:
             logger.warning(f"Bilibili cmd build failed for {workdir} (script/venv/hardsub missing)")
         return cmd
 
-    def _build_wechat_cmd(self, workdir):
+    def _build_wechat_cmd(self, workdir, llm_model=None, llm_provider=None):
         """Build WeChat Channels upload command via the canonical autosub API."""
         cmd = build_wechat_cmd(
             workdir,
             public=self.wechat_public,
+            llm_model=llm_model,
+            llm_provider=llm_provider,
         )
         if cmd is None:
             logger.warning(f"WeChat cmd build failed for {workdir} (script/python/hardsub missing)")
@@ -1840,12 +2033,14 @@ class Dashboard:
                 # 确定行基础颜色
                 is_done = t.status == "完成"
                 is_failed = "失败" in t.status or "报错" in t.status
+                is_over_limit = t.status.startswith("超限")
                 is_paused = "暂停" in t.status
                 is_running = "运行" in t.status
                 is_queued = "排队" in t.status or "等待" in t.status or t.status.startswith("排队中") or t.status.startswith("等待中")
 
                 row_color = "green" if is_done else \
                             "red" if is_failed else \
+                            "bright_yellow" if is_over_limit else \
                             "bright_yellow" if is_paused else \
                             "bright_blue" if is_running else "grey37"
 
@@ -1863,6 +2058,8 @@ class Dashboard:
                     disp_status = "DONE\n "
                 elif is_failed:
                     disp_status = f"FAIL\n({active_stage})" if active_stage else "FAIL\n "
+                elif is_over_limit:
+                    disp_status = f"LIMIT\n({active_stage})" if active_stage else "LIMIT\n "
                 elif is_paused:
                     disp_status = f"PAUSE\n({active_stage})" if active_stage else "PAUSE\n "
                 elif is_running:
@@ -2157,7 +2354,12 @@ def main():
                             if not new_global_pause:
                                 with engine.lock:
                                     for t in engine.task_map.values():
-                                        if t.status != "完成" and not t.status.startswith("失败") and t.uid not in engine.active_workers:
+                                        if (
+                                            t.status != "完成"
+                                            and not t.status.startswith("失败")
+                                            and not t.status.startswith("超限")
+                                            and t.uid not in engine.active_workers
+                                        ):
                                             threading.Thread(target=engine.worker, args=(t,), daemon=True).start()
                         else:
                             try:
