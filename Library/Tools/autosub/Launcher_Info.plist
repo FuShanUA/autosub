@@ -5,7 +5,7 @@
 	<key>CFBundleExecutable</key>
 	<string>launcher.sh</string>
 	<key>CFBundleIconFile</key>
-	<string>launcher.icns</string>
+	<string>autosub_v9.icns</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.fushan.autosub.launcher</string>
 	<key>CFBundleName</key>

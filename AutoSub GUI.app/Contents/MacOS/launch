@@ -1,0 +1,13 @@
+#!/bin/bash
+# AutoSub GUI launcher
+DIR="/Users/shanfu/cc/Library/Tools/autosub/Library/Tools/autosub"
+PY_FW="/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14"
+
+cd "$DIR"
+export PYTHONHOME="$PY_FW"
+export PYTHONPATH="$DIR/.venv/lib/python3.14/site-packages:$DIR"
+export VIRTUAL_ENV="$DIR/.venv"
+export PATH="$DIR/.venv/bin:$PATH"
+# Use the Python binary copied into this .app bundle so macOS
+# identifies the process as belonging to this bundle, not Python.app
+exec "$(dirname "$0")/AutoSubGUI" autosub_gui.py

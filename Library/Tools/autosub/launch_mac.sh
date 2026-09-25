@@ -1,5 +1,6 @@
 #!/bin/bash
 # AutoSub Mac Launcher
 cd "$(dirname "$0")"
-source .venv/bin/activate
-python3 autosub_gui.py
+# Launch via .app bundle so macOS identifies the process as AutoSub GUI
+# (not Python.app) for correct Dock and Cmd+Tab icon
+open "$(cd "$(dirname "$0")/../../../" && pwd)/AutoSub GUI.app"
