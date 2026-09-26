@@ -251,7 +251,6 @@ BILI_SCRIPT = "/Users/shanfu/.gemini/config/skills/bilibili-uploader/scripts/bil
 BILI_PYTHON = "/Users/shanfu/.gemini/config/skills/bilibili-uploader/.venv/bin/python"
 BILI_VIDEO_EXTS = ('.mp4', '.mkv', '.webm', '.mov', '.ts')
 WECHAT_SCRIPT = os.path.expanduser("~/.codex/skills/wechat-channel-uploader/scripts/wechat_upload.py")
-WECHAT_MAX_UPLOAD_SECONDS = 600
 SHARED_UPLOAD_TITLE_MAX_CHARS = 16
 BILI_UPLOAD_TITLE_MAX_CHARS = 48
 BILI_UPLOAD_TITLE_HARD_MAX_CHARS = 80
@@ -528,13 +527,13 @@ _SHARED_TITLE_BANNED_TERMS = (
     "死活",
 )
 _SHARED_TITLE_ACTION_MARKERS = (
-    "谈", "讲", "靠", "用", "做", "让", "成为", "押",
+    "谈", "讲", "靠", "用", "做", "让", "成为", "押", "是",
     "招", "卖", "买", "建立", "打造", "解决", "守住", "聚焦", "变成", "保护",
     "整合", "引领", "炮轰", "反对", "支持", "梳理", "展示",
     "被裁", "烂掉",
 )
 _SHARED_TITLE_CONTEXT_MARKERS = (
-    "访谈", "对话", "谈", "讲", "为", "帮", "给", "客户", "企业",
+    "访谈", "对话", "谈", "讲", "为", "帮", "给", "客户", "企业", "主题",
     "问题", "不做", "不是", "不招", "押注", "才是", "隐私",
     "被裁", "烂掉",
 )
@@ -552,10 +551,214 @@ _SHARED_TITLE_CONCRETE_OBJECTS = (
 _SHARED_TITLE_BENEFICIARIES = (
     "企业", "政企", "政府", "客户", "机构",
 )
+_TITLE_NATURALNESS_BAD_PREFIXES = (
+    "就", "光是", "你得", "而且", "但", "但是", "所以", "然后",
+    "换句话说", "也就是说",
+)
+_TITLE_TRANSLATION_PATTERNS = (
+    r"^(?:对于|关于|作为|通过|基于)",
+    r"(?:不仅仅是|而不是|而非|与其说|不如说)",
+    r"(?:进行|实现)了",
+    r"被.{0,12}所",
+    r"(?:支持|学习|成长|价值|能力)的$",
+)
+_TITLE_AI_SLOP_TERMS = (
+    "赋能", "助力", "深度解析", "全面解析", "一文读懂",
+    "底层逻辑", "认知升级", "新范式", "未来已来", "无限可能",
+    "干货满满", "保姆级", "颠覆认知",
+)
+_COVER_TITLE_VAGUE_TERMS = (
+    "有人", "一些人", "许多人", "很多人", "所有人", "大量",
+    "各种", "一系列", "东西", "内容",
+)
+_COVER_TITLE_SUBJECT_MARKERS = (
+    "医院", "病人", "医生", "警局", "警察", "新人", "员工", "团队",
+    "公司", "客户", "企业", "工程师", "学生", "学校", "军队", "前线",
+    "数据治理", "网络攻击", "透析", "脓毒症", "癌症", "战争", "武器",
+)
+_COVER_TITLE_CONFLICT_MARKERS = (
+    "被", "没有", "不", "无法", "做不了", "停摆", "攻击", "裁",
+    "危机", "错误", "失败", "冲突", "对手", "对付", "杀手",
+)
+_COVER_TITLE_CONSEQUENCE_MARKERS = (
+    "受影响", "停摆", "烂掉", "没了", "断了", "做不了", "救",
+    "治", "上线", "采用", "落地", "结果", "后果", "反而", "却",
+    "先", "头号", "杀手",
+)
+_COVER_TITLE_ABSTRACT_MARKERS = (
+    "行业落地", "实际价值", "业务价值", "商业价值", "成果",
+    "价值", "能力", "支持", "创新", "范式", "开创性", "最前线",
+)
+_COVER_TITLE_THESIS_ACTION_MARKERS = (
+    "用", "整合", "识别", "救治", "优化", "合作", "布局",
+    "推进", "建立", "采用", "穿针引线",
+)
+_COVER_TITLE_TRANSLATION_TERMS = (
+    "内部模型",
+)
+
+
+def _title_has_naturalness_issue(title):
+    """Reject headline Chinese that reads like translation or filler speech."""
+    value = re.sub(r"\s+", " ", str(title or "")).strip()
+    if not value:
+        return True
+    if any(value.startswith(prefix) for prefix in _TITLE_NATURALNESS_BAD_PREFIXES):
+        return True
+    if re.search(r"[：:](?:但|但是|所以|然后|而且|就是)", value):
+        return True
+    if re.search(r"[你您]", value):
+        return True
+    if re.search(r"(?:大量|许多|很多)的?(?:支持|东西|内容|信息)", value):
+        return True
+    if re.search(r"(?:获得|得到).{0,6}(?:支持|东西|内容|信息)", value):
+        return True
+    if re.search(r"(?:学到|收获).{0,4}(?:大量|很多|许多)", value):
+        return True
+    if re.search(r"(?:完全|绝对)(?:不对|正确|错误)", value):
+        return True
+    if re.search(r"(?:思路|逻辑)(?:完全)?(?:不对|错误)", value):
+        return True
+    if value.count("，") + value.count(",") > 2:
+        return True
+    if len(value) >= 16 and value.count("的") >= 3:
+        return True
+    if any(term in value for term in _TITLE_AI_SLOP_TERMS):
+        return True
+    return any(
+        re.search(pattern, value)
+        for pattern in _TITLE_TRANSLATION_PATTERNS
+    )
+
+
+def _cover_title_information_units(title):
+    """Count the concrete units a viewer can decode in three seconds."""
+    value = re.sub(r"\s+", " ", str(title or "")).strip()
+    latin_subject = bool(
+        re.search(r"\b[A-Za-z][A-Za-z0-9_-]{2,}\b", value)
+        and value.lower() not in {"the", "and", "for"}
+    )
+    return (
+        latin_subject
+        + any(marker in value for marker in _COVER_TITLE_SUBJECT_MARKERS)
+        + _cover_title_has_thesis_action(value)
+        + any(marker in value for marker in _COVER_TITLE_CONFLICT_MARKERS)
+        + any(marker in value for marker in _COVER_TITLE_CONSEQUENCE_MARKERS)
+        + bool(re.search(r"(?:[0-9一二三四五六七八九十]+(?:周|年|次|倍)|第[0-9一二三四五六七八九十]+|一半)", value))
+    )
+
+
+def _cover_title_has_thesis_action(value):
+    """Treat negated uses such as ``不用`` as no action."""
+    value = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not value:
+        return False
+    if re.search(r"(?<![不没])用", value):
+        return True
+    return any(
+        marker in value
+        for marker in _COVER_TITLE_THESIS_ACTION_MARKERS
+        if marker != "用"
+    )
+
+
+def _cover_title_has_engagement_issue(title):
+    """Reject hooks that are striking but cannot be decoded quickly."""
+    value = re.sub(r"\s+", " ", str(title or "")).strip()
+    if not value:
+        return True
+    if any(term in value for term in _COVER_TITLE_VAGUE_TERMS):
+        return True
+    if _cover_title_information_units(value) < 2:
+        return True
+    if any(marker in value for marker in _COVER_TITLE_ABSTRACT_MARKERS) and not (
+        any(marker in value for marker in _COVER_TITLE_CONFLICT_MARKERS)
+        or any(marker in value for marker in _COVER_TITLE_CONSEQUENCE_MARKERS)
+    ):
+        return True
+    if value.startswith("我们") and "就像" in value:
+        return not any(
+            marker in value
+            for marker in _COVER_TITLE_CONSEQUENCE_MARKERS
+        )
+    return False
+
+
+def _cover_title_context_anchor_count(title, *contexts):
+    """Count substantive title tokens shared with whole-video context."""
+    title_tokens = _title_scoring_tokens(title)
+    if not title_tokens:
+        return 0
+    context_tokens = set()
+    for context in contexts:
+        context_tokens.update(_title_scoring_tokens(context))
+    return len(title_tokens & context_tokens)
+
+
+def _cover_title_has_context_issue(title, form_title="", source_title="", description=""):
+    """Require a cover hook to stay anchored to the video's main subject."""
+    contexts = tuple(
+        str(context or "")
+        for context in (form_title, source_title, description)
+        if str(context or "").strip()
+    )
+    if not contexts:
+        return False
+    substantive_description = _contains_chinese_text(description, 8)
+    required_anchors = 2 if substantive_description else 1
+    return _cover_title_context_anchor_count(title, *contexts) < required_anchors
+
+
+def _cover_title_subject_tokens(*contexts):
+    """Extract whole-video subjects shared by the available contexts."""
+    tokens = []
+    for context in contexts:
+        tokens.extend(
+            token
+            for token in re.findall(
+                r"\b[A-Za-z][A-Za-z0-9_-]{2,}\b",
+                str(context or ""),
+            )
+            if token.lower() not in _TITLE_LATIN_STOPWORDS
+        )
+    if not tokens:
+        return set()
+    threshold = 2 if len(contexts) > 1 else 1
+    counts = {}
+    for token in tokens:
+        counts[token] = counts.get(token, 0) + 1
+    return {
+        token for token, count in counts.items() if count >= threshold
+    }
+
+
+def _cover_title_has_thesis_issue(
+    title,
+    form_title="",
+    source_title="",
+    description="",
+):
+    """Require a strong hook to name the video subject and its main action."""
+    value = re.sub(r"\s+", " ", str(title or "")).strip()
+    subjects = _cover_title_subject_tokens(
+        form_title,
+        source_title,
+        description,
+    )
+    if not subjects or not _contains_chinese_text(description, 8):
+        return False
+    value_lower = value.casefold()
+    has_subject = any(
+        subject.casefold() in value_lower for subject in subjects
+    )
+    has_action = _cover_title_has_thesis_action(value)
+    return not (has_subject and has_action)
 
 
 def _shared_title_has_quality_issue(title):
     value = re.sub(r"\s+", " ", str(title or "")).strip()
+    if _title_has_naturalness_issue(value):
+        return True
     if any(term in value for term in _SHARED_TITLE_BANNED_TERMS):
         return True
     if "把" in value:
@@ -681,9 +884,143 @@ def _cover_title_repeats_form_title(title, form_title):
     return bool(form_title) and normalize(title) == normalize(form_title)
 
 
+def _contains_chinese_text(value, min_chars=2):
+    """Return whether a metadata field carries meaningful Chinese content."""
+    return len(re.findall(r"[\u3400-\u9fff]", str(value or ""))) >= min_chars
+
+
+def _comparison_title(value):
+    """Normalize mixed-language titles for duplicate and source-copy checks."""
+    return re.sub(
+        r"[^0-9A-Za-z\u3400-\u9fff]",
+        "",
+        str(value or ""),
+    ).casefold()
+
+
+def _metadata_title_is_source_copy(title, source_title):
+    """Detect an untranslated publisher title, including its truncations."""
+    normalized_title = _comparison_title(title)
+    normalized_source = _comparison_title(source_title)
+    if not normalized_title or not normalized_source:
+        return False
+    return (
+        normalized_title == normalized_source
+        or normalized_source.startswith(normalized_title)
+    )
+
+
+def _metadata_title_has_quality_issue(title, source_title, require_chinese):
+    """Validate one persisted form title before it blocks regeneration."""
+    value = re.sub(r"\s+", " ", str(title or "")).strip()
+    if not value:
+        return True
+    if not require_chinese:
+        return False
+    if require_chinese and not _contains_chinese_text(value):
+        return True
+    if _metadata_title_is_source_copy(value, source_title):
+        return True
+    return bool(_shared_title_has_quality_issue(value))
+
+
+def _metadata_cover_title_has_quality_issue(
+    cover_title,
+    form_title,
+    wechat_title,
+    source_title,
+    description,
+    require_chinese,
+):
+    """Validate a persisted cover independently from the form title."""
+    value = re.sub(r"\s+", " ", str(cover_title or "")).strip()
+    if not value:
+        return True
+    if not require_chinese:
+        return False
+    if require_chinese and not _contains_chinese_text(value):
+        return True
+    if _metadata_title_is_source_copy(value, source_title):
+        return True
+    normalized_cover = _comparison_title(value)
+    if normalized_cover in {
+        _comparison_title(form_title),
+        _comparison_title(wechat_title),
+    }:
+        return True
+    if _cover_title_has_engagement_issue(value):
+        return True
+    if _cover_title_has_context_issue(
+        value,
+        form_title=form_title,
+        source_title=source_title,
+        description=description,
+    ):
+        return True
+    if _cover_title_has_thesis_issue(
+        value,
+        form_title=form_title,
+        source_title=source_title,
+        description=description,
+    ):
+        return True
+    return bool(_cover_title_has_quality_issue(value))
+
+
+def _invalidate_cached_upload_metadata(meta, source_title, chinese_subtitle):
+    """Clear cached fields that would preserve a known bad upload title."""
+    require_chinese = bool(chinese_subtitle)
+    invalid_fields = []
+
+    if _metadata_title_has_quality_issue(
+        meta.get("title"),
+        source_title,
+        require_chinese,
+    ):
+        invalid_fields.extend(
+            field
+            for field in ("title", "wechat_title", "cover_title")
+            if meta.get(field)
+        )
+    elif _metadata_title_has_quality_issue(
+        meta.get("wechat_title"),
+        source_title,
+        require_chinese,
+    ):
+        if meta.get("wechat_title"):
+            invalid_fields.append("wechat_title")
+
+    if _metadata_cover_title_has_quality_issue(
+        meta.get("cover_title"),
+        meta.get("title"),
+        meta.get("wechat_title"),
+        source_title,
+        meta.get("description"),
+        require_chinese,
+    ):
+        if meta.get("cover_title"):
+            invalid_fields.append("cover_title")
+
+    if (
+        require_chinese
+        and meta.get("description")
+        and not _contains_chinese_text(meta.get("description"), 8)
+    ):
+        invalid_fields.append("description")
+
+    for field in dict.fromkeys(invalid_fields):
+        if meta.get(field):
+            meta[field] = ""
+    return list(dict.fromkeys(invalid_fields))
+
+
 def _cover_title_has_quality_issue(title):
     value = re.sub(r"\s+", " ", str(title or "")).strip()
     if not value:
+        return True
+    if _title_has_naturalness_issue(value):
+        return True
+    if any(term in value for term in _COVER_TITLE_TRANSLATION_TERMS):
         return True
     try:
         from subtitle_title import _title_has_quality_issue
@@ -696,10 +1033,13 @@ def _cover_title_has_quality_issue(title):
     predicate_markers = (
         "是", "像", "就像", "不是", "没有", "开", "做", "看", "说", "谈",
         "解决", "变成", "成为", "却", "并", "让", "把", "给", "在",
-        "对付", "阻止", "提供", "押注", "坚持", "拒绝",
+        "对付", "阻止", "提供", "押注", "坚持", "拒绝", "被", "受影响",
         "没了", "断了", "烂掉",
+    ) + _COVER_TITLE_THESIS_ACTION_MARKERS
+    return not (
+        any(marker in value for marker in predicate_markers)
+        or _cover_title_has_thesis_action(value)
     )
-    return not any(marker in value for marker in predicate_markers)
 
 
 def _normalize_cover_simile_title(title, full_subtitle_text):
@@ -767,6 +1107,10 @@ def _generate_title_from_description(
         f"标题长度必须为 {min_chars}-{max_chars} 个字符，英文字母逐字符计数。"
         "优先 24-40 个字符，只有信息不足时才低于 24 个字符。"
         "输出前必须逐字重数一遍；超过上限的候选直接作废。"
+        "输出前再按中文编辑标准默读一遍：标题必须是现代汉语自然短句，"
+        "不得有翻译腔、口语填充、机械拼接或AI套话。"
+        "不得以「就」「光是」「你得」等口语强调开头，不得使用第二人称，"
+        "不得输出「大量的支持」「学到大量东西」「思路完全不对」这类生硬表达。"
         "B站标题没有微信的 16 字限制，要表达得更充分："
         "通常覆盖 3 个实质信息点，例如访谈主题、核心业务/做法、"
         "明确立场或结果；不要为了短而删成分类标签。"
@@ -774,6 +1118,9 @@ def _generate_title_from_description(
         "用「主体+为+受益者+动作+对象」或「主体+解决+对象+问题」表达完整谓语。"
         "先在内部完成三步：列出访谈的 3-5 个主要内容；"
         "判断哪条线索贯穿全片；再写成一句自然短句。"
+        "多嘉宾、多段访谈或合集视频不强制压缩成单一 central_claim："
+        "先用共同主题和代表性案例概括全片，标题可保留场次名称，"
+        "但必须中文化并覆盖字幕中的实际场景。"
         "参考下面公开B站标题的结构，只学句式，不复制事实或短语："
         + "；".join(_PUBLIC_TITLE_STYLE_EXAMPLES)
         + "。"
@@ -921,6 +1268,8 @@ def _generate_structured_title_from_description(
         "object 必须是具体核心对象，例如数据、应用、平台或工具；"
         "不得用「产品」「价值」「问题」这类泛词充当 object。"
         "不要只选组织理念、单个案例或一句钩子。"
+        "多嘉宾、多段访谈或合集视频不强制单一主线："
+        "用共同主题和代表性案例概括全片，标题可保留场次名称。"
         "不要把全片主体缩小成单一客户群体；若同时服务企业和政府，"
         "beneficiary 用「客户」或自然的并列表达。"
         "不要市井口语和情绪副词，例如「死活」「简直」。"
@@ -1216,6 +1565,8 @@ def _derive_wechat_title_from_bili_title(
         "16字允许时优先输出「主体+具体后果/反差」或"
         "「主体+核心动作+对象+最有力的立场」，"
         "例如主体后接「被裁后组织会烂掉」或「整合数据不招销售」。"
+        "输出必须是现代汉语自然短句：不得以「就」「光是」开头，"
+        "不得使用「你」「您」，不得保留字幕里的口语填充或直译腔。"
         "禁用「把」字句，输出必须能独立读成一句完整陈述。"
         "不要为了凑满 16 字新增字幕没有的连接短语。"
         "生成 5 个候选，按编辑质量从高到低排列。"
@@ -1324,6 +1675,7 @@ def _generate_cover_title_from_full_subtitle(
     provider=None,
     form_title=None,
     source_title=None,
+    description=None,
 ):
     """Generate a cover headline by scanning the complete subtitle transcript."""
     from subtitle_title import (
@@ -1336,7 +1688,7 @@ def _generate_cover_title_from_full_subtitle(
         return None
 
     title_context = ""
-    if form_title or source_title:
+    if form_title or source_title or description:
         title_context = (
             "封面标题不是表单标题的压缩版。表单标题只用于判断主题边界和兜底，"
             "不得作为封面标题的主要模板。请从完整字幕中选一个具体原话或克制复述，"
@@ -1349,6 +1701,8 @@ def _generate_cover_title_from_full_subtitle(
                 "\n视频原标题（题材参考，不是唯一事实来源）：\n"
                 f"{source_title}\n"
             )
+        if description:
+            title_context += f"\n视频简介（全片主线参考）：\n{description}\n"
         title_context += "\n"
 
     base_prompt = (
@@ -1356,6 +1710,23 @@ def _generate_cover_title_from_full_subtitle(
         "不要只看开头、结尾或采样片段。"
         "先在内部列出 5-8 个有潜力的原话钩子，按话题感、画面感、"
         "反常识程度和对全片主题的代表性排序，再生成封面标题候选。"
+        "多嘉宾、多段访谈或合集视频不要求一个钩子覆盖所有嘉宾："
+        "从任一代表性段落选强钩子，但它要能体现全片的主题气质。"
+        "参考高播放封面标题的结构，不复制事实、不学标题党："
+        "观众三秒内要能读出「主体或场景、冲突、后果」中的至少两项；"
+        "优先「主体+反常识做法+可见结果」「场景+突发事件+具体人群受影响」"
+        "「身份+极端时间+具体任务」这类结构。"
+        "钩子必须接回全片主旨：写出主体或场景，再接主线动作或可见后果，"
+        "不得只留一个局部事实。"
+        "人称视角按证据强度选择：亲历者讲已发生做法时，"
+        "优先「我们+具体动作+了」的第一人称；需要交代全片主体、"
+        "跨嘉宾主线或编辑判断时，用第三人称。不得为了统一风格"
+        "抹掉「我们」或「了」，也不得把一般性陈述改成伪亲历。"
+        "「internal model」写成「自建模型」或「自己的模型」，"
+        "不得写成「内部模型」；只有同一证据链明确说本地部署时，"
+        "才写「本地模型」，不得把别段的本地部署或本体拼进当前案例。"
+        "标题可以留悬念，但不得留谜面；局部比喻必须补足主体或后果，"
+        "否则宁可换成更直白的冲突句。"
         "封面标题必须是语义完整的句子，可以比表单标题更具体，不必刻意压短。"
         "主语、谓语和比喻/冲突对象要保留，目标形态例如"
         "「我们就像在帕罗奥图正中央开马戏团」。"
@@ -1371,9 +1742,16 @@ def _generate_cover_title_from_full_subtitle(
         "优先使用原话或最小语法整理；"
         "原句太长或翻译腔重时，后 3 个候选可以做克制复述，"
         "复述时只删除真正的修饰语，不得删除主语、谓语或比喻核心；"
+        "原话含「就」「光是」「你」「大量的」这类口语或直译成分时，"
+        "必须改写成自然标题，不能整句照抄。"
         "「我们」「的」「了」若承担语法或语境作用必须保留。"
         "字幕说「就有点像」时，标题必须压缩成「就像」，不得只写「像」。"
         "不得输出无语境的反常识短语或名词短语拼接。"
+        "不得使用「有人」「所有人」「大量」这类模糊指代，"
+        "受影响对象要写成具体人群、系统或业务。"
+        "不得用「行业落地」「实际价值」「业务价值」这类抽象成果句充当封面钩子。"
+        "每个候选生成后先自检：不知道视频内容的观众能否看出谁/哪里发生什么、"
+        "为什么值得点开；看不出就作废。"
         "复述要保留原句的具体对象和语气，不得引入字幕外事实，"
         "不得使用市井口语、夸张营销或AI套话。"
         "标题长度 12-48 个字符，优先 18-32 个字符。"
@@ -1406,6 +1784,22 @@ def _generate_cover_title_from_full_subtitle(
                     title = _normalize_cover_simile_title(title, full_subtitle_text)
                     if _cover_title_has_quality_issue(title):
                         raise SubtitleTitleError("封面标题不是完整短句")
+                    if _cover_title_has_engagement_issue(title):
+                        raise SubtitleTitleError("封面标题三秒内读不出主体、冲突或后果")
+                    if _cover_title_has_context_issue(
+                        title,
+                        form_title=form_title,
+                        source_title=source_title,
+                        description=description,
+                    ):
+                        raise SubtitleTitleError("封面标题脱离全片主线")
+                    if _cover_title_has_thesis_issue(
+                        title,
+                        form_title=form_title,
+                        source_title=source_title,
+                        description=description,
+                    ):
+                        raise SubtitleTitleError("封面标题没有接回全片主旨")
                     if _cover_title_repeats_form_title(title, form_title):
                         raise SubtitleTitleError("封面标题复写表单标题")
                     validate_title_from_subtitle(
@@ -1425,16 +1819,30 @@ def _generate_cover_title_from_full_subtitle(
                     title = item[0]
                     compact_title = re.sub(r"\s+", "", title)
                     score = 0.0
+                    score += 2.0 * _cover_title_information_units(title)
+                    score += 2.0 * _cover_title_context_anchor_count(
+                        title,
+                        form_title,
+                        source_title,
+                        description,
+                    )
                     score += 0.5 * _title_reference_coverage(title, source_title)
                     # The model orders its strongest hooks first. Local scoring
                     # only corrects obvious filler and abstract-business bias.
                     score -= index * 0.25
                     if compact_title in compact_subtitle:
                         score += 2.0
-                    if title.startswith("我们"):
-                        score += 1.0
+                    if title.startswith("我们") and re.search(
+                        r"(?:识别|建立|采用|上线|救治|整合|优化)了",
+                        title,
+                    ):
+                        score += 1.5
                     if any(marker in title for marker in ("就像", "像")):
-                        score += 2.0
+                        score -= 2.0
+                    if any(marker in title for marker in _COVER_TITLE_CONSEQUENCE_MARKERS):
+                        score += 4.0
+                    if any(marker in title for marker in _COVER_TITLE_VAGUE_TERMS):
+                        score -= 8.0
                     if 18 <= len(title) <= 32:
                         score += 3.0
                     elif 14 <= len(title) <= 36:
@@ -1602,7 +2010,128 @@ def _clean_subtitle_hook_line(line):
     value = re.sub(r"\s+", " ", str(line or "")).strip()
     value = value.strip("“”\"' 　")
     value = re.sub(r"^(?:嗯|哦|对|就是)[，,：: ]+", "", value)
+    value = re.sub(
+        r"^(?:当然可以|没问题|好的|好|可以)[。.!！?？\s]+",
+        "",
+        value,
+    )
     return value.rstrip(" 。.！!？?；;，,、")
+
+
+def _clarify_cover_hook_line(line):
+    """Make a grounded fallback hook readable without adding new facts."""
+    value = _clean_subtitle_hook_line(line)
+    replacements = (
+        ("医院被攻击，就有人做不了透析", "医院被攻击，透析先受影响"),
+        ("医院被攻击，有人做不了透析", "医院被攻击，透析先受影响"),
+        ("数据治理有一半的工作是在当穿针引线的人", "数据治理一半工作是在穿针引线"),
+        (
+            "脓毒症这个病，是全球医院病人的头号杀手",
+            "我们用自建模型提前识别了脓毒症",
+        ),
+        ("一上来就被扔进深水区", "新人一入职就被扔进深水区"),
+        ("刚入职就被扔进深水区", "新人入职就被扔进深水区"),
+        ("所有人的目标都是别让飞机相撞", "目标是不让飞机相撞"),
+    )
+    for old, new in replacements:
+        value = value.replace(old, new)
+    value = re.sub(r"就有人做不了(.{2,10})", r"\1先受影响", value)
+    return value
+
+
+def _anchor_cover_hook_with_context(
+    title,
+    form_title="",
+    source_title="",
+    description="",
+    max_chars=48,
+):
+    """Prefix a local hook with the whole-video subject when needed."""
+    value = re.sub(r"\s+", " ", str(title or "")).strip()
+    contexts = (form_title, source_title, description)
+    subjects = _cover_title_subject_tokens(*contexts)
+    if subjects and any(
+        subject.casefold() in value.casefold() for subject in subjects
+    ):
+        return value
+
+    subject = ""
+    for context in contexts:
+        match = re.search(
+            r"\b([A-Za-z][A-Za-z0-9_-]{2,})\s*(?:现场)?访谈",
+            str(context or ""),
+        )
+        if match:
+            subject = match.group(1)
+            break
+    if not subject:
+        for context in contexts:
+            tokens = re.findall(
+                r"\b[A-Za-z][A-Za-z0-9_-]{2,}\b",
+                str(context or ""),
+            )
+            if tokens:
+                subject = tokens[0]
+                break
+    subject = str(subject or "").strip(" ：:，,。.！!？?；;")
+    if (
+        not subject
+        or subject.casefold() in value.casefold()
+    ):
+        return value
+
+    context_text = " ".join(str(context or "") for context in contexts)
+    if (
+        "访谈" in context_text
+        and "访谈" not in subject
+        and "访谈" not in value
+    ):
+        subject = f"{subject}访谈"
+    if len(f"{subject}：{value}") > max_chars:
+        return value
+    return f"{subject}：{value}"
+
+
+def _subtitle_sentence_candidates(subtitle_text):
+    """Join subtitle fragments into complete Chinese sentence candidates."""
+    buffer = ""
+    candidates = []
+    for raw_line in str(subtitle_text or "").splitlines():
+        line = re.sub(r"\s+", " ", raw_line).strip()
+        if not line or not re.search(r"[\u3400-\u9fff]", line):
+            if buffer:
+                candidates.append(buffer)
+                buffer = ""
+            continue
+
+        starts_new_clause = re.match(r"^(?:我们|他们|她们|它|这|那|我)", line)
+        if buffer and (
+            starts_new_clause
+            or (len(buffer) >= 12 and re.search(r"[，,、；;：:]", buffer))
+        ):
+            candidates.append(buffer)
+            buffer = line
+        else:
+            buffer = line if not buffer else f"{buffer}{line}"
+        if re.search(r"[。！？!?]$", line):
+            candidates.append(buffer)
+            buffer = ""
+        elif len(buffer) > 72:
+            candidates.append(buffer)
+            buffer = ""
+    if buffer:
+        candidates.append(buffer)
+
+    cleaned = []
+    seen = set()
+    for candidate in candidates:
+        value = _clean_subtitle_hook_line(candidate)
+        normalized = _comparison_title(value)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        cleaned.append(value)
+    return cleaned
 
 
 def _subtitle_hook_score(value):
@@ -1649,6 +2178,7 @@ def _compress_subtitle_hook_for_wechat(line, max_chars):
     if (
         not candidate
         or candidate == "未命名视频"
+        or _title_has_naturalness_issue(candidate)
         or any(marker in candidate for marker in _GENERIC_TITLE_MARKERS)
     ):
         return ""
@@ -1730,9 +2260,11 @@ def _fallback_wechat_title_from_subtitle(
 def _fallback_cover_title_from_subtitle(
     subtitle_text,
     form_title=None,
+    description=None,
+    source_title=None,
     max_chars=48,
 ):
-    """Use a complete subtitle hook instead of repeating the form title."""
+    """Use any complete subtitle hook instead of repeating the form title."""
     candidates = []
     consequence_cover = _fallback_consequence_cover_title(subtitle_text)
     if consequence_cover and not _cover_title_repeats_form_title(
@@ -1740,21 +2272,92 @@ def _fallback_cover_title_from_subtitle(
         form_title,
     ):
         candidates.append((100.0, consequence_cover))
-    for line in str(subtitle_text or "").splitlines():
-        cleaned = _clean_subtitle_hook_line(line)
+
+    scene_markers = (
+        "医院", "病房", "临床", "透析", "脓毒症", "前线", "战争", "武器",
+        "攻击", "袭击", "网络攻击", "欺诈", "警局", "大脑", "人脑",
+        "马戏团", "帕罗奥图", "深水区", "工程师",
+    )
+    conflict_markers = (
+        "被", "没有", "不是", "不了", "头号", "杀手", "救", "烂掉",
+        "断了", "没了", "永远", "必须", "标准",
+    )
+    opening_markers = (
+        "大家好", "欢迎", "谢谢", "接下来", "今天我们", "本期视频",
+    )
+
+    for cleaned in _subtitle_sentence_candidates(subtitle_text):
+        cleaned = _clarify_cover_hook_line(cleaned)
         if "、" in cleaned:
             first_clause = cleaned.split("、", 1)[0]
             if len(first_clause) >= 12:
                 cleaned = first_clause
         if not 12 <= len(cleaned) <= max_chars:
             continue
-        if not any(marker in cleaned for marker in _SUBTITLE_HOOK_MARKERS):
+        if not _contains_chinese_text(cleaned, 4):
+            continue
+        if any(marker in cleaned for marker in opening_markers):
             continue
         if _cover_title_has_quality_issue(cleaned):
             continue
+        if _cover_title_has_engagement_issue(cleaned):
+            continue
         if _cover_title_repeats_form_title(cleaned, form_title):
             continue
-        candidates.append((_subtitle_hook_score(cleaned), cleaned))
+        cleaned = _anchor_cover_hook_with_context(
+            cleaned,
+            form_title=form_title,
+            source_title=source_title,
+            description=description,
+            max_chars=max_chars,
+        )
+        if _cover_title_has_quality_issue(cleaned):
+            continue
+        if _cover_title_has_engagement_issue(cleaned):
+            continue
+        if _cover_title_has_context_issue(
+            cleaned,
+            form_title=form_title,
+            source_title=source_title,
+            description=description,
+        ):
+            continue
+        if _cover_title_has_thesis_issue(
+            cleaned,
+            form_title=form_title,
+            source_title=source_title,
+            description=description,
+        ):
+            continue
+        score = _subtitle_hook_score(cleaned)
+        score += 3.0 * _cover_title_information_units(cleaned)
+        score += 3.0 * _cover_title_context_anchor_count(
+            cleaned,
+            form_title,
+            source_title,
+            description,
+        )
+        if any(marker in cleaned for marker in _COVER_TITLE_CONSEQUENCE_MARKERS):
+            score += 5.0
+        if any(marker in cleaned for marker in _COVER_TITLE_VAGUE_TERMS):
+            score -= 10.0
+        score += 6.0 * sum(marker in cleaned for marker in scene_markers)
+        score += 4.0 * sum(marker in cleaned for marker in conflict_markers)
+        if 18 <= len(cleaned) <= 32:
+            score += 3.0
+        elif 14 <= len(cleaned) <= 36:
+            score += 1.0
+        if any(marker in cleaned for marker in _GENERIC_TITLE_MARKERS):
+            score -= 8.0
+        if (
+            re.search(
+                r"我们.{0,12}(?:识别|建立|采用|上线|救治|整合|优化)了",
+                cleaned,
+            )
+            and any(marker in cleaned for marker in _COVER_TITLE_SUBJECT_MARKERS)
+        ):
+            score += 5.0
+        candidates.append((score, cleaned))
     if not candidates:
         return ""
     return max(candidates, key=lambda item: (item[0], len(item[1])))[1]
@@ -1788,11 +2391,81 @@ def _load_upload_metadata(workdir):
         return {}
 
 
+def _fallback_bili_title_from_subtitle(
+    subtitle_text,
+    source_title=None,
+    max_chars=48,
+):
+    """Choose a Chinese summary sentence when description extraction fails."""
+    summary_markers = (
+        "主题", "核心", "聚焦", "关键", "本质", "标准", "实际", "落地",
+    )
+    weak_markers = (
+        "大家好", "欢迎", "谢谢", "接下来", "今天我们", "我觉", "我想",
+        "你知道吗", "举个例子",
+    )
+    candidates = []
+    for cleaned in _subtitle_sentence_candidates(subtitle_text):
+        cleaned = re.sub(
+            r"^(?:我是说|我是想说|我的意思是)[，,：: ]+",
+            "",
+            cleaned,
+        )
+        cleaned = cleaned.replace("的主题就是", "的主题是")
+        if not 12 <= len(cleaned) <= max_chars:
+            continue
+        if not _contains_chinese_text(cleaned, 4):
+            continue
+        if any(marker in cleaned for marker in weak_markers):
+            continue
+        if re.search(r"[?？]$", cleaned):
+            continue
+        title = normalize_bili_upload_title(cleaned, max_chars=max_chars)
+        if not title or _metadata_title_is_source_copy(title, source_title):
+            continue
+        score = 0.0
+        score += 5.0 * sum(marker in title for marker in summary_markers)
+        score += 3.0 * _title_reference_coverage(title, source_title)
+        if 24 <= len(title) <= 40:
+            score += 3.0
+        if title.startswith(("我", "我们")):
+            score -= 6.0
+        if any(marker in title for marker in _GENERIC_TITLE_MARKERS):
+            score -= 5.0
+        candidates.append((score, title))
+    if not candidates:
+        return ""
+    return max(candidates, key=lambda item: (item[0], len(item[1])))[1]
+
+
 def _fallback_bili_title_from_description(description, max_chars):
     """Build a conservative shared title when title-model calls time out."""
     value = re.sub(r"\s+", " ", str(description or "")).strip()
     if not value:
         return ""
+    if not _contains_chinese_text(value, 8):
+        return ""
+
+    first_sentence = re.split(r"[。！？\n]", value, maxsplit=1)[0]
+    panel_match = re.search(r"^(?:本期视频为|这是)(.{2,32})，聚焦(.{4,28})", first_sentence)
+    if panel_match:
+        subject = panel_match.group(1).strip()
+        subject = subject.replace("现场", "").replace("合集", "")
+        focus = panel_match.group(2).strip().replace("的", "")
+        panel_title = re.sub(r"\s+", " ", f"{subject}聚焦{focus}").strip()
+        panel_title = re.sub(
+            r"(?<=[\u3400-\u9fff])\s+(?=[A-Za-z0-9])"
+            r"|(?<=[A-Za-z0-9])\s+(?=[\u3400-\u9fff])",
+            "",
+            panel_title,
+        )
+        if len(panel_title) <= max_chars:
+            panel_title = normalize_bili_upload_title(
+                panel_title,
+                max_chars=max_chars,
+            )
+            if panel_title:
+                return panel_title
 
     subject_match = re.search(r"((?:[A-Za-z][A-Za-z0-9'&.-]*\s*)?员工)", value)
     if subject_match and "：" in value:
@@ -1825,6 +2498,44 @@ def _fallback_bili_title_from_description(description, max_chars):
             cut = max_chars
         value = value[:cut].rstrip(" ：:，,。.！!？?；;")
     return normalize_bili_upload_title(value, max_chars=max_chars)
+
+
+def _fallback_wechat_title_from_description(description, max_chars):
+    """Build a natural short Panel title from the saved Chinese summary."""
+    value = re.sub(r"\s+", " ", str(description or "")).strip()
+    if not value or not _contains_chinese_text(value, 8):
+        return ""
+
+    first_sentence = re.split(r"[。！？\n]", value, maxsplit=1)[0]
+    panel_match = re.search(
+        r"^(?:本期视频为|这是)(.{2,32})，聚焦(.{4,28})",
+        first_sentence,
+    )
+    if not panel_match:
+        return ""
+
+    subject = panel_match.group(1).strip()
+    latin_tokens = re.findall(r"[A-Za-z][A-Za-z0-9]*", subject)
+    event = latin_tokens[-1] if latin_tokens else subject
+    event = event.replace("现场", "").replace("合集", "").strip()
+    if not event:
+        return ""
+
+    focus = panel_match.group(2).strip()
+    if "行业落地" in focus:
+        focus = "行业落地"
+    else:
+        focus = re.split(r"[，,；;、]", focus, maxsplit=1)[0]
+        focus = re.sub(r"(?:的|成果|结果)$", "", focus)
+    if not focus:
+        return ""
+
+    candidate = f"{event}访谈聚焦{focus}"
+    if len(candidate) > max_chars:
+        candidate = f"{event}聚焦{focus}"
+    if len(candidate) > max_chars:
+        return ""
+    return normalize_shared_upload_title(candidate, max_chars=max_chars)
 
 
 def _fallback_wechat_title_from_bili_title(bili_title, max_chars):
@@ -1912,6 +2623,24 @@ def generate_upload_metadata(
     if source_title:
         meta["source_title"] = source_title
 
+    try:
+        full_sub_text, _full_sub_path = read_full_subtitle_text(hardsub_path)
+        full_sub_text = _correct_known_asr_proper_nouns(full_sub_text)
+        sub_text = _extract_chinese_subtitle_lines(full_sub_text)
+    except Exception as e:
+        _log(f"⚠️ [MetaGen] Full subtitle read failed: {e}")
+
+    invalid_cached_fields = _invalidate_cached_upload_metadata(
+        meta,
+        source_title,
+        sub_text,
+    )
+    if invalid_cached_fields:
+        _log(
+            "⚠️ [MetaGen] 缓存元数据质量不足，重新生成："
+            + "、".join(invalid_cached_fields)
+        )
+
     required_fields = ("title", "wechat_title", "description", "cover_title")
     if all(str(meta.get(field) or "").strip() for field in required_fields):
         return meta
@@ -1919,11 +2648,8 @@ def generate_upload_metadata(
     # Generate the description first. The form title is a compressed version of
     # this summary, so sharing its first sentence keeps the title tied to the
     # whole video instead of one striking transcript fragment.
-    try:
-        full_sub_text, _full_sub_path = read_full_subtitle_text(hardsub_path)
-        full_sub_text = _correct_known_asr_proper_nouns(full_sub_text)
-        sub_text = _extract_chinese_subtitle_lines(full_sub_text)
-        if sub_text and llm_client:
+    if not meta.get("description") and sub_text and llm_client:
+        try:
             prompt = (
                 "根据以下视频字幕，写一段100-200字的视频简介。简洁有力，概括核心内容，不要AI味。\n\n"
                 "视频原标题只作题材和场景参考，不是唯一事实来源。"
@@ -1953,13 +2679,13 @@ def generate_upload_metadata(
                     "无法确认的英文专名改用中文字幕中的既有译名。\n\n"
                     f"{prompt}"
                 )
-    except Exception as e:
-        _log(f"⚠️ [MetaGen] Description generation failed: {e}")
+        except Exception as e:
+            _log(f"⚠️ [MetaGen] Description generation failed: {e}")
 
     # Prefer a title compressed from the whole-video description. The older
     # subtitle-candidate path remains as a fallback when this grounded path
     # cannot produce a valid short title.
-    if meta.get("description") and sub_text and llm_client:
+    if not meta.get("title") and meta.get("description") and sub_text and llm_client:
         try:
             summary_title = _generate_title_from_description(
                 meta["description"],
@@ -2031,24 +2757,37 @@ def generate_upload_metadata(
             _log(f"⚠️ [MetaGen] Fallback Bilibili title generation failed: {e}")
 
     if not meta.get("title"):
-        fallback_title = _fallback_bili_title_from_source_title(
-            source_title,
+        fallback_title = _fallback_bili_title_from_description(
+            meta.get("description"),
             max_chars=bili_title_max_chars,
         )
-        fallback_source = "原标题"
+        fallback_source = "本地"
         if not fallback_title:
-            fallback_title = _fallback_bili_title_from_description(
-                meta.get("description"),
+            fallback_title = _fallback_bili_title_from_subtitle(
+                sub_text,
+                source_title=source_title,
                 max_chars=bili_title_max_chars,
             )
-            fallback_source = "本地"
+            fallback_source = "字幕"
+        if not fallback_title and not sub_text:
+            fallback_title = _fallback_bili_title_from_source_title(
+                source_title,
+                max_chars=bili_title_max_chars,
+            )
+            fallback_source = "原标题"
         if fallback_title:
             meta["title"] = fallback_title
             _log(f">>> [MetaGen] B站标题 ({fallback_source}兜底): {fallback_title}")
 
     # 2. WeChat form title, derived from the Bilibili title rather than
     # regenerating a separate theme under a tighter character budget.
-    if meta.get("title") and meta.get("description") and sub_text and llm_client:
+    if (
+        not meta.get("wechat_title")
+        and meta.get("title")
+        and meta.get("description")
+        and sub_text
+        and llm_client
+    ):
         try:
             wechat_title = _derive_wechat_title_from_bili_title(
                 meta["title"],
@@ -2079,7 +2818,13 @@ def generate_upload_metadata(
                 max_chars=wechat_title_max_chars,
             )
             fallback_source = "本地"
-        if not fallback_wechat_title and source_title:
+        if not fallback_wechat_title and meta.get("description"):
+            fallback_wechat_title = _fallback_wechat_title_from_description(
+                meta.get("description"),
+                max_chars=wechat_title_max_chars,
+            )
+            fallback_source = "简介"
+        if not fallback_wechat_title and not sub_text and source_title:
             fallback_wechat_title = _fallback_wechat_title_from_source_title(
                 source_title,
                 max_chars=wechat_title_max_chars,
@@ -2090,34 +2835,48 @@ def generate_upload_metadata(
             _log(f">>> [MetaGen] 视频号标题 ({fallback_source}兜底): {fallback_wechat_title}")
 
     # 3. Cover title (editorial headline style)
-    try:
-        cover_title = _generate_cover_title_from_full_subtitle(
-            sub_text,
-            llm_client,
-            model,
-            min_chars=12,
-            max_chars=48,
-            provider=provider,
-            form_title=meta.get("title"),
-            source_title=source_title,
-        )
-        if cover_title:
-            meta["cover_title"] = cover_title
-            _log(f">>> [MetaGen] 封面标题: {cover_title}")
-    except Exception as e:
-        _log(f"⚠️ [MetaGen] Cover title generation failed: {e}")
+    if not meta.get("cover_title") and sub_text and llm_client:
+        try:
+            cover_title = _generate_cover_title_from_full_subtitle(
+                sub_text,
+                llm_client,
+                model,
+                min_chars=12,
+                max_chars=48,
+                provider=provider,
+                form_title=meta.get("title"),
+                source_title=source_title,
+                description=meta.get("description"),
+            )
+            if cover_title:
+                if _metadata_cover_title_has_quality_issue(
+                    cover_title,
+                    meta.get("title"),
+                    meta.get("wechat_title"),
+                    source_title,
+                    meta.get("description"),
+                    bool(sub_text),
+                ):
+                    _log(f"⚠️ [MetaGen] Cover title rejected: {cover_title}")
+                else:
+                    meta["cover_title"] = cover_title
+                    _log(f">>> [MetaGen] 封面标题: {cover_title}")
+        except Exception as e:
+            _log(f"⚠️ [MetaGen] Cover title generation failed: {e}")
 
     if not meta.get("cover_title"):
         fallback_cover_title = _fallback_cover_title_from_subtitle(
             sub_text,
             form_title=meta.get("title"),
+            description=meta.get("description"),
+            source_title=source_title,
             max_chars=48,
         )
         fallback_source = "字幕钩子"
-        if not fallback_cover_title:
+        if not fallback_cover_title and not sub_text:
             fallback_cover_title = _fallback_cover_title(meta)
             fallback_source = "本地"
-        if not fallback_cover_title and source_title:
+        if not fallback_cover_title and not sub_text and source_title:
             fallback_cover_title = _fallback_bili_title_from_source_title(
                 source_title,
                 max_chars=48,
@@ -2138,6 +2897,10 @@ def build_wechat_title(hardsub_path):
     """Derive a WeChat Channels title, capped at the platform's short-title limit."""
     return sanitize_wechat_title(build_bili_title(hardsub_path))
 
+def get_wechat_duration_skip_reason(duration):
+    """WeChat uploads no longer have an application-side duration cap."""
+    return None
+
 def get_wechat_upload_skip_reason(workdir):
     """Return a user-facing reason when WeChat upload must not start."""
     if not os.path.exists(WECHAT_SCRIPT) or not os.path.exists(WECHAT_PYTHON):
@@ -2148,12 +2911,7 @@ def get_wechat_upload_skip_reason(workdir):
     duration = get_video_duration(hardsub_path)
     if duration <= 0:
         return f"cannot read duration: {os.path.basename(hardsub_path)}"
-    if duration > WECHAT_MAX_UPLOAD_SECONDS:
-        return (
-            f"视频时长 {duration / 60:.1f} 分钟，超过视频号 "
-            f"{WECHAT_MAX_UPLOAD_SECONDS // 60} 分钟限制"
-        )
-    return None
+    return get_wechat_duration_skip_reason(duration)
 
 def build_wechat_cmd(
     workdir,

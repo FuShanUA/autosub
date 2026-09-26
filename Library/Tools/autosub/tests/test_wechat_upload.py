@@ -64,7 +64,7 @@ class TestAutosubWechatCommand(unittest.TestCase):
         finally:
             sys.modules.pop("autosub_wechat_command_under_test", None)
 
-    def test_wechat_command_rejects_video_over_ten_minutes(self):
+    def test_wechat_command_accepts_video_over_ten_minutes(self):
         spec, module = self._load_module()
         try:
             spec.loader.exec_module(module)
@@ -77,7 +77,7 @@ class TestAutosubWechatCommand(unittest.TestCase):
                      patch.object(module, "get_video_duration", lambda _path: 601):
                     cmd = module.build_wechat_cmd(temp_dir)
 
-                self.assertIsNone(cmd)
+                self.assertIsNotNone(cmd)
         finally:
             sys.modules.pop("autosub_wechat_command_under_test", None)
 
@@ -116,27 +116,31 @@ class TestAutosubWechatCommand(unittest.TestCase):
         finally:
             sys.modules.pop("autosub_wechat_command_under_test", None)
 
-    def test_wechat_trigger_skips_over_limit_without_running_upload(self):
+    def test_wechat_trigger_runs_upload_over_ten_minutes(self):
         spec, module = self._load_module()
         try:
             spec.loader.exec_module(module)
             with tempfile.TemporaryDirectory() as temp_dir:
                 python, script, video = self._make_upload_fixture(temp_dir)
                 logs = []
+                commands = []
 
                 with patch.object(module, "WECHAT_SCRIPT", script), \
                      patch.object(module, "WECHAT_PYTHON", python), \
                      patch.object(module, "find_hardsub_video", lambda _workdir: video), \
                      patch.object(module, "get_video_duration", lambda _path: 601), \
-                     patch.object(module, "run_wechat_cmd", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("upload must not run"))):
+                     patch.object(
+                         module,
+                         "run_wechat_cmd",
+                         lambda cmd, *_args, **_kwargs: commands.append(cmd) or True,
+                     ):
                     ok = module.trigger_wechat_upload(
                         temp_dir, on_log=logs.append
                     )
 
-                self.assertFalse(ok)
-                self.assertTrue(
-                    any("10 分钟限制" in message for message in logs)
-                )
+                self.assertTrue(ok)
+                self.assertEqual(len(commands), 1)
+                self.assertFalse(any("10 分钟限制" in message for message in logs))
         finally:
             sys.modules.pop("autosub_wechat_command_under_test", None)
 
@@ -259,27 +263,29 @@ class TestWechatUploadTitle(unittest.TestCase):
             )
         self.assertFalse(ok)
 
-    def test_upload_rejects_video_over_ten_minutes_before_title_generation(self):
+    def test_upload_allows_video_over_ten_minutes_to_reach_title_generation(self):
+        class ReachedTitleGeneration(Exception):
+            pass
+
         with patch.object(
             self.module, "_get_video_duration_seconds", lambda _path: 601
         ), patch.object(
             self.module,
             "build_title",
             lambda *_args, **_kwargs: (_ for _ in ()).throw(
-                AssertionError("title generation must not run")
+                ReachedTitleGeneration("title generation must run")
             ),
         ):
-            ok = asyncio.run(
+            with self.assertRaises(ReachedTitleGeneration):
+                asyncio.run(
                 self.module.upload_one_video(self.video, "Filename-derived title")
-            )
+                )
 
-        self.assertFalse(ok)
-
-    def test_wechat_duration_limit_boundary_values(self):
+    def test_wechat_duration_check_only_rejects_unknown_duration(self):
         with patch.object(self.module, "_get_video_duration_seconds", lambda _path: 600):
             self.assertTrue(self.module._within_wechat_duration_limit(self.video))
         with patch.object(self.module, "_get_video_duration_seconds", lambda _path: 601):
-            self.assertFalse(self.module._within_wechat_duration_limit(self.video))
+            self.assertTrue(self.module._within_wechat_duration_limit(self.video))
         with patch.object(self.module, "_get_video_duration_seconds", lambda _path: 0):
             self.assertFalse(self.module._within_wechat_duration_limit(self.video))
 
