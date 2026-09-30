@@ -1156,6 +1156,30 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         )
         self.assertEqual(reframed_wechat_title, "Palantir员工谈新人深水区")
 
+    def test_teaching_metadata_fallback_survives_llm_timeout(self):
+        """A good saved summary must not degrade to a random subtitle line."""
+        description = (
+            "Andrej Karpathy教你用好ChatGPT这类LLM应用。"
+            "他把模型讲成“1TB压缩包”：知识来自预训练对互联网的有损压缩，"
+            "性格靠后训练调教，自带知识截止日期。"
+        )
+        title = autosub._fallback_bili_title_from_description(description, 48)
+        wechat_title = autosub._fallback_wechat_title_from_description(
+            description,
+            16,
+        )
+        cover_title = autosub._fallback_cover_title_from_description(
+            description,
+            form_title=title,
+        )
+
+        self.assertEqual(title, "Andrej Karpathy讲透ChatGPT这类LLM应用")
+        self.assertEqual(wechat_title, "Karpathy讲透LLM应用")
+        self.assertEqual(cover_title, "Andrej Karpathy用1TB压缩包讲模型")
+        self.assertTrue(autosub.normalize_bili_upload_title(title))
+        self.assertTrue(autosub.normalize_shared_upload_title(wechat_title))
+        self.assertFalse(autosub._cover_title_has_quality_issue(cover_title))
+
     def test_offline_fallback_uses_distinct_subtitle_hooks(self):
         """LLM timeouts must still yield concrete, non-duplicate titles."""
         subtitle_text = (
@@ -1247,6 +1271,90 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
 
         self.assertEqual(metadata["wechat_title"], "数据治理一半是在穿针引线")
         self.assertEqual(metadata["cover_title"], "数据治理一半工作是在穿针引线")
+
+    def test_generate_upload_metadata_falls_back_from_spoken_title(self):
+        """A spoken Bilibili title still yields a WeChat title offline."""
+        workdir = os.path.join(self.temp_dir, "metadata_spoken_title")
+        os.makedirs(workdir)
+        hardsub = os.path.join(workdir, "video_hardsub.mp4")
+        with open(hardsub, "w") as handle:
+            handle.write("video")
+        with open(os.path.join(workdir, "upload_metadata.json"), "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "title": "再说一次，如果从德国面临的核心问题说起，那就是出口导向型文化",
+                    "description": "Palantir CEO Alex Karp 回应技术法西斯指控，并分析德国社会问题。",
+                    "cover_title": "Palantir：还没真正好好利用这些资源，反而先去搞道德批判",
+                },
+                handle,
+                ensure_ascii=False,
+            )
+
+        subtitle_title = MagicMock()
+        subtitle_title.read_full_subtitle_text.return_value = (
+            "德国面临的核心问题是出口导向型文化。",
+            "subtitle.srt",
+        )
+
+        with patch.object(autosub, "find_hardsub_video", return_value=hardsub), \
+             patch.object(autosub, "_load_llm_defaults", return_value=("glm-5.2", "dashscope")), \
+             patch.object(autosub, "_derive_wechat_title_from_bili_title", side_effect=TimeoutError), \
+             patch.dict(
+                 sys.modules,
+                 {
+                     "subtitle_title": subtitle_title,
+                     "llm_utils": MagicMock(get_client=lambda: MagicMock()),
+                 },
+             ):
+            metadata = autosub.generate_upload_metadata(workdir)
+
+        self.assertEqual(
+            metadata["wechat_title"],
+            "德国核心问题是出口导向型文化",
+        )
+
+    def test_generate_upload_metadata_falls_back_from_source_title(self):
+        """A publisher title still yields a WeChat title when hooks fail."""
+        workdir = os.path.join(self.temp_dir, "metadata_source_title")
+        os.makedirs(workdir)
+        hardsub = os.path.join(workdir, "video_hardsub.mp4")
+        with open(hardsub, "w") as handle:
+            handle.write("video")
+        with open(os.path.join(workdir, "upload_metadata.json"), "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "title": "一切终会以某种方式成为这样一个和平、社会民主主义的社会",
+                    "description": "Peter Thiel在柏林受访时指出，AI潜力超越互联网。",
+                    "cover_title": "Peter：通谕是在帮中共的忙",
+                },
+                handle,
+                ensure_ascii=False,
+            )
+
+        subtitle_title = MagicMock()
+        subtitle_title.read_full_subtitle_text.return_value = (
+            "Peter Thiel discusses AI in Berlin.",
+            "subtitle.srt",
+        )
+
+        with patch.object(autosub, "find_hardsub_video", return_value=hardsub), \
+             patch.object(
+                 autosub,
+                 "_extract_source_title",
+                 return_value="Peter Thiel - The AI Crisis Europe s Decline the Battle for America",
+             ), \
+             patch.object(autosub, "_load_llm_defaults", return_value=("glm-5.2", "dashscope")), \
+             patch.object(autosub, "_derive_wechat_title_from_bili_title", side_effect=TimeoutError), \
+             patch.dict(
+                 sys.modules,
+                 {
+                     "subtitle_title": subtitle_title,
+                     "llm_utils": MagicMock(get_client=lambda: MagicMock()),
+                 },
+             ):
+            metadata = autosub.generate_upload_metadata(workdir)
+
+        self.assertEqual(metadata["wechat_title"], "Peter Thiel谈AI")
 
     def test_extract_source_title_uses_info_file_then_filename(self):
         """Metadata generation should recover the publisher title reliably."""
@@ -1409,6 +1517,36 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         )
         self.assertNotEqual(metadata["title"], metadata["cover_title"])
         self.assertFalse(llm_client.generate_content.called)
+
+    def test_cached_upload_title_must_cover_whole_video_summary(self):
+        """A single highlight or spoken quote must not survive metadata reuse."""
+        source_title = "The Wildest Hot Takes From the All-In Summit 2026"
+        description = (
+            "All-In Summit 2026现场，多位嘉宾讨论AI、能源与人体创新。"
+            "内容包括SaaS、天然气、超加工食品、自由意志和生物黑客。"
+        )
+
+        self.assertTrue(
+            autosub._metadata_title_has_whole_video_issue(
+                "GenSpark建立管控机制加速普及模型",
+                source_title=source_title,
+                description=description,
+            )
+        )
+        self.assertTrue(
+            autosub._metadata_title_has_whole_video_issue(
+                "因为我来这里不只是为了拍个视频",
+                source_title=source_title,
+                description=description,
+            )
+        )
+        self.assertFalse(
+            autosub._metadata_title_has_whole_video_issue(
+                "All-In峰会嘉宾谈AI、能源与人体创新",
+                source_title=source_title,
+                description=description,
+            )
+        )
 
     def test_title_and_cover_prompts_anchor_on_source_and_form_titles(self):
         """Prompts must compare the publisher title with the transcript主线."""

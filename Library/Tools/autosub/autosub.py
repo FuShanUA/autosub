@@ -910,7 +910,33 @@ def _metadata_title_is_source_copy(title, source_title):
     )
 
 
-def _metadata_title_has_quality_issue(title, source_title, require_chinese):
+def _metadata_title_has_whole_video_issue(title, source_title="", description=""):
+    """Reject cached titles that describe one transcript moment, not the video."""
+    value = re.sub(r"\s+", " ", str(title or "")).strip()
+    summary = str(description or "").strip()
+    if not value or not _contains_chinese_text(summary, 8):
+        return False
+    if re.match(
+        r"^(?:因为|如果|我|我们|我是|我想|我觉得|我的|再说一次|再强调一次|换句话说)",
+        value,
+    ):
+        return True
+    references = [summary, str(source_title or "").strip()]
+    if not any(references):
+        return False
+    coverage = max(
+        _title_reference_coverage(value, reference)
+        for reference in references
+    )
+    return coverage < 0.15
+
+
+def _metadata_title_has_quality_issue(
+    title,
+    source_title,
+    require_chinese,
+    description="",
+):
     """Validate one persisted form title before it blocks regeneration."""
     value = re.sub(r"\s+", " ", str(title or "")).strip()
     if not value:
@@ -920,6 +946,12 @@ def _metadata_title_has_quality_issue(title, source_title, require_chinese):
     if require_chinese and not _contains_chinese_text(value):
         return True
     if _metadata_title_is_source_copy(value, source_title):
+        return True
+    if _metadata_title_has_whole_video_issue(
+        value,
+        source_title=source_title,
+        description=description,
+    ):
         return True
     return bool(_shared_title_has_quality_issue(value))
 
@@ -976,6 +1008,7 @@ def _invalidate_cached_upload_metadata(meta, source_title, chinese_subtitle):
         meta.get("title"),
         source_title,
         require_chinese,
+        meta.get("description"),
     ):
         invalid_fields.extend(
             field
@@ -986,6 +1019,7 @@ def _invalidate_cached_upload_metadata(meta, source_title, chinese_subtitle):
         meta.get("wechat_title"),
         source_title,
         require_chinese,
+        meta.get("description"),
     ):
         if meta.get("wechat_title"):
             invalid_fields.append("wechat_title")
@@ -1991,6 +2025,24 @@ def _fallback_bili_title_from_source_title(source_title, max_chars):
 def _fallback_wechat_title_from_source_title(source_title, max_chars):
     """Keep a word-boundary prefix of the publisher title for WeChat."""
     value = _fallback_bili_title_from_source_title(source_title, max_chars)
+    # Interview-style publisher titles often contain a usable subject and topic
+    # even when the transcript has no strong local hook.
+    raw = re.sub(r"\s+", " ", str(source_title or "")).strip()
+    subject_match = re.match(r"^(.{2,48}?)\s*(?:[-:：]\s)", raw)
+    topic_match = re.search(
+        r"\b(AI|GPT|Europe|America|China|OpenAI|Google|Meta|Palantir|AfD)\b",
+        raw,
+        re.IGNORECASE,
+    )
+    if subject_match and topic_match:
+        subject = subject_match.group(1).strip()
+        if len(subject) > max_chars - 4:
+            words = subject.split()
+            subject = " ".join(words[-2:]) if len(words) >= 2 else subject
+        candidate = f"{subject}谈{topic_match.group(1)}"
+        normalized = normalize_shared_upload_title(candidate, max_chars=max_chars)
+        if normalized:
+            return normalized
     return sanitize_wechat_title(value, max_chars=max_chars)
 
 
@@ -2447,6 +2499,16 @@ def _fallback_bili_title_from_description(description, max_chars):
         return ""
 
     first_sentence = re.split(r"[。！？\n]", value, maxsplit=1)[0]
+    if "教你用好" in first_sentence:
+        subject, object_value = first_sentence.split("教你用好", 1)
+        teaching_title = f"{subject}讲透{object_value}"
+        teaching_title = normalize_bili_upload_title(
+            teaching_title,
+            max_chars=max_chars,
+        )
+        if teaching_title:
+            return teaching_title
+
     panel_match = re.search(r"^(?:本期视频为|这是)(.{2,32})，聚焦(.{4,28})", first_sentence)
     if panel_match:
         subject = panel_match.group(1).strip()
@@ -2507,6 +2569,22 @@ def _fallback_wechat_title_from_description(description, max_chars):
         return ""
 
     first_sentence = re.split(r"[。！？\n]", value, maxsplit=1)[0]
+    if "教你用好" in first_sentence:
+        subject, object_value = first_sentence.split("教你用好", 1)
+        subject_words = re.findall(r"[A-Za-z][A-Za-z0-9_-]*", subject)
+        short_subject = subject_words[-1] if subject_words else subject
+        compact_object = next(
+            (
+                marker
+                for marker in ("LLM应用", "AI应用", "ChatGPT", "GPT")
+                if marker in object_value
+            ),
+            "",
+        )
+        if compact_object:
+            candidate = f"{short_subject}讲透{compact_object}"
+            return normalize_shared_upload_title(candidate, max_chars=max_chars)
+
     panel_match = re.search(
         r"^(?:本期视频为|这是)(.{2,32})，聚焦(.{4,28})",
         first_sentence,
@@ -2542,29 +2620,86 @@ def _fallback_wechat_title_from_bili_title(bili_title, max_chars):
     """Compress the local Bilibili fallback without another model call."""
     value = re.sub(r"\s+", " ", str(bili_title or "")).strip()
     marker = value.find("谈")
-    if marker <= 0:
-        return ""
-
-    subject = re.sub(r"\s+", "", value[:marker])
-    body = re.sub(r"\s+", "", value[marker + len("谈"):])
-    body = re.sub(r"一上来就?", "", body)
-    parts = re.split(r"(?:即被|就被|被|[，,；;：:])", body, maxsplit=1)
-    prefix = parts[0]
-    suffix = parts[1] if len(parts) > 1 else ""
-    if suffix:
-        suffix = re.sub(r"^(?:扔进|丢进|放进)", "", suffix)
-        if len(prefix) + len(suffix) <= max_chars - len(subject) - len("谈"):
-            body = prefix + suffix
+    if marker > 0:
+        subject = re.sub(r"\s+", "", value[:marker])
+        body = re.sub(r"\s+", "", value[marker + len("谈"):])
+        body = re.sub(r"一上来就?", "", body)
+        parts = re.split(r"(?:即被|就被|被|[，,；;：:])", body, maxsplit=1)
+        prefix = parts[0]
+        suffix = parts[1] if len(parts) > 1 else ""
+        if suffix:
+            suffix = re.sub(r"^(?:扔进|丢进|放进)", "", suffix)
+            if len(prefix) + len(suffix) <= max_chars - len(subject) - len("谈"):
+                body = prefix + suffix
+            else:
+                body = prefix
         else:
             body = prefix
-    else:
-        body = prefix
-    remaining = max_chars - len(subject) - len("谈")
-    if remaining <= 0:
+        remaining = max_chars - len(subject) - len("谈")
+        if remaining > 0:
+            body = body[:remaining].rstrip("的了着")
+            candidate = f"{subject}谈{body}"
+            candidate = normalize_shared_upload_title(
+                candidate,
+                max_chars=max_chars,
+            )
+            if candidate:
+                return candidate
+
+    # Some grounded Bilibili fallbacks are complete spoken sentences. Remove
+    # the conversational lead-in and turn the conditional into a claim.
+    cleaned = re.sub(
+        r"^(?:再说一次|再强调一次|我的意思是|换句话说)[，,]\s*",
+        "",
+        value,
+    )
+    cleaned = re.sub(r"^如果从?", "", cleaned)
+    cleaned = cleaned.replace("说起，那就是", "是")
+    cleaned = cleaned.replace("面临的核心问题", "核心问题")
+    cleaned = re.sub(r"\s+", "", cleaned)
+    if cleaned and len(cleaned) <= max_chars:
+        return normalize_shared_upload_title(cleaned, max_chars=max_chars)
+    return ""
+
+def _fallback_cover_title_from_description(
+    description,
+    form_title="",
+    max_chars=48,
+):
+    """Turn a saved teaching summary and its metaphor into a cover headline."""
+    value = re.sub(r"\s+", " ", str(description or "")).strip()
+    if not value or not _contains_chinese_text(value, 8):
         return ""
-    body = body[:remaining].rstrip("的了着")
-    candidate = f"{subject}谈{body}"
-    return normalize_shared_upload_title(candidate, max_chars=max_chars)
+
+    first_sentence = re.split(r"[。！？\n]", value, maxsplit=1)[0]
+    if "教你用好" not in first_sentence:
+        return ""
+    subject, _ = first_sentence.split("教你用好", 1)
+    subject = subject.strip()
+    if not subject:
+        return ""
+
+    for sentence in re.split(r"[。！？\n]", value):
+        metaphor_match = re.search(
+            r"把(.{1,16}?)讲成[“\"]([^”\"]{2,24})[”\"]",
+            sentence,
+        )
+        if not metaphor_match:
+            continue
+        object_value = metaphor_match.group(1)
+        metaphor = metaphor_match.group(2)
+        candidate = f"{subject}用{metaphor}讲{object_value}"
+        if not 12 <= len(candidate) <= max_chars:
+            continue
+        if _cover_title_repeats_form_title(candidate, form_title):
+            continue
+        if (
+            _cover_title_has_quality_issue(candidate)
+            or _cover_title_has_engagement_issue(candidate)
+        ):
+            continue
+        return candidate
+    return ""
 
 
 def _fallback_cover_title(meta):
@@ -2824,7 +2959,7 @@ def generate_upload_metadata(
                 max_chars=wechat_title_max_chars,
             )
             fallback_source = "简介"
-        if not fallback_wechat_title and not sub_text and source_title:
+        if not fallback_wechat_title and source_title:
             fallback_wechat_title = _fallback_wechat_title_from_source_title(
                 source_title,
                 max_chars=wechat_title_max_chars,
@@ -2873,6 +3008,13 @@ def generate_upload_metadata(
             max_chars=48,
         )
         fallback_source = "字幕钩子"
+        if not fallback_cover_title and meta.get("description"):
+            fallback_cover_title = _fallback_cover_title_from_description(
+                meta.get("description"),
+                form_title=meta.get("title"),
+                max_chars=48,
+            )
+            fallback_source = "简介"
         if not fallback_cover_title and not sub_text:
             fallback_cover_title = _fallback_cover_title(meta)
             fallback_source = "本地"

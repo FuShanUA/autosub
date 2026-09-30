@@ -148,7 +148,7 @@ def get_optimized_encoder(ffmpeg_path, quality="high", original_bitrate=None, so
                     else: # "high" (visually lossless, maps 1.8x original to prevent bloat)
                         target_b = int(original_bitrate * 1.8)
                     print(f"   Target dynamic bitrate: {target_b // 1000} kbps (matching original source)")
-                    return "h264_videotoolbox", ["-b:v", f"{target_b}", "-profile:v", "high", "-level", "4.1"]
+                    return "h264_videotoolbox", ["-b:v", f"{target_b}", "-profile:v", "high"]
                 else:
                     if quality == "lossless":
                         vt_q = "95"
@@ -156,7 +156,7 @@ def get_optimized_encoder(ffmpeg_path, quality="high", original_bitrate=None, so
                         vt_q = "55"
                     else: # "high"
                         vt_q = "75"
-                    return "h264_videotoolbox", ["-q:v", vt_q, "-profile:v", "high", "-level", "4.1"]
+                    return "h264_videotoolbox", ["-q:v", vt_q, "-profile:v", "high"]
         except:
             pass
 
