@@ -8,6 +8,10 @@
 		<data>
 		j+4+BXCieIgJzjKwLtXUEiNxX5M=
 		</data>
+		<key>Resources/autosub_launcher_neon.icns</key>
+		<data>
+		QFMeTYE32NUucR/USKjySXvLSDo=
+		</data>
 		<key>Resources/autosub_v9.icns</key>
 		<data>
 		Ic/yFaS7im1QIyBaoCnY8ncdBnw=
@@ -33,6 +37,13 @@
 			<key>hash2</key>
 			<data>
 			UKtgM+BI71kylsJvPG7MvkpVpErNHtbi+2r47ECNTD8=
+			</data>
+		</dict>
+		<key>Resources/autosub_launcher_neon.icns</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			bMgNA8DJlaLBasrG7zu1+JiwpYwPcv228MLCc2/L+2o=
 			</data>
 		</dict>
 		<key>Resources/autosub_v9.icns</key>

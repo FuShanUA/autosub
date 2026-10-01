@@ -110,7 +110,7 @@ class AutoSubGUI:
         self.root.geometry("1020x500")
 
         # Set Window Icon
-        icon_name = "autosub_vibrant_v2.png" if sys.platform == "darwin" else "autosub.ico"
+        icon_name = "autosub_gui_neon.png" if sys.platform == "darwin" else "autosub.ico"
         icon_path = os.path.join(CURRENT_DIR, icon_name)
         if os.path.exists(icon_path):
             try:
@@ -156,7 +156,8 @@ class AutoSubGUI:
             "llm_vendor", self.settings.get("vendor", "Google Vertex AI")
         )
         self.key_editor_env_key = self.vendor_env_keys.get(self.key_editor_vendor, "VERTEX_SA_KEY_PATH")
-        self.current_process = None
+        self.current_processes = []
+        self._process_lock = threading.Lock()
         self.last_was_progress = False
         self.is_paused = False
 
@@ -627,6 +628,25 @@ class AutoSubGUI:
         if m: self.progress_var.set(float(m.group(1)))
         if any(e in msg for e in ["🎬", "🎙️", "🌍", "🔥"]): self.status_label.config(text=msg.strip())
 
+    def _register_process(self, proc):
+        with self._process_lock:
+            self.current_processes.append(proc)
+
+    def _unregister_process(self, proc):
+        with self._process_lock:
+            if proc in self.current_processes:
+                self.current_processes.remove(proc)
+
+    def _running_processes(self):
+        with self._process_lock:
+            return [proc for proc in self.current_processes if proc.poll() is None]
+
+    def _prune_finished_processes(self):
+        with self._process_lock:
+            self.current_processes = [
+                proc for proc in self.current_processes if proc.poll() is None
+            ]
+
     def start_process(self):
         v = self.input_var.get().strip()
         if not v: return messagebox.showwarning("警告", "请输入视频 URL 或文件")
@@ -644,10 +664,9 @@ class AutoSubGUI:
         self.log_text.config(state="normal"); self.log_text.delete(1.0, tk.END); self.log_text.config(state="disabled")
         
         # Ensure any previous process is truly gone
-        if self.current_process and self.current_process.poll() is None:
-            try: ProcessTree.kill(self.current_process.pid)
-            except: pass
-            self.current_process = None
+        for proc in self._running_processes():
+            try: ProcessTree.kill(proc.pid)
+            except Exception: pass
 
         # Robust Mapping for Localized Values
         trans_mode_map = {"平衡模式 (Balanced)": "balanced", "意译模式 (Paraphrase)": "paraphrase", "balanced": "balanced", "paraphrase": "paraphrase"}
@@ -713,39 +732,20 @@ class AutoSubGUI:
         if v_id_str:
             cmd.extend(["--llm-provider", v_id_str])
         cmd.extend(["--llm-model", self.llm_model_var.get()])
+        # Platform uploads stay in run_worker so upload-only follows the same
+        # order as a full run: cut ads first, then GD(full)/BI/WX(ad-cut).
         gdrive_folder = self.sync_gdrive_var.get().strip() if self.gdrive_enabled_var.get() else ""
-        if gdrive_folder:
-            cmd.extend(["--sync-gdrive", gdrive_folder])
-        if self.bili_enabled_var.get():
-            cmd.append("--bili-upload")
-        if self.wechat_enabled_var.get():
-            cmd.append("--wechat-upload")
-            if self.wechat_public_var.get():
-                cmd.append("--wechat-public")
 
         print(f"📤 [GUI] Upload-only: {' '.join(cmd)}")
         threading.Thread(target=self.run_worker, args=(cmd, v, self.output_dir_var.get(), gdrive_folder, py_exe), daemon=True).start()
 
     def run_worker(self, cmd, input_video, output_dir, gdrive_folder="", py_exe=None):
         import glob
-        # Open a workflow.log handle in the job's workdir so that post-pipeline
-        # upload logs are persisted alongside the autosub.py output. Without this,
-        # upload failures were invisible — they only showed in the GUI text panel
-        # and vanished when the app was closed.
+        # Post-pipeline upload logs are opened after the real project workdir is
+        # resolved. A local input may live in Downloads while autosub.py copies
+        # and burns the video under Projects.
         _log_path = None
         _log_file = None
-        try:
-            if not input_video.startswith("http"):
-                _vid_dir = os.path.dirname(input_video)
-            else:
-                _vid_dir = output_dir or BASE_OUTPUT_DIR
-            if _vid_dir:
-                _log_path = os.path.join(_vid_dir, "workflow.log")
-                _log_file = open(_log_path, "a", encoding="utf-8", errors="replace")
-                _log_file.write("\n--- 后续上传阶段 ---\n")
-                _log_file.flush()
-        except Exception:
-            pass
 
         def _persist(msg):
             """Write a message to both the GUI log panel and workflow.log."""
@@ -759,14 +759,13 @@ class AutoSubGUI:
 
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', bufsize=1)
-            self.current_process = proc
+            self._register_process(proc)
             self.root.after(0, lambda: self.pause_btn.config(state="normal"))
             if proc.stdout:
                 for line in proc.stdout: self.root.after(0, self.log, line.strip())
             ret_code = proc.wait()
-            # Main pipeline (incl. hardsub burn) finished. Release current_process so
-            # stop/pause no longer target the completed subprocess during uploads.
-            self.current_process = None
+            # Keep the pause/stop controls alive for GD/BI/WX post-processing.
+            self._unregister_process(proc)
             if ret_code != 0:
                 self.root.after(0, lambda r=ret_code: self.status_label.config(text="❌ 失败"))
             else:
@@ -826,7 +825,72 @@ class AutoSubGUI:
                 # sync_dir is the workdir holding the hardsub; passed to GDrive
                 # sync and as the workdir arg to build_bili_cmd.
                 sync_dir = workdir if newest_video else None
-                upload_jobs = []  # (label, cmd) pairs launched concurrently below
+                _log_dir = sync_dir
+                if _log_dir is None and not str(input_video).startswith("http"):
+                    _log_dir = os.path.dirname(input_video)
+                if _log_dir is None:
+                    _log_dir = output_dir or BASE_OUTPUT_DIR
+                try:
+                    _log_path = os.path.join(_log_dir, "workflow.log")
+                    _log_file = open(_log_path, "a", encoding="utf-8", errors="replace")
+                    _log_file.write("\n--- 后续上传阶段 ---\n")
+                    _log_file.flush()
+                except Exception as log_error:
+                    self.root.after(0, self.log, f"⚠️ 无法写入上传日志: {log_error}")
+
+                # Cut ads before building upload jobs. BI/WX must not publish the
+                # full version when the user asked for the ad-cut version.
+                ad_removal_ok = True
+                if getattr(self, "remove_ads_var", None) and self.remove_ads_var.get() and sync_dir:
+                    _persist("📱 主流程完成，开始剪除广告片段...")
+                    _ra_script = os.path.join(CURRENT_DIR, "remove_ads.py")
+                    _ra_model = self.llm_model_var.get() or "glm-5.2"
+                    _ra_prov = self.vendor_map.get(self.vendor_var.get(), "")
+                    _ra_cmd = [py_exe, _ra_script, sync_dir, "--model", _ra_model]
+                    if _ra_prov:
+                        _ra_cmd += ["--provider", _ra_prov]
+                    _ra_proc = None
+                    try:
+                        _ra_proc = subprocess.Popen(_ra_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1)
+                        self._register_process(_ra_proc)
+                        if _ra_proc.stdout:
+                            for _ra_line in _ra_proc.stdout:
+                                _persist(f"📱 [Ads] {_ra_line.strip()}")
+                        _ra_proc.wait()
+                        ad_removal_ok = _ra_proc.returncode == 0
+                    except Exception as _ra_e:
+                        ad_removal_ok = False
+                        _persist(f"❌ 广告剪除异常: {_ra_e}")
+                    finally:
+                        if _ra_proc is not None:
+                            self._unregister_process(_ra_proc)
+                    if not ad_removal_ok:
+                        _persist("⚠️ 广告剪除失败，Bilibili/微信上传已停止；Google Drive 仍同步完整版。")
+
+                upload_jobs = []  # (label, cmd, marker) tuples launched concurrently
+                bili_pending = self.bili_enabled_var.get() and not (
+                    sync_dir and os.path.exists(os.path.join(sync_dir, ".bili_uploaded"))
+                )
+                wechat_pending = self.wechat_enabled_var.get() and not (
+                    sync_dir and os.path.exists(os.path.join(sync_dir, ".wechat_uploaded"))
+                )
+                if not ad_removal_ok:
+                    bili_pending = False
+                    wechat_pending = False
+                shared_metadata = None
+                if sync_dir and (bili_pending or wechat_pending):
+                    from autosub import prepare_shared_upload_metadata
+                    shared_metadata = prepare_shared_upload_metadata(
+                        sync_dir,
+                        explicit_cover_title=self.wechat_cover_title_var.get().strip() or None,
+                        llm_model=self.llm_model_var.get(),
+                        llm_provider=self.vendor_map.get(self.vendor_var.get(), ""),
+                        on_log=_persist,
+                    )
+                    if not shared_metadata:
+                        _persist("⚠️ Bilibili/微信上传跳过：共享表单元数据生成失败或不完整。")
+                        bili_pending = False
+                        wechat_pending = False
                 # 1) Google Drive sync (mirrors autosub.py trigger_sync headless branch)
                 if gdrive_folder and sync_dir:
                     if os.path.exists(os.path.join(sync_dir, ".synced")):
@@ -837,8 +901,17 @@ class AutoSubGUI:
                         token_path = os.path.join(PROJECT_ROOT, ".agents", "skills", "google-drive-sync", "token.json")
                         sync_py = py_exe or sys.executable
                         if os.path.exists(sync_script) and os.path.exists(creds_path):
-                            gdrive_cmd = [sync_py, sync_script, "--local-dir", sync_dir, "--remote-id", gdrive_folder, "--credentials", creds_path, "--token", token_path, "--wrap-folder", "--headless"]
-                            upload_jobs.append(("☁️ [GDrive]", gdrive_cmd))
+                            gdrive_cmd = [
+                                sync_py, sync_script,
+                                "--local-dir", sync_dir,
+                                "--remote-id", gdrive_folder,
+                                "--credentials", creds_path,
+                                "--token", token_path,
+                                "--wrap-folder",
+                                "--exclude", "noads",
+                                "--headless",
+                            ]
+                            upload_jobs.append(("☁️ [GDrive]", gdrive_cmd, ".synced"))
                         else:
                             _persist(f"⚠️ 找不到 GDrive 同步脚本或凭证，跳过 Drive 同步: {sync_script}")
                 # 2) Bilibili upload (cmd built by the canonical autosub.build_bili_cmd,
@@ -846,7 +919,9 @@ class AutoSubGUI:
                 if self.bili_enabled_var.get():
                     if sync_dir and os.path.exists(os.path.join(sync_dir, ".bili_uploaded")):
                         _persist("📱 [Bilibili] 已上传过 (跳过)")
-                    else:
+                    elif not bili_pending:
+                        pass
+                    elif bili_pending and sync_dir:
                         bili_tid_str = self.bili_tid_var.get().strip()
                         bili_tid = bili_category = None
                         if bili_tid_str and bili_tid_str != "智能识别 (Auto)":
@@ -862,12 +937,16 @@ class AutoSubGUI:
                             category_name=bili_category,
                             tags=self.bili_tags_var.get().strip() or None,
                             season=self.bili_season_var.get().strip() or None,
+                            title=shared_metadata["title"],
+                            desc=shared_metadata["desc"],
+                            cover_title=shared_metadata["cover_title"],
                             llm_model=self.llm_model_var.get(),
                             llm_provider=self.vendor_map.get(self.vendor_var.get(), ""),
+                            require_complete_metadata=True,
                         )
                         if bili_cmd:
-                            _persist(f"📱 找到生成的视频: {os.path.basename(bili_cmd[2])}")
-                            upload_jobs.append(("📱 [Bilibili]", bili_cmd))
+                            _persist(f"📱 找到上传视频: {os.path.basename(bili_cmd[2])}")
+                            upload_jobs.append(("📱 [Bilibili]", bili_cmd, ".bili_uploaded"))
                         elif newest_video:
                             _persist("⚠️ Bilibili 上传跳过（未找到上传脚本或虚拟环境）。")
                         else:
@@ -876,63 +955,66 @@ class AutoSubGUI:
                 if self.wechat_enabled_var.get():
                     if sync_dir and os.path.exists(os.path.join(sync_dir, ".wechat_uploaded")):
                         _persist("💬 [WeChat] 已上传过 (跳过)")
-                    elif sync_dir:
-                        from autosub import build_wechat_cmd
-                        wechat_cmd = build_wechat_cmd(
-                            sync_dir,
-                            public=self.wechat_public_var.get(),
-                            cover_title=self.wechat_cover_title_var.get().strip() or None,
-                            llm_model=self.llm_model_var.get(),
-                            llm_provider=self.vendor_map.get(self.vendor_var.get(), ""),
-                        )
-                        if wechat_cmd:
-                            _persist(f"💬 找到生成的视频: {os.path.basename(wechat_cmd[2])}")
-                            upload_jobs.append(("💬 [WeChat]", wechat_cmd))
-                        elif newest_video:
-                            _persist("⚠️ 微信视频号上传跳过（未找到上传脚本或虚拟环境）。")
+                    elif not wechat_pending:
+                        pass
+                    elif wechat_pending and sync_dir:
+                        from autosub import build_wechat_cmd, get_wechat_upload_skip_reason
+                        skip_reason = get_wechat_upload_skip_reason(sync_dir)
+                        if skip_reason:
+                            _persist(f"⚠️ 微信视频号上传跳过: {skip_reason}")
                         else:
-                            _persist("⚠️ 未找到生成的 hardsub 视频文件，跳过微信视频号上传。")
+                            wechat_cmd = build_wechat_cmd(
+                                sync_dir,
+                                public=self.wechat_public_var.get(),
+                                title=shared_metadata["wechat_title"],
+                                desc=shared_metadata["desc"],
+                                cover_title=shared_metadata["cover_title"],
+                                llm_model=self.llm_model_var.get(),
+                                llm_provider=self.vendor_map.get(self.vendor_var.get(), ""),
+                                require_complete_metadata=True,
+                            )
+                            if wechat_cmd:
+                                _persist(f"💬 找到上传视频: {os.path.basename(wechat_cmd[2])}")
+                                upload_jobs.append(("💬 [WeChat]", wechat_cmd, ".wechat_uploaded"))
+                            elif newest_video:
+                                _persist("⚠️ 微信视频号上传命令构建失败。")
+                            else:
+                                _persist("⚠️ 未找到生成的 hardsub 视频文件，跳过微信视频号上传。")
                 # Launch all upload jobs concurrently, wait for all to finish
                 if upload_jobs:
                     self.root.after(0, lambda: self.status_label.config(text="📤 正在上传..."))
-                    def run_upload(label, ucmd):
+                    def run_upload(label, ucmd, marker):
                         _persist(f"{label} 开始上传...")
+                        proc = None
                         try:
                             proc = subprocess.Popen(ucmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', bufsize=1)
+                            self._register_process(proc)
                             if proc.stdout:
                                 for line in proc.stdout:
                                     _persist(f"{label} {line.strip()}")
                             proc.wait()
                             mark = "✅" if proc.returncode == 0 else "⚠️"
                             _persist(f"{label} {mark} 上传结束 (code={proc.returncode})")
+                            if proc.returncode == 0 and marker and sync_dir:
+                                try:
+                                    with open(os.path.join(sync_dir, marker), "w", encoding="utf-8") as marker_file:
+                                        marker_file.write("1")
+                                except Exception as marker_error:
+                                    _persist(f"{label} ⚠️ 写入上传标记失败: {marker_error}")
                         except Exception as ue:
                             _persist(f"{label} ❌ 异常: {ue}")
+                        finally:
+                            if proc is not None:
+                                self._unregister_process(proc)
                     upload_threads = []
-                    for label, ucmd in upload_jobs:
-                        t = threading.Thread(target=run_upload, args=(label, ucmd), daemon=True)
+                    for label, ucmd, marker in upload_jobs:
+                        t = threading.Thread(target=run_upload, args=(label, ucmd, marker), daemon=True)
                         upload_threads.append(t)
                         t.start()
                     for t in upload_threads:
                         t.join()
                 else:
                     _persist("⚠️ 没有可执行的上传任务。")
-                # Auto ad-removal after pipeline + uploads (controlled by the checkbox)
-                if getattr(self, "remove_ads_var", None) and self.remove_ads_var.get() and sync_dir:
-                    self.root.after(0, self.log, "📱 主流程完成，开始剪除广告片段...")
-                    _ra_script = os.path.join(CURRENT_DIR, "remove_ads.py")
-                    _ra_model = self.llm_model_var.get() or "glm-5.2"
-                    _ra_prov = self.vendor_map.get(self.vendor_var.get(), "")
-                    _ra_cmd = [py_exe, _ra_script, sync_dir, "--model", _ra_model]
-                    if _ra_prov:
-                        _ra_cmd += ["--provider", _ra_prov]
-                    try:
-                        _ra_proc = subprocess.Popen(_ra_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1)
-                        if _ra_proc.stdout:
-                            for _ra_line in _ra_proc.stdout:
-                                self.root.after(0, self.log, _ra_line.strip())
-                        _ra_proc.wait()
-                    except Exception as _ra_e:
-                        self.root.after(0, self.log, f"❌ 广告剪除异常: {_ra_e}")
                 _persist("✅ 全部完成！")
                 self.root.after(0, lambda: self.status_label.config(text="✅ 完成！"))
         except Exception as e:
@@ -942,7 +1024,7 @@ class AutoSubGUI:
             if _log_file:
                 try: _log_file.close()
                 except: pass
-            self.current_process = None
+            self._prune_finished_processes()
             self.root.after(0, lambda: self.start_btn.config(state="normal"))
             self.root.after(0, lambda: self.upload_btn.config(state="normal"))
             self.root.after(0, lambda: self.stop_btn.config(state="disabled"))
@@ -950,33 +1032,50 @@ class AutoSubGUI:
             self.is_paused = False
 
     def toggle_pause(self):
-        if not self.current_process:
+        processes = self._running_processes()
+        if not processes:
             self.root.after(0, self.log, "⚠️ 没有正在运行的进程，无法暂停/继续")
             return
         if self.is_paused:
-            ok = ProcessTree.resume(self.current_process.pid)
-            if ok:
+            resumed = [
+                proc.pid for proc in processes if ProcessTree.resume(proc.pid)
+            ]
+            if resumed:
                 self.is_paused = False
                 self.root.after(0, lambda: self.pause_btn.config(text="暂停 (Pause)"))
-                self.root.after(0, self.log, "▶️ 已继续")
+                self.root.after(
+                    0,
+                    lambda count=len(resumed): self.log(f"▶️ 已继续 {count} 个进程"),
+                )
             else:
                 self.root.after(0, self.log, "⚠️ 继续失败，进程可能已结束")
         else:
-            ok = ProcessTree.suspend(self.current_process.pid)
-            if ok:
+            suspended = [
+                proc.pid for proc in processes if ProcessTree.suspend(proc.pid)
+            ]
+            if suspended:
                 self.is_paused = True
                 self.root.after(0, lambda: self.pause_btn.config(text="继续 (Resume)"))
-                self.root.after(0, self.log, "⏸️ 已暂停")
+                self.root.after(
+                    0,
+                    lambda count=len(suspended): self.log(f"⏸️ 已暂停 {count} 个进程"),
+                )
             else:
                 self.root.after(0, self.log, "⚠️ 暂停失败，进程可能已结束")
 
     def stop_process(self):
-        if self.current_process and self.current_process.poll() is None:
+        processes = self._running_processes()
+        if processes:
             try:
-                ProcessTree.kill(self.current_process.pid)
+                for proc in processes:
+                    ProcessTree.kill(proc.pid)
             except Exception:
                 pass
-            self.current_process = None
+            self._prune_finished_processes()
+            self.root.after(
+                0,
+                lambda count=len(processes): self.log(f"⛔ 已停止 {count} 个进程"),
+            )
         self.root.after(0, lambda: self.status_label.config(text="已停止"))
         self.root.after(0, lambda: self.start_btn.config(state="normal"))
         self.root.after(0, lambda: self.upload_btn.config(state="normal"))
@@ -1022,15 +1121,15 @@ class AutoSubGUI:
         threading.Thread(target=self._remove_ads_worker, args=(cmd,), daemon=True).start()
 
     def _remove_ads_worker(self, cmd):
+        proc = None
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', bufsize=1)
-            self.current_process = proc
+            self._register_process(proc)
             self.root.after(0, lambda: self.pause_btn.config(state="normal"))
             if proc.stdout:
                 for line in proc.stdout:
                     self.root.after(0, self.log, line.strip())
             ret = proc.wait()
-            self.current_process = None
             if ret == 0:
                 self.root.after(0, lambda: self.status_label.config(text="✅ 广告剪除完成"))
             else:
@@ -1038,7 +1137,9 @@ class AutoSubGUI:
         except Exception as e:
             self.root.after(0, lambda: self.log(f"❌ 广告剪除异常: {e}"))
         finally:
-            self.current_process = None
+            if proc is not None:
+                self._unregister_process(proc)
+            self._prune_finished_processes()
             self.root.after(0, lambda: self.start_btn.config(state="normal"))
             self.root.after(0, lambda: self.stop_btn.config(state="disabled"))
             self.root.after(0, lambda: self.pause_btn.config(state="disabled", text="暂停 (Pause)"))
@@ -1066,6 +1167,7 @@ class AutoSubGUI:
             "api_key": self.api_key_var.get(),
             "quick": self.quick_var.get(),
             "multilang": self.multilang_var.get(),
+            "remove_ads": self.remove_ads_var.get(),
             "sync_gdrive": self.sync_gdrive_var.get(),
             "gdrive_enabled": self.gdrive_enabled_var.get(),
             "wechat_enabled": self.wechat_enabled_var.get(),
@@ -1086,7 +1188,7 @@ if __name__ == "__main__":
     # Set app icon early (before any widgets) so Cmd+Tab switcher picks it up
     try:
         from mac_icon import set_macos_app_icon
-        _icon_name = "autosub_vibrant_v2.png" if sys.platform == "darwin" else "autosub.ico"
+        _icon_name = "autosub_gui_neon.png" if sys.platform == "darwin" else "autosub.ico"
         set_macos_app_icon(root, os.path.join(CURRENT_DIR, _icon_name))
     except Exception:
         pass

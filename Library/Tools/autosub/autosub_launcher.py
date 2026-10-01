@@ -26,6 +26,23 @@ if getattr(sys, 'frozen', False):
 else:
     TOOLS_DIR = os.environ.get("AUTOSUB_TOOLS_DIR") or os.path.dirname(CURRENT_DIR)
 os.environ.setdefault("AUTOSUB_TOOLS_DIR", TOOLS_DIR)
+
+
+def venv_site_packages():
+    """Absolute path to this project's venv site-packages, or None."""
+    root = os.path.join(CURRENT_DIR, ".venv")
+    windows_layout = os.path.join(root, "Lib", "site-packages")
+    if os.path.isdir(windows_layout):
+        return windows_layout
+    lib = os.path.join(root, "lib")
+    if os.path.isdir(lib):
+        for entry in sorted(os.listdir(lib)):
+            candidate = os.path.join(lib, entry, "site-packages")
+            if os.path.isdir(candidate):
+                return candidate
+    return None
+
+
 # --- Robust Tool Discovery ---
 def get_ytdlp_path():
     # 1. Check local tools folder
@@ -74,7 +91,15 @@ NODE_EXE = discover_node()
 BATCH_SCRIPT = os.path.join(CURRENT_DIR, "autosub_batch_pro.py")
 SINGLE_SCRIPT = os.path.join(CURRENT_DIR, "autosub.py")
 DEFAULT_OUTPUT_ROOT = r"/Users/shanfu/cc/Projects"
+PROJECT_REGISTRY_PATH = os.path.join(os.path.expanduser("~"), ".autosub", "projects.json")
+LEGACY_PROJECT_SCAN_ROOTS = (
+    os.path.join(os.path.expanduser("~"), "Downloads"),
+    os.path.join(os.path.expanduser("~"), "Desktop"),
+    os.path.join(os.path.expanduser("~"), "Documents"),
+    os.path.join(os.path.expanduser("~"), "Movies"),
+)
 GDRIVE_FOLDER_ID = "18iAFFSuHQmZlxVN0dri1Gbje9SmpS96f"
+
 
 def discover_initial_cookies():
     """Finds cookies.txt in prioritized locations for the launcher."""
@@ -366,8 +391,21 @@ def launch_engine(cmd):
     ps_command = f'chcp 65001; & {{ {escaped_inner} }}'
 
     try:
-        # Final safety check: Clear PYTHONPATH to avoid version conflicts
-        if "PYTHONPATH" in os.environ:
+        # The .app bundle execs a homebrew interpreter with PYTHONHOME set, so
+        # clearing PYTHONPATH makes the engine resolve imports against
+        # homebrew's site-packages, which has rich and playwright but no
+        # psutil. Every process-management path in the engine then silently
+        # no-ops: orphans survive a restart and keep the shared WeChat browser
+        # profile locked, a wedged upload is never killed, and because the
+        # WeChat slot is serial that one wedged upload parks every remaining
+        # task at "queued" until the engine is restarted by hand. Point
+        # PYTHONPATH at the project venv instead of dropping it.
+        site_packages = venv_site_packages()
+        if site_packages:
+            os.environ["PYTHONPATH"] = os.pathsep.join([site_packages, CURRENT_DIR])
+        elif "PYTHONPATH" in os.environ:
+            # No venv to point at; keep the old behaviour rather than inherit a
+            # PYTHONPATH from an unrelated environment.
             del os.environ["PYTHONPATH"]
         os.environ["PYTHONUTF8"] = "1"
 
@@ -454,6 +492,98 @@ def has_uncompleted_tasks(project_path):
         return not check_all_completed(state_data)
     except Exception:
         return False
+
+
+def _load_project_registry() -> Set[str]:
+    """Load project paths recorded by local-folder mode."""
+    try:
+        with open(PROJECT_REGISTRY_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return set()
+
+    if not isinstance(data, list):
+        return set()
+    return {
+        os.path.abspath(str(path))
+        for path in data
+        if isinstance(path, str) and os.path.isdir(path)
+    }
+
+
+def register_project(project_path: str):
+    """Persist a project location so restart can find it outside DEFAULT_OUTPUT_ROOT."""
+    project_path = os.path.abspath(project_path)
+    if not os.path.isdir(project_path):
+        return
+
+    registered = _load_project_registry()
+    if project_path in registered:
+        return
+    registered.add(project_path)
+
+    registry_dir = os.path.dirname(PROJECT_REGISTRY_PATH)
+    os.makedirs(registry_dir, exist_ok=True)
+    temp_path = PROJECT_REGISTRY_PATH + ".tmp"
+    try:
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(sorted(registered), f, ensure_ascii=False, indent=2)
+        os.replace(temp_path, PROJECT_REGISTRY_PATH)
+    finally:
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
+
+def _candidate_project_directories() -> Set[str]:
+    """Collect default, indexed, and legacy local project folders."""
+    candidates: Set[str] = set()
+
+    def add_children(root: str):
+        try:
+            entries = os.scandir(root)
+        except OSError:
+            return
+        with entries:
+            for entry in entries:
+                try:
+                    if entry.is_dir():
+                        candidates.add(os.path.abspath(entry.path))
+                except OSError:
+                    continue
+
+    add_children(DEFAULT_OUTPUT_ROOT)
+    for root in LEGACY_PROJECT_SCAN_ROOTS:
+        add_children(root)
+    candidates.update(_load_project_registry())
+    return candidates
+
+
+def find_uncompleted_projects() -> List[tuple]:
+    """Find unfinished projects across the default root and local-folder locations."""
+    projects = []
+    for project_path in _candidate_project_directories():
+        state_path = os.path.join(project_path, "batch_state.json")
+        if not os.path.isfile(state_path):
+            continue
+        try:
+            with open(state_path, "r", encoding="utf-8") as f:
+                state_data = json.load(f)
+            if not check_all_completed(state_data):
+                projects.append((os.path.basename(project_path), project_path, state_data))
+        except (OSError, json.JSONDecodeError):
+            continue
+
+    def state_mtime(project):
+        state_path = os.path.join(project[1], "batch_state.json")
+        try:
+            return os.path.getmtime(state_path)
+        except OSError:
+            return 0.0
+
+    return sorted(projects, key=state_mtime, reverse=True)
 
 
 # ---------------------------------------------------------------------------
@@ -710,10 +840,211 @@ def ask_wechat_cover_title():
     ).strip()
 
 
+LOCAL_VIDEO_EXTENSIONS = (".mp4", ".mkv", ".webm", ".mov", ".ts")
+
+
+def is_local_source_video(filename: str) -> bool:
+    """Whether a folder entry is an input video rather than a prior output."""
+    name = filename.lower()
+    return (
+        name.endswith(LOCAL_VIDEO_EXTENSIONS)
+        and "_hardsub" not in name
+        and not name.endswith(".part")
+        and not re.search(r"\.f\d+\.", name)
+    )
+
+
+def find_local_video_files(folder_path: str) -> List[str]:
+    """Find source videos placed directly in a user-selected folder."""
+    try:
+        entries = os.listdir(folder_path)
+    except OSError:
+        return []
+
+    videos = []
+    for entry in entries:
+        path = os.path.join(folder_path, entry)
+        if os.path.isfile(path) and is_local_source_video(entry):
+            videos.append(path)
+    return sorted(videos, key=lambda path: os.path.basename(path).lower())
+
+
+def safe_local_video_title(path: str) -> str:
+    title = os.path.splitext(os.path.basename(path))[0].strip()
+    title = re.sub(r'[\\/*?:"<>|]', "_", title)[:80].strip()
+    return title or "Untitled Video"
+
+
+def link_local_video(source_path: str, workdir: str) -> str:
+    """Put a cheap filesystem link to the source video in a task workspace."""
+    destination = os.path.join(workdir, os.path.basename(source_path))
+    if os.path.lexists(destination):
+        if os.path.isdir(destination) and not os.path.islink(destination):
+            raise RuntimeError(f"Task video path is a directory: {destination}")
+        os.remove(destination)
+
+    try:
+        os.link(source_path, destination)
+    except OSError:
+        os.symlink(source_path, destination)
+    return destination
+
+
+def build_local_video_tasks(folder_path: str, videos: List[str]) -> Dict[str, Any]:
+    """Create or resume one isolated workspace for every local video."""
+    state_path = os.path.join(folder_path, "batch_state.json")
+    state: Dict[str, Any] = {}
+    if os.path.exists(state_path):
+        try:
+            with open(state_path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                state = loaded
+        except (OSError, json.JSONDecodeError):
+            state = {}
+
+    existing_tasks = {
+        key: value
+        for key, value in state.items()
+        if str(key).isdigit() and isinstance(value, dict)
+    }
+    next_uid = max((int(key) for key in existing_tasks), default=0)
+
+    for index, video_path in enumerate(videos, 1):
+        source_path = os.path.abspath(video_path)
+        existing = None
+        for value in existing_tasks.values():
+            if os.path.abspath(str(value.get("local_video", ""))) == source_path:
+                existing = value
+                break
+
+        safe_title = safe_local_video_title(source_path)
+        if existing and existing.get("workdir"):
+            workdir = os.path.abspath(str(existing["workdir"]))
+        else:
+            workdir = os.path.join(
+                folder_path, f"[{index:02d}] - {safe_title} [local]"
+            )
+
+        os.makedirs(workdir, exist_ok=True)
+        link_local_video(source_path, workdir)
+
+        if existing:
+            existing.update(
+                {
+                    "local_video": source_path,
+                    "title": existing.get("title") or safe_title,
+                    "workdir": workdir,
+                }
+            )
+            continue
+
+        next_uid += 1
+        state[str(next_uid)] = {
+            "uid": next_uid,
+            "url": f"local:{source_path}",
+            "vid_id": "local",
+            "title": safe_title,
+            "duration": "未知",
+            "status": "排队中 (TR)",
+            "pcts": {
+                "DL": 100.0,
+                "TR": 0.0,
+                "TL": 0.0,
+                "MR": 0.0,
+                "BR": 0.0,
+                "GD": 0.0,
+                "BI": 0.0,
+                "WX": 0.0,
+            },
+            "workdir": workdir,
+            "local_video": source_path,
+            "error": None,
+            "is_paused": False,
+            "retries": 0,
+        }
+
+    return state
+
+
+def process_local_folder_mode(folder_path: str, videos: List[str]):
+    """Turn a folder of direct video files into normal AutoSub tasks."""
+    folder_path = os.path.abspath(folder_path)
+    proj_name = os.path.basename(folder_path)
+    state = build_local_video_tasks(folder_path, videos)
+    task_items = [
+        (key, value)
+        for key, value in state.items()
+        if str(key).isdigit() and isinstance(value, dict)
+    ]
+    if not task_items:
+        console.print("[bold red]❌ 未找到可处理的视频文件。[/]")
+        return
+
+    console.print(f"\n[bold cyan]📁 本地视频文件夹模式: {proj_name}[/]")
+    console.print(f"[dim]发现 {len(task_items)} 个视频，将在独立任务目录中生成字幕。[/]\n")
+
+    table = Table(box=box.SIMPLE_HEAD, expand=True, border_style="bright_blue")
+    table.add_column("序号", width=6, style="bold cyan")
+    table.add_column("视频名称", overflow="ellipsis", no_wrap=True)
+    for i, (_, task) in enumerate(task_items, 1):
+        display_title = cjk_truncate(
+            str(task.get("title", "")), max(20, console.width - 6 - 6)
+        )
+        table.add_row(str(i), display_title)
+    console.print(table)
+
+    do_sync = Confirm.ask("\n是否同步到 Google Drive?", default=False)
+    do_bili = Confirm.ask("\n是否上传到 Bilibili?", default=False)
+    do_wechat, do_wechat_public = confirm_wechat_upload(state)
+    quality = Prompt.ask(
+        "\n选择压制字幕画质",
+        choices=["standard", "high", "lossless"],
+        default="high",
+    )
+    onboard_model_selection()
+
+    state["bili"] = do_bili
+    state["gdsync"] = do_sync
+    state["wechat"] = do_wechat
+    state["wechat_public"] = do_wechat_public
+    state_path = os.path.join(folder_path, "batch_state.json")
+    with open(state_path, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+    register_project(folder_path)
+
+    cmd = [
+        PYTHON_EXE,
+        BATCH_SCRIPT,
+        "--output",
+        os.path.dirname(folder_path),
+        "--sub-dir-name",
+        proj_name,
+        "--quality",
+        quality,
+    ]
+    if do_sync:
+        cmd.append("--gdsync")
+    if do_bili:
+        cmd.append("--bili-upload")
+    if do_wechat:
+        cmd.append("--wechat-upload")
+        if do_wechat_public:
+            cmd.append("--wechat-public")
+
+    console.print("\n[bold green]🚀 启动本地视频字幕引擎...[/]")
+    launch_engine(cmd)
+
+
 def process_folder_mode(folder_path: str):
     """Folder re-processing mode: skip download/transcription, re-run from translate/burn/upload."""
     folder_path = os.path.abspath(folder_path)
     proj_name = os.path.basename(folder_path)
+
+    direct_videos = find_local_video_files(folder_path)
+    if direct_videos:
+        process_local_folder_mode(folder_path, direct_videos)
+        return
 
     state_path = os.path.join(folder_path, "batch_state.json")
     existing_state = {}
@@ -724,7 +1055,6 @@ def process_folder_mode(folder_path: str):
         except Exception:
             pass
 
-    video_exts = (".mp4", ".mkv", ".webm")
     found_tasks = []
     for entry in sorted(os.listdir(folder_path)):
         sub_path = os.path.join(folder_path, entry)
@@ -734,7 +1064,7 @@ def process_folder_mode(folder_path: str):
             files = os.listdir(sub_path)
         except Exception:
             continue
-        videos = [f for f in files if f.endswith(video_exts) and "_hardsub" not in f and not re.search(r'\.f\d+\.', f)]
+        videos = [f for f in files if f.lower().endswith(LOCAL_VIDEO_EXTENSIONS) and "_hardsub" not in f and not re.search(r'\.f\d+\.', f)]
         if not videos:
             continue
         srts = [f for f in files if f.endswith(".srt") and not re.search(r'(\.zh|\.cn|\.bi)\.srt$', f)]
@@ -858,6 +1188,7 @@ def process_folder_mode(folder_path: str):
             cmd.append("--wechat-public")
 
     console.print(f"\n[bold green]🚀 启动文件夹重处理引擎...[/]")
+    register_project(folder_path)
     launch_engine(cmd)
 
 
@@ -868,20 +1199,7 @@ def main():
     console.print("[bold cyan]========================================================[/]")
 
     # Check for existing projects with uncompleted tasks
-    uncompleted_projects = []
-    if os.path.exists(DEFAULT_OUTPUT_ROOT):
-        for entry in os.listdir(DEFAULT_OUTPUT_ROOT):
-            project_path = os.path.join(DEFAULT_OUTPUT_ROOT, entry)
-            if os.path.isdir(project_path):
-                state_path = os.path.join(project_path, "batch_state.json")
-                if os.path.exists(state_path):
-                    try:
-                        with open(state_path, "r", encoding="utf-8") as f:
-                            state_data = json.load(f)
-                        if not check_all_completed(state_data):
-                            uncompleted_projects.append((entry, project_path, state_data))
-                    except Exception:
-                        pass
+    uncompleted_projects = find_uncompleted_projects()
 
     if uncompleted_projects:
         # Check active status of uncompleted projects
@@ -921,6 +1239,7 @@ def main():
             idx = int(choice) - 1
             proj_name, proj_path, state_data = uncompleted_projects[idx]
             is_run, pid = running_projects_status[proj_name]
+            project_root = os.path.dirname(proj_path)
 
             if is_run:
                 console.print(f"\n✨ [bold green]检测到项目 [cyan]{proj_name}[/] 正在后台运行 (PID {pid})。[/]")
@@ -929,7 +1248,7 @@ def main():
                 cmd = [
                     PYTHON_EXE,
                     BATCH_SCRIPT,
-                    "--output", DEFAULT_OUTPUT_ROOT,
+                    "--output", project_root,
                     "--sub-dir-name", proj_name
                 ]
                 launch_engine(cmd)
@@ -961,7 +1280,7 @@ def main():
             cmd = [
                 PYTHON_EXE,
                 BATCH_SCRIPT,
-                "--output", DEFAULT_OUTPUT_ROOT,
+                "--output", project_root,
                 "--sub-dir-name", proj_name,
                 "--quality", quality
             ]

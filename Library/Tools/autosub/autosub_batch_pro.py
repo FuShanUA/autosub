@@ -18,10 +18,53 @@ import argparse
 import shutil
 import glob
 import logging
-try:
-    import psutil
-except ModuleNotFoundError:
-    psutil = None
+import signal
+
+
+def _venv_site_packages():
+    """Absolute path to this project's venv site-packages, or None."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    root = os.path.join(here, ".venv")
+    windows_layout = os.path.join(root, "Lib", "site-packages")
+    if os.path.isdir(windows_layout):
+        return windows_layout
+    lib = os.path.join(root, "lib")
+    if os.path.isdir(lib):
+        for entry in sorted(os.listdir(lib)):
+            candidate = os.path.join(lib, entry, "site-packages")
+            if os.path.isdir(candidate):
+                return candidate
+    return None
+
+
+def _import_psutil():
+    """Import psutil, falling back to the project venv's site-packages.
+
+    The macOS .app hands the engine a copied interpreter whose PYTHONPATH the
+    launcher strips, so a plain import resolves against the system
+    site-packages and psutil goes missing. Orphan cleanup, child cleanup, the
+    pause kill and the single-instance check all test `psutil is None` or call
+    `psutil.Process` inside a bare except, so the engine keeps running with
+    every one of them silently disabled: a wedged upload is never killed, never
+    cleaned up on restart, and holds its serial slot until someone intervenes.
+    """
+    try:
+        import psutil
+        return psutil
+    except ModuleNotFoundError:
+        pass
+    site_packages = _venv_site_packages()
+    if site_packages and site_packages not in sys.path:
+        sys.path.append(site_packages)
+        try:
+            import psutil
+            return psutil
+        except ModuleNotFoundError:
+            pass
+    return None
+
+
+psutil = _import_psutil()
 try:
     import msvcrt
 except ImportError:
@@ -197,10 +240,13 @@ from autosub import (  # noqa: E402
     VENDOR_MAP,
     build_bili_cmd,
     build_wechat_cmd,
+    get_wechat_duration_skip_reason,
     get_wechat_upload_skip_reason,
     run_bili_cmd,
     run_wechat_cmd,
     generate_upload_metadata,
+    UPLOAD_STALL_TIMEOUT,
+    UPLOAD_SILENCE_TIMEOUT,
 )
 
 BROWSER_COOKIE_NAMES = {"chrome", "firefox", "safari", "edge"}
@@ -421,6 +467,15 @@ def parse_indices(input_str, total_count):
         return {i for i in range(1, total_count + 1) if i not in selected}
 
 # --- 数据模型 ---
+STAGE_ORDER = ("DL", "TR", "TL", "MR", "BR", "GD", "BI", "WX")
+STAGE_MARKERS = {
+    "BR": ".burn_complete",
+    "GD": ".synced",
+    "BI": ".bili_uploaded",
+    "WX": ".wechat_uploaded",
+}
+
+
 @dataclass
 class SubTask:
     uid: int
@@ -437,6 +492,7 @@ class SubTask:
     sub_dir: Optional[str] = None
     playlist_index: Optional[int] = None
     retries: int = 0
+    wx_skip_reason: Optional[str] = None
 
     def to_dict(self):
         d = asdict(self)
@@ -460,6 +516,92 @@ def is_wechat_over_limit_reason(reason: Optional[str]) -> bool:
     """Whether a WeChat upload stop reason is the platform duration limit."""
     value = str(reason or "")
     return "超过视频号" in value and "分钟限制" in value
+
+# --- 子进程树控制 ---
+# 上传子进程会再派生 chromium / ffmpeg，只杀父进程会留下占着浏览器 Profile 的
+# 孤儿，下一次视频号上传因此卡死。psutil 缺失时也必须能杀干净，所以这里提供
+# 一条不依赖 psutil 的兜底路径。
+# 视频号上传脚本必须一并列出：它派生的 chromium 持有共享浏览器 Profile，
+# 漏掉它会让重启后的第一个视频号上传卡在 Profile 锁上。
+CHILD_ENGINE_MARKERS = (
+    "transcribe_engine.py",
+    "smart_translate.py",
+    "burn_engine.py",
+    "bili_upload.py",
+    "wechat_upload.py",
+    "sync.py",
+)
+
+def _descendant_pids(pid: int) -> List[int]:
+    """Collect every descendant of pid, children first (deepest last)."""
+    found: List[int] = []
+    frontier = [pid]
+    seen = {pid}
+    while frontier:
+        current = frontier.pop(0)
+        try:
+            if sys.platform == "win32":
+                continue
+            out = subprocess.run(
+                ["pgrep", "-P", str(current)],
+                capture_output=True, text=True, timeout=5,
+            ).stdout
+        except Exception:
+            continue
+        for token in out.split():
+            try:
+                child = int(token)
+            except ValueError:
+                continue
+            if child in seen:
+                continue
+            seen.add(child)
+            found.append(child)
+            frontier.append(child)
+    return found
+
+
+def kill_pid_tree(pid: Optional[int], terminate: bool = False) -> bool:
+    """Signal a child process and all of its descendants. Returns True on success."""
+    if not pid:
+        return False
+    if psutil is not None:
+        try:
+            proc = psutil.Process(pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            return False
+        victims = proc.children(recursive=True)
+        victims.append(proc)
+        for victim in victims:
+            try:
+                victim.terminate() if terminate else victim.kill()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        return True
+
+    sig = signal.SIGTERM if terminate else signal.SIGKILL
+    victims = _descendant_pids(pid)
+    victims.append(pid)
+    signalled = False
+    for victim in reversed(victims):
+        try:
+            os.kill(victim, sig)
+            signalled = True
+        except OSError:
+            pass
+    return signalled
+
+
+def _pid_command(pid: int) -> str:
+    """Best-effort command line for a pid, used when psutil is unavailable."""
+    try:
+        return subprocess.run(
+            ["ps", "-o", "command=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+    except Exception:
+        return ""
+
 
 # --- 资源管理器 ---
 class ResourceManager:
@@ -575,6 +717,11 @@ class BatchEngine:
                                 running = True
                     except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                         running = False
+                elif psutil is None and old_pid != os.getpid() and "autosub_batch_pro.py" in _pid_command(old_pid):
+                    # Same check through `ps`. Without it a live engine is never
+                    # detected, the read-only Live Monitor never engages, and two
+                    # engines can drive one project at the same time.
+                    running = True
                 if running and old_pid != os.getpid():
                     print(f"✨ Active Batch Launcher instance detected (PID {old_pid}) running for this project.")
                     print("📊 Entering read-only Live Monitor Mode. Press Ctrl+C to exit without disturbing the running task.\n")
@@ -625,57 +772,80 @@ class BatchEngine:
         belonging to this project (transcribe_engine, smart_translate, burn_engine)
         to prevent resource leaks and concurrent execution of duplicate engines."""
         logger.info("🧹 Scanning for orphaned child engines from previous runs...")
-        if psutil is None:
-            logger.warning("psutil is unavailable; orphaned process cleanup skipped")
-            return
         cleaned_count = 0
         current_pid = os.getpid()
-        
+
         project_path_abs = os.path.abspath(self.project_dir)
-        
-        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
-            try:
-                pid = proc.info['pid']
-                if pid == current_pid:
-                    continue
-                cmdline = proc.info['cmdline']
-                if not cmdline:
-                    continue
-                
-                cmdline_str = " ".join(cmdline)
-                is_child_engine = any(x in cmdline_str for x in ["transcribe_engine.py", "smart_translate.py", "burn_engine.py", "bili_upload.py", "sync.py"])
-                
-                if is_child_engine:
-                    # Check if the process belongs to this project
-                    # 1. By checking if the project folder is mentioned in the command line
-                    belongs_to_project = project_path_abs in os.path.abspath(cmdline_str)
-                    
-                    # 2. Or by checking if the process current working directory is inside our project folder
-                    if not belongs_to_project:
-                        try:
-                            proc_cwd = os.path.abspath(proc.cwd())
-                            if proc_cwd.startswith(project_path_abs):
-                                belongs_to_project = True
-                        except:
-                            pass
-                            
-                    if belongs_to_project:
-                        logger.info(f"💀 Found orphaned child process PID {pid}: '{cmdline_str}'. Force killing...")
-                        # Kill the process and all its children
-                        try:
-                            for child in proc.children(recursive=True):
-                                child.kill()
-                            proc.kill()
-                            cleaned_count += 1
-                        except Exception as e_kill:
-                            logger.error(f"Failed to kill orphaned process {pid}: {e_kill}")
-            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+
+        for pid, cmdline_str in self._iter_process_table():
+            if pid == current_pid or not cmdline_str:
                 continue
-                
+            if not any(x in cmdline_str for x in CHILD_ENGINE_MARKERS):
+                continue
+            # Check if the process belongs to this project
+            # 1. By checking if the project folder is mentioned in the command line
+            belongs_to_project = project_path_abs in os.path.abspath(cmdline_str)
+            # 2. Or by checking if the process current working directory is inside our project folder
+            if not belongs_to_project and self._pid_cwd_in_project(pid, project_path_abs):
+                belongs_to_project = True
+            if not belongs_to_project:
+                continue
+            logger.info(f"💀 Found orphaned child process PID {pid}: '{cmdline_str}'. Force killing...")
+            if kill_pid_tree(pid):
+                cleaned_count += 1
+            else:
+                logger.error(f"Failed to kill orphaned process {pid}")
+
         if cleaned_count > 0:
             logger.info(f"✨ Successfully cleaned up {cleaned_count} orphaned child engine(s).")
         else:
             logger.info("✅ No orphaned child engines found.")
+
+    def _iter_process_table(self):
+        """Yield (pid, command line) for every visible process.
+
+        psutil is preferred. When it is missing the scan still has to run: a
+        leftover wechat_upload.py from the previous session keeps the shared
+        browser profile locked, and the next WeChat upload then wedges on that
+        lock while holding the only WeChat slot, which parks every other task at
+        "queued". `ps -axo` gives the same command lines without the dependency.
+        """
+        if psutil is not None:
+            for proc in psutil.process_iter(['pid', 'cmdline']):
+                try:
+                    cmdline = proc.info.get('cmdline')
+                    if cmdline:
+                        yield proc.info['pid'], " ".join(cmdline)
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    continue
+            return
+        logger.warning("psutil is unavailable; falling back to `ps` for the orphan scan")
+        try:
+            out = subprocess.run(
+                ["ps", "-axo", "pid=,command="],
+                capture_output=True, text=True, timeout=20,
+            ).stdout
+        except Exception as e:
+            logger.error(f"Process table unavailable; orphaned process cleanup skipped: {e}")
+            return
+        for line in out.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            pid_str, _, command = line.partition(" ")
+            try:
+                yield int(pid_str), command.strip()
+            except ValueError:
+                continue
+
+    def _pid_cwd_in_project(self, pid: int, project_path_abs: str) -> bool:
+        """psutil-only secondary belonging check: process cwd inside the project."""
+        if psutil is None:
+            return False
+        try:
+            return os.path.abspath(psutil.Process(pid).cwd()).startswith(project_path_abs)
+        except Exception:
+            return False
 
     def _pause_monitor(self):
         """Background thread that periodically scans tasks and forcefully kills
@@ -717,13 +887,7 @@ class BatchEngine:
                     for task in list(self.task_map.values()):
                         if (task.is_paused or self.res.global_pause) and task.pid is not None:
                             logger.info(f"[Pause Monitor] Force killing process {task.pid} for paused task {task.uid}")
-                            try:
-                                proc = psutil.Process(task.pid)
-                                for child in proc.children(recursive=True):
-                                    child.kill()
-                                proc.kill()
-                            except:
-                                pass
+                            kill_pid_tree(task.pid)
                             task.pid = None
             except Exception as e:
                 logger.error(f"[Pause Monitor] Error in background monitor loop: {e}")
@@ -837,16 +1001,28 @@ class BatchEngine:
     def kill_children(self):
         """Kill all child subprocesses on exit to prevent orphaned processes."""
         if psutil is None:
-            logger.warning("psutil is unavailable; child process cleanup skipped")
+            # Without psutil we cannot read a child's command line reliably, and
+            # the engine is already on its way out: anything still parented to it
+            # is ours. Kill the whole tree so chromium does not survive holding
+            # the shared WeChat browser profile.
+            logger.warning("psutil is unavailable; killing descendants via pgrep")
+            for pid in reversed(_descendant_pids(os.getpid())):
+                logger.info(f"Killing child on exit: PID {pid} ({_pid_command(pid)[:60]})")
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
             return
         try:
             parent = psutil.Process(os.getpid())
             for child in parent.children(recursive=True):
                 try:
                     cmdline = " ".join(child.cmdline())
-                    if any(x in cmdline for x in ["sync.py", "bili_upload.py", "wechat_upload.py", "transcribe_engine.py", "smart_translate.py", "burn_engine.py"]):
+                    if any(x in cmdline for x in CHILD_ENGINE_MARKERS):
                         logger.info(f"Killing child on exit: PID {child.pid} ({cmdline[:60]})")
-                        child.kill()
+                        # Tree kill: the uploader's chromium/ffmpeg grandchildren
+                        # do not match the markers but must not survive either.
+                        kill_pid_tree(child.pid)
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     pass
         except Exception as e:
@@ -877,6 +1053,117 @@ class BatchEngine:
                 with open(self.state_file, "w", encoding="utf-8") as f:
                     json.dump(data, f, ensure_ascii=False, indent=2)
         except: pass
+
+    def _sync_marker_progress(self, task: SubTask):
+        """Restore persisted progress from completion marker files."""
+        if not task.workdir:
+            return
+        for stage, marker in STAGE_MARKERS.items():
+            if os.path.exists(os.path.join(task.workdir, marker)):
+                task.pcts[stage] = 100.0
+
+    def _stage_is_complete(self, task: SubTask, stage: str) -> bool:
+        if stage == "GD" and not self.do_gdsync:
+            return True
+        if stage == "BI" and not self.do_bili:
+            return True
+        if stage == "WX" and not self.do_wechat:
+            return True
+
+        marker = STAGE_MARKERS.get(stage)
+        if marker and task.workdir and os.path.exists(os.path.join(task.workdir, marker)):
+            return True
+
+        if task.pcts.get(stage, 0.0) < 100.0:
+            return False
+
+        # A failed stage can retain a misleading 100% value. Keep it resettable
+        # when the status explicitly names that stage as the failure.
+        status_stage = ""
+        if "(" in task.status:
+            status_stage = task.status.split("(", 1)[1].split(")", 1)[0]
+        if stage == status_stage and task.status.startswith(("失败", "报错")):
+            return False
+        return True
+
+    def _first_unfinished_stage(self, task: SubTask) -> Optional[str]:
+        """Derive the next unfinished stage from markers and progress."""
+        self._sync_marker_progress(task)
+        for stage in STAGE_ORDER:
+            if not self._stage_is_complete(task, stage):
+                return stage
+        return None
+
+    def reset_task(self, task: SubTask) -> Optional[str]:
+        """Reset the next unfinished stage without discarding completed work."""
+        with self.lock:
+            stage = self._first_unfinished_stage(task)
+            if stage is None:
+                task.status = "完成"
+                task.error = None
+                task.retries = 0
+                self.save_state()
+                return None
+
+            if stage in ("TR", "TL", "MR", "BR") and task.workdir and os.path.isdir(task.workdir):
+                try:
+                    files = os.listdir(task.workdir)
+                    if stage == "TR":
+                        for name in files:
+                            if name.endswith(".srt") and not any(
+                                ext in name for ext in (".zh", ".cn", ".bi")
+                            ):
+                                try: os.remove(os.path.join(task.workdir, name))
+                                except OSError: pass
+                    elif stage == "TL":
+                        for name in files:
+                            if ".zh.srt" in name or ".cn.srt" in name:
+                                try: os.remove(os.path.join(task.workdir, name))
+                                except OSError: pass
+                    elif stage == "MR":
+                        for name in files:
+                            if ".bi.srt" in name:
+                                try: os.remove(os.path.join(task.workdir, name))
+                                except OSError: pass
+                    elif stage == "BR":
+                        for name in files:
+                            if name.endswith(".ass") or name.endswith("_hardsub.mp4"):
+                                try: os.remove(os.path.join(task.workdir, name))
+                                except OSError: pass
+                except OSError:
+                    pass
+
+            task.status = f"排队中 ({stage})"
+            task.pcts[stage] = 0.0
+            task.error = None
+            task.retries = 0
+            self.save_state()
+            return stage
+
+    def _refresh_wechat_skip(self, task: SubTask) -> Optional[str]:
+        """Persist an early WeChat duration-limit decision from known duration."""
+        if not self.do_wechat:
+            return None
+
+        duration_seconds = parse_duration_to_seconds(task.duration)
+        reason = get_wechat_duration_skip_reason(duration_seconds)
+        if reason:
+            if task.wx_skip_reason != reason:
+                task.wx_skip_reason = reason
+                logger.info(
+                    f"Task {task.uid} | WX | Early skip: {reason}"
+                )
+            return reason
+
+        # A duration-limit decision goes stale once the cap is lifted or the
+        # duration metadata is corrected. Drop it whenever the current duration no
+        # longer produces one, otherwise the worker keeps re-marking the task 超限
+        # and every manual retry dies before it starts. Other transient upload
+        # failures are left untouched, and the worker re-derives the reason from
+        # the real file before it decides to skip.
+        if task.wx_skip_reason and is_wechat_over_limit_reason(task.wx_skip_reason):
+            task.wx_skip_reason = None
+        return task.wx_skip_reason
 
     def load_state(self):
         if not os.path.exists(self.state_file): return
@@ -930,9 +1217,22 @@ class BatchEngine:
                         if os.path.exists(os.path.join(t.workdir, ".burn_complete")):
                             t.pcts["BR"] = 100.0
 
+                    if t.status.startswith("超限") and is_wechat_over_limit_reason(t.error):
+                        t.wx_skip_reason = t.error
+                    self._refresh_wechat_skip(t)
+
                     # Duration-limit skips are terminal, but they are not successes.
                     # Keep the persisted status/error so a restart does not requeue WX.
-                    if t.status.startswith("超限") and t.pcts.get("WX", 0.0) < 100.0:
+                    # Re-validate the limit before honoring it: the cap has been lifted,
+                    # so a 超限 status persisted by an older run must fall through to the
+                    # re-derivation below instead of blocking every later manual retry.
+                    if (
+                        t.status.startswith("超限")
+                        and t.pcts.get("WX", 0.0) < 100.0
+                        and get_wechat_duration_skip_reason(
+                            parse_duration_to_seconds(t.duration)
+                        )
+                    ):
                         t.pid = None
                         continue
 
@@ -982,6 +1282,7 @@ class BatchEngine:
             if any(t.url == url for t in self.task_map.values()): return
 
             task = SubTask(uid=new_uid, url=url, title=title or "未知视频", duration=duration or "未知", vid_id=vid_id, sub_dir=sub_dir, playlist_index=playlist_index)
+            self._refresh_wechat_skip(task)
             # Set initial workdir if title is available
             if title:
                 task.workdir = self.get_task_workdir(task)
@@ -1047,6 +1348,7 @@ class BatchEngine:
                 out = subprocess.check_output(cmd, creationflags=CREATE_NO_WINDOW, timeout=30).decode('utf-8', errors='ignore').strip()
                 if out and out != "未知":
                     task.duration = out
+                self._refresh_wechat_skip(task)
 
             # 3. Fetch vid_id (for X/Twitter, the URL status ID != yt-dlp video ID)
             # This is critical for folder lookup in disk_truth() to work correctly.
@@ -1126,6 +1428,7 @@ class BatchEngine:
                         if dur and dur != "未知":
                             task.duration = dur
                             found_on_disk = True
+                            self._refresh_wechat_skip(task)
 
                 # B. 物理文件未找到，尝试从 Web 获取
                 if not found_on_disk:
@@ -1205,8 +1508,15 @@ class BatchEngine:
                 need_gd = self.do_gdsync and not os.path.exists(os.path.join(task.workdir, ".synced"))
                 need_bi = self.do_bili and not os.path.exists(os.path.join(task.workdir, ".bili_uploaded"))
                 need_wx = self.do_wechat and not os.path.exists(os.path.join(task.workdir, ".wechat_uploaded"))
-                if need_gd or need_bi or need_wx:
-                    task.status = "排队中 (GD)"
+                pending_upload_stages = []
+                if need_gd:
+                    pending_upload_stages.append("GD")
+                if need_bi:
+                    pending_upload_stages.append("BI")
+                if need_wx:
+                    pending_upload_stages.append("WX")
+                if pending_upload_stages:
+                    task.status = f"排队中 ({'/'.join(pending_upload_stages)})"
                     _gd_pct = 100.0 if not need_gd else 0.0
                     _bi_pct = 100.0 if not need_bi else 0.0
                     _wx_pct = 100.0 if not need_wx else 0.0
@@ -1283,26 +1593,50 @@ class BatchEngine:
         for th in threads: th.join()
         logger.info("Full physical sync completed.")
 
-    def run_process(self, task: SubTask, stage: str, cmd: List[str], start_pct: float = 0.0, end_pct: float = 100.0):
+    def run_process(
+        self,
+        task: SubTask,
+        stage: str,
+        cmd: List[str],
+        start_pct: float = 0.0,
+        end_pct: float = 100.0,
+        status_label: Optional[str] = None,
+        stall_timeout: Optional[float] = None,
+        silence_timeout: Optional[float] = None,
+    ):
         """通用环节运行器，带进度抓取与多步进度映射。"""
         sem = self.res.get_sem(stage)
         has_sem = False
         output_lines = []
+        display_label = status_label or stage
         try:
             # 1. 启动前的暂停检查 (不占坑)
             while (task.is_paused or self.res.global_pause) and not self.abort:
                 with self.lock:
-                    task.status = f"暂停中 ({stage})"
+                    task.status = f"暂停中 ({display_label})"
                 time.sleep(0.5)
 
             if self.abort: return False
 
             # 2. 占坑并启动
-            sem.acquire()
+            # 上传槽位是串行的（视频号共用浏览器 Profile）。排队时每 5 分钟留一条
+            # 日志，否则界面上只剩一个"排队中"，分不清是在等槽位还是已经卡死。
+            _slot_wait_start = time.time()
+            _next_slot_notice = _slot_wait_start + 300.0
+            while not sem.acquire(timeout=5.0):
+                if self.abort:
+                    return False
+                _now = time.time()
+                if _now >= _next_slot_notice:
+                    _next_slot_notice += 300.0
+                    logger.info(
+                        f"Task {task.uid} | {stage} | 等待上传槽位 "
+                        f"{int(_now - _slot_wait_start)}s（同类上传串行执行中）"
+                    )
             has_sem = True
 
             with self.lock:
-                task.status = f"运行中 ({stage})"
+                task.status = f"运行中 ({display_label})"
 
             logger.info(f"Task {task.uid} | {stage} | Start: {' '.join(cmd)}")
             p = subprocess.Popen(
@@ -1311,6 +1645,11 @@ class BatchEngine:
                cwd=task.workdir, creationflags=CREATE_NO_WINDOW
            )
             task.pid = p.pid
+
+            # 看门狗状态。output=最后一次收到输出的时刻，advance=百分比最后一次
+            # 前进的时刻。只有调用方显式传入超时才生效：BI/WX 会传，GD 的 sync.py
+            # 输出不规律，不监控。
+            _stall_note = ""
 
             if p.stdout:
                 import queue as _queue
@@ -1331,9 +1670,52 @@ class BatchEngine:
                 _rt = _threading.Thread(target=_stdout_reader, daemon=True)
                 _rt.start()
                 _last_save = 0.0
+                _watch = {"output": time.time(), "advance": time.time(), "pct": -1.0}
+
+                def _consume(_line, allow_save=False):
+                    nonlocal _last_save
+                    _watch["output"] = time.time()
+                    output_lines.append(_line)
+                    m = re.search(r'Progress:\s*([\d\.]+)%', _line) or re.search(r'\[download\]\s*([\d\.]+)%', _line) or re.search(r'上传进度:\s*([\d\.]+)%', _line)
+                    if not m:
+                        return
+                    val = float(m.group(1))
+                    if val > _watch["pct"]:
+                        _watch["pct"] = val
+                        _watch["advance"] = time.time()
+                    mapped_val = start_pct + (val / 100.0) * (end_pct - start_pct)
+                    if mapped_val > task.pcts.get(stage, 0.0):
+                        task.pcts[stage] = round(mapped_val, 1)
+                        if allow_save:
+                            _now = time.time()
+                            if _now - _last_save > 2.0:
+                                self.save_state()
+                                _last_save = _now
+
+                def _stall_reason():
+                    now = time.time()
+                    if silence_timeout and now - _watch["output"] > silence_timeout:
+                        return f"{int(now - _watch['output'])}s 无任何输出"
+                    if stall_timeout and now - _watch["advance"] > stall_timeout:
+                        return f"进度停在 {max(_watch['pct'], 0.0):.1f}% 已 {int(now - _watch['advance'])}s"
+                    return None
+
                 while True:
                     if self.abort:
-                        p.kill(); break
+                        kill_pid_tree(p.pid); break
+                    # 每轮都查，不只在队列空转时查：视频号上传会持续打印轮询日志
+                    # 而百分比不动，只在队列超时时检查就永远不会触发。
+                    if p.poll() is None:
+                        reason = _stall_reason()
+                        if reason:
+                            _stall_note = reason
+                            logger.error(
+                                f"Task {task.uid} | {stage} | 看门狗触发：{reason}；"
+                                f"杀掉整棵进程树，释放上传槽位后交给重试逻辑"
+                            )
+                            kill_pid_tree(p.pid)
+                            _reader_stop.set()
+                            break
                     try:
                         line = _line_q.get(timeout=1.0)
                     except Exception:
@@ -1344,43 +1726,30 @@ class BatchEngine:
                                 except Exception:
                                     break
                                 if line is None: break
-                                output_lines.append(line)
-                                m = re.search(r'Progress:\s*([\d\.]+)%', line) or re.search(r'\[download\]\s*([\d\.]+)%', line) or re.search(r'上传进度:\s*([\d\.]+)%', line)
-                                if m:
-                                    val = float(m.group(1))
-                                    mapped_val = start_pct + (val / 100.0) * (end_pct - start_pct)
-                                    if mapped_val > task.pcts.get(stage, 0.0):
-                                        task.pcts[stage] = round(mapped_val, 1)
+                                _consume(line)
                             break
                         continue
                     if line is None: break
-                    output_lines.append(line)
-
-                    m = re.search(r'Progress:\s*([\d\.]+)%', line) or re.search(r'\[download\]\s*([\d\.]+)%', line) or re.search(r'上传进度:\s*([\d\.]+)%', line)
-                    if m:
-                        val = float(m.group(1))
-                        mapped_val = start_pct + (val / 100.0) * (end_pct - start_pct)
-                        if mapped_val > task.pcts.get(stage, 0.0):
-                            task.pcts[stage] = round(mapped_val, 1)
-                            _now = time.time()
-                            if _now - _last_save > 2.0:
-                                self.save_state()
-                                _last_save = _now
+                    _consume(line, allow_save=True)
 
                     if task.is_paused or self.res.global_pause:
                         logger.info(f"Task {task.uid} | {stage} | Detected pause request, KILLING process to yield slot.")
-                        try:
-                            proc = psutil.Process(task.pid)
-                            for child in proc.children(recursive=True):
-                                try: child.kill()
-                                except: pass
-                            proc.kill()
-                        except: pass
+                        kill_pid_tree(task.pid)
                         _reader_stop.set()
                         break
 
-            # 阻塞等待直到进程彻底退出
-            p.wait()
+                # 先等进程退出，让读取线程自己读到 EOF，再关掉管道。不关的话
+                # 每次上传都泄漏一个描述符，而引擎是长驻进程。
+                p.wait()
+                _reader_stop.set()
+                _rt.join(timeout=2)
+                try:
+                    p.stdout.close()
+                except Exception:
+                    pass
+            else:
+                # 阻塞等待直到进程彻底退出
+                p.wait()
             task.pid = None
             if p.returncode == 0:
                 task.pcts[stage] = end_pct
@@ -1395,7 +1764,7 @@ class BatchEngine:
                 if task.pcts.get(stage, 0.0) >= 100.0:
                     task.pcts[stage] = 0.0
                 task.status = f"失败 ({stage})"
-                task.error = f"Exit {p.returncode}"
+                task.error = f"上传卡死（看门狗：{_stall_note}）" if _stall_note else f"Exit {p.returncode}"
                 last_out = "".join(output_lines[-10:]).strip()
                 logger.error(f"Task {task.uid} | {stage} | FAILED | Code: {p.returncode} | Last Out: {last_out}")
                 return False
@@ -1463,6 +1832,9 @@ class BatchEngine:
                             local_sec = parse_duration_to_seconds(local_dur)
                             if local_sec <= 0:
                                 continue
+                            if not task.duration or task.duration == "未知":
+                                task.duration = local_dur
+                            self._refresh_wechat_skip(task)
                             # Try remote duration; fall back to size check (>10MB)
                             remote_sec = parse_duration_to_seconds(task.duration) if task.duration and task.duration != "未知" else 0
                             if remote_sec > 0 and abs(local_sec - remote_sec) / remote_sec < 0.05:
@@ -1480,7 +1852,7 @@ class BatchEngine:
                     cmd = list(VDOWN_CMD) + [task.url, self.cookie_path, workdir, "--title", task.title]
                 elif "TR" in task.status:
                     stage = "TR"
-                    vids = [f for f in os.listdir(workdir) if f.endswith((".mp4", ".mkv", ".webm")) and "_hardsub" not in f and not re.search(r'\.f\d+\.', f)]
+                    vids = [f for f in os.listdir(workdir) if f.lower().endswith((".mp4", ".mkv", ".webm", ".mov", ".ts")) and "_hardsub" not in f and not re.search(r'\.f\d+\.', f)]
                     cmd = list(TRANSCRIBER_CMD) + [os.path.join(workdir, vids[0]), "--output", workdir, "--no-gui"]
                 elif "TL" in task.status:
                     stage = "TL"
@@ -1497,9 +1869,9 @@ class BatchEngine:
                 elif "BR" in task.status:
                     stage = "BR"
                     bi = [f for f in os.listdir(workdir) if ".bi.srt" in f][0]
-                    vid = [f for f in os.listdir(workdir) if f.endswith((".mp4", ".mkv", ".webm")) and "_hardsub" not in f][0]
+                    vid = [f for f in os.listdir(workdir) if f.lower().endswith((".mp4", ".mkv", ".webm", ".mov", ".ts")) and "_hardsub" not in f][0]
                     ass = bi.replace(".srt", ".ass")
-                    out = vid.replace(".mp4", "_hardsub.mp4").replace(".mkv", "_hardsub.mp4")
+                    out = os.path.splitext(vid)[0] + "_hardsub.mp4"
                     
                     # Load and apply global subtitle styles
                     settings = self._load_global_settings()
@@ -1538,17 +1910,37 @@ class BatchEngine:
                         start_pct = 2.0
                         end_pct = 100.0
                     else: continue
-                elif "GD" in task.status:
+                elif any(upload_stage in task.status for upload_stage in ("GD", "BI", "WX")):
                     stage = "GD"
                     need_gd = self.do_gdsync and not os.path.exists(os.path.join(workdir, ".synced"))
                     need_bi = self.do_bili and not os.path.exists(os.path.join(workdir, ".bili_uploaded"))
-                    need_wx = self.do_wechat and not os.path.exists(os.path.join(workdir, ".wechat_uploaded"))
+                    wx_skip_reason = self._refresh_wechat_skip(task)
+                    if self.do_wechat and not wx_skip_reason and not os.path.exists(
+                        os.path.join(workdir, ".wechat_uploaded")
+                    ):
+                        wx_skip_reason = get_wechat_upload_skip_reason(workdir)
+                        if wx_skip_reason and is_wechat_over_limit_reason(wx_skip_reason):
+                            task.wx_skip_reason = wx_skip_reason
+                            self.save_state()
+                    wx_over_limit = bool(
+                        wx_skip_reason and is_wechat_over_limit_reason(wx_skip_reason)
+                    )
+                    need_wx = (
+                        self.do_wechat
+                        and not wx_over_limit
+                        and not os.path.exists(os.path.join(workdir, ".wechat_uploaded"))
+                    )
                     upload_llm_model, upload_llm_provider = self._get_upload_llm_settings()
 
                     # Count how many uploads are needed
                     active = sum([bool(need_gd), bool(need_bi), bool(need_wx)])
 
                     if active == 0:
+                        if wx_over_limit:
+                            task.status = "超限 (WX)"
+                            task.error = f"视频号上传未启动：{wx_skip_reason}"
+                            self.save_state()
+                            break
                         cmd = []
                     elif active == 1:
                         # Single upload — use the shared run_process block below
@@ -1591,6 +1983,19 @@ class BatchEngine:
                         # scenario where slow LLM calls delay GD sync by 20+ min.
                         sync_cmd = [str(x) for x in [PYTHON_EXE, SYNC_SCRIPT, "--local-dir", workdir, "--remote-id", self.gdsync_id, "--wrap-folder", "--headless"] if x is not None] if need_gd else None
 
+                        pending_upload_stages = []
+                        if need_gd:
+                            pending_upload_stages.append("GD")
+                        if need_bi:
+                            pending_upload_stages.append("BI")
+                        if need_wx:
+                            pending_upload_stages.append("WX")
+                        upload_status_label = "/".join(pending_upload_stages)
+                        if upload_status_label:
+                            with self.lock:
+                                task.status = f"运行中 ({upload_status_label})"
+                                self.save_state()
+
                         # Phase 1: kick off GD sync + MetaGen concurrently
                         gd_result = [False]
                         bi_result = [False]
@@ -1600,7 +2005,16 @@ class BatchEngine:
                         gd_thread = None
                         if need_gd and sync_cmd:
                             def _run_gd():
-                                gd_result[0] = self.run_process(task, "GD", sync_cmd, start_pct=0.0, end_pct=100.0)
+                                gd_result[0] = self.run_process(
+                                    task,
+                                    "GD",
+                                    sync_cmd,
+                                    start_pct=0.0,
+                                    end_pct=100.0,
+                                    status_label=upload_status_label,
+                                )
+                                if gd_result[0]:
+                                    self._write_upload_marker(task, "GD")
                             gd_thread = threading.Thread(target=_run_gd, daemon=True)
                             gd_thread.start()
 
@@ -1628,6 +2042,10 @@ class BatchEngine:
                         metadata_failed = False
                         upload_failure_reasons = []
                         permanent_upload_failure = False
+                        if wx_over_limit:
+                            upload_failure_reasons.append(
+                                f"视频号上传未启动：{wx_skip_reason}"
+                            )
                         if need_wx and meta and not str(meta.get("wechat_title") or "").strip():
                             meta_is_complete = False
                         if (need_bi or need_wx) and not meta_is_complete:
@@ -1684,6 +2102,18 @@ class BatchEngine:
                             upload_threads.append(threading.Thread(target=self._run_bili_upload, args=(task, bili_cmd, bi_result), daemon=True))
                         if need_wx and wechat_cmd:
                             upload_threads.append(threading.Thread(target=self._run_wechat_upload, args=(task, wechat_cmd, wx_result), daemon=True))
+
+                        active_stages = []
+                        if gd_thread and gd_thread.is_alive():
+                            active_stages.append("GD")
+                        if need_bi and bili_cmd:
+                            active_stages.append("BI")
+                        if need_wx and wechat_cmd:
+                            active_stages.append("WX")
+                        if active_stages:
+                            with self.lock:
+                                task.status = f"运行中 ({'/'.join(active_stages)})"
+                                self.save_state()
 
                         for t in upload_threads: t.start()
                         # Wait for GD sync (may already be done)
@@ -1763,7 +2193,16 @@ class BatchEngine:
 
                 if cmd:
                     cmd = [str(x) for x in cmd if x is not None]
-                    if self.run_process(task, stage, cmd, start_pct=start_pct, end_pct=end_pct):
+                    # 只有 BI/WX 走看门狗：这两条上传会真的卡死（视频号尤其明显，
+                    # 子进程一直打印轮询日志但百分比不动），而串行槽位只有一个，
+                    # 卡住一个就把后面所有任务钉在"等待"。GD 的 sync.py 输出不规律，
+                    # 不纳入监控。
+                    _watchdog_kwargs = (
+                        {"stall_timeout": UPLOAD_STALL_TIMEOUT,
+                         "silence_timeout": UPLOAD_SILENCE_TIMEOUT}
+                        if stage in ("BI", "WX") else {}
+                    )
+                    if self.run_process(task, stage, cmd, start_pct=start_pct, end_pct=end_pct, **_watchdog_kwargs):
                         if stage == "BR":
                             try:
                                 with open(os.path.join(workdir, ".burn_complete"), "w", encoding="utf-8") as f:
@@ -1825,30 +2264,94 @@ class BatchEngine:
             return "失败 (GD)"
         return "失败 (上传)"
 
-    def _build_bili_cmd(self, workdir, llm_model=None, llm_provider=None):
-        """Build Bilibili upload command via the canonical autosub.build_bili_cmd.
-        All metadata (tid, tags, desc, season) is auto-generated per-video by
-        bili_upload.py's built-in LLM logic."""
-        cmd = build_bili_cmd(
+    def _resolve_upload_metadata(self, workdir, llm_model=None, llm_provider=None):
+        """Return complete pre-generated upload metadata for workdir, else None.
+
+        generate_upload_metadata() reuses upload_metadata.json and only calls the
+        LLM for fields that are missing or stale, so this stays cheap on retries.
+        """
+        meta = generate_upload_metadata(
             workdir,
+            on_log=lambda msg: logger.info(f"MetaGen | {msg}"),
             llm_model=llm_model,
             llm_provider=llm_provider,
         )
+        if not meta:
+            return None
+        for field in ("title", "description", "cover_title"):
+            if not str(meta.get(field) or "").strip():
+                return None
+        return meta
+
+    def _build_bili_cmd(self, workdir, llm_model=None, llm_provider=None):
+        """Build Bilibili upload command via the canonical autosub.build_bili_cmd.
+
+        A single remaining stage goes through here instead of the overlapping
+        pipeline, so it must pass the same pre-generated metadata. Without it
+        bili_upload.py falls back to its own LLM title and a retry publishes
+        different metadata than the first attempt.
+        """
+        meta = self._resolve_upload_metadata(workdir, llm_model, llm_provider)
+        cmd = build_bili_cmd(
+            workdir,
+            title=meta.get("title") if meta else None,
+            desc=meta.get("description") if meta else None,
+            cover_title=meta.get("cover_title") if meta else None,
+            llm_model=llm_model,
+            llm_provider=llm_provider,
+            require_complete_metadata=True,
+        )
         if cmd is None:
-            logger.warning(f"Bilibili cmd build failed for {workdir} (script/venv/hardsub missing)")
+            logger.warning(
+                f"Bilibili cmd build failed for {workdir} "
+                "(script/venv/hardsub missing or metadata incomplete)"
+            )
         return cmd
 
     def _build_wechat_cmd(self, workdir, llm_model=None, llm_provider=None):
-        """Build WeChat Channels upload command via the canonical autosub API."""
+        """Build WeChat Channels upload command via the canonical autosub API.
+
+        Mirrors the overlapping pipeline: the form title comes from wechat_title
+        and the command is refused when pre-generated metadata is incomplete.
+        """
+        meta = self._resolve_upload_metadata(workdir, llm_model, llm_provider)
+        if meta and not str(meta.get("wechat_title") or "").strip():
+            meta = None
         cmd = build_wechat_cmd(
             workdir,
+            title=meta.get("wechat_title") if meta else None,
+            desc=meta.get("description") if meta else None,
+            cover_title=meta.get("cover_title") if meta else None,
             public=self.wechat_public,
             llm_model=llm_model,
             llm_provider=llm_provider,
+            require_complete_metadata=True,
         )
         if cmd is None:
-            logger.warning(f"WeChat cmd build failed for {workdir} (script/python/hardsub missing)")
+            logger.warning(
+                f"WeChat cmd build failed for {workdir} "
+                "(script/python/hardsub missing or metadata incomplete)"
+            )
         return cmd
+
+    def _write_upload_marker(self, task, stage):
+        """Persist an upload's marker file the moment that upload succeeds.
+
+        Parallel GD/BI/WX uploads used to write their markers only after every
+        sibling thread joined. A fast BI upload therefore stayed unmarked while a
+        slow WX upload ran, and a restart or retry in that window re-uploaded the
+        already-published stage (duplicate Bilibili post).
+        """
+        markers = {"GD": ".synced", "BI": ".bili_uploaded", "WX": ".wechat_uploaded"}
+        marker = markers.get(stage)
+        workdir = task.workdir
+        if not marker or not workdir:
+            return
+        try:
+            with open(os.path.join(workdir, marker), "w", encoding="utf-8") as f:
+                f.write("1")
+        except OSError as e:
+            logger.error(f"Task {task.uid} | {stage} | marker write failed: {e}")
 
     def _run_bili_upload(self, task, cmd, result_box):
         """Run Bilibili upload in a background thread (parallel with GD sync),
@@ -1878,6 +2381,7 @@ class BatchEngine:
             if ok:
                 with self.lock:
                     task.pcts["BI"] = 100.0
+                self._write_upload_marker(task, "BI")
                 result_box[0] = True
                 logger.info(f"Task {task.uid} | BI | Success")
             else:
@@ -1907,10 +2411,22 @@ class BatchEngine:
             def on_log(line):
                 logger.info(f"Task {task.uid} | WX | {line}")
 
-            ok = run_wechat_cmd(cmd, on_log=on_log, abort_flag=lambda: self.abort)
+            def on_progress(pct):
+                if pct > task.pcts.get("WX", 0.0):
+                    with self.lock:
+                        task.pcts["WX"] = round(pct, 1)
+                        self.save_state()
+
+            ok = run_wechat_cmd(
+                cmd,
+                on_progress=on_progress,
+                on_log=on_log,
+                abort_flag=lambda: self.abort,
+            )
             if ok:
                 with self.lock:
                     task.pcts["WX"] = 100.0
+                self._write_upload_marker(task, "WX")
                 result_box[0] = True
                 logger.info(f"Task {task.uid} | WX | Success")
             else:
@@ -1948,7 +2464,8 @@ class Dashboard:
         if p >= 100:
             bar_color = "green"
         elif stage_active:
-            bar_color = row_color
+            # Queued rows are grey, but an active stage still has live work.
+            bar_color = "bright_blue" if row_color == "grey37" else row_color
         else:
             bar_color = "grey37"
 
@@ -2333,11 +2850,7 @@ def main():
                                         # P+A 暂停所有：标记全局暂停，杀死所有活跃子进程
                                         t.status = f"暂停中 ({stage})"
                                         if t.pid:
-                                            try:
-                                                p_proc = psutil.Process(t.pid)
-                                                for child in p_proc.children(recursive=True): child.terminate()
-                                                p_proc.terminate()
-                                            except: pass
+                                            kill_pid_tree(t.pid, terminate=True)
                                     else:
                                         # P+A 恢复所有：清除全局暂停 AND 清除所有任务的 is_paused 标志
                                         # 关键修复：恢复时必须一并清除每个任务的 is_paused，否则
@@ -2379,11 +2892,7 @@ def main():
                                                 t.status = f"排队中 ({stage})"
 
                                             if t.pid:
-                                                try:
-                                                    p_proc = psutil.Process(t.pid)
-                                                    for child in p_proc.children(recursive=True): child.kill()
-                                                    p_proc.kill()
-                                                except: pass
+                                                kill_pid_tree(t.pid)
 
                                             # 核心改进：如果是从“失败”状态点击 P 恢复，或者工人线程已死，则重新拉起线程
                                             if not t.is_paused and t.uid not in engine.active_workers:
@@ -2391,49 +2900,15 @@ def main():
                                     elif cmd_mode == 'R':
                                         with engine.lock:
                                             if t.pid:
-                                                try: psutil.Process(t.pid).kill()
-                                                except: pass
+                                                kill_pid_tree(t.pid)
                                                 t.pid = None
 
-                                            # 复位逻辑：清除当前报错环节的中间文件
-                                            stage_err = ""
-                                            if "(" in t.status:
-                                                stage_err = t.status.split("(")[1].split(")")[0]
-
-                                            if stage_err and t.workdir and os.path.exists(t.workdir):
-                                                files = os.listdir(t.workdir)
-                                                if stage_err == "DL": pass
-                                                elif stage_err == "TR":
-                                                    for f in files:
-                                                        if f.endswith(".srt") and not any(x in f for x in [".zh", ".cn", ".bi"]):
-                                                            os.remove(os.path.join(t.workdir, f))
-                                                elif stage_err == "TL":
-                                                    for f in files:
-                                                        if any(x in f for x in [".zh.srt", ".cn.srt"]):
-                                                            try: os.remove(os.path.join(t.workdir, f))
-                                                            except: pass
-                                                elif stage_err == "MR":
-                                                    for f in files:
-                                                        if ".bi.srt" in f:
-                                                            try: os.remove(os.path.join(t.workdir, f))
-                                                            except: pass
-                                                elif stage_err == "BR":
-                                                    for f in files:
-                                                        if any(x in f for x in [".ass", "_hardsub.mp4"]):
-                                                            try: os.remove(os.path.join(t.workdir, f))
-                                                            except: pass
-
-                                            t.status = "排队中"
-                                            # 物理重置进度，防止死循环
-                                            if stage_err in t.pcts:
-                                                t.pcts[stage_err] = 0.0
-                                            t.error = None
-                                            t.retries = 0
+                                            reset_stage = engine.reset_task(t)
                                             # 仅在没有活跃工人时才重新拉起线程，防止“泥潭”效应
                                             if t.uid not in engine.active_workers:
                                                 threading.Thread(target=engine.worker, args=(t,), daemon=True).start()
                                             else:
-                                                logger.info(f"Task {t.uid} | Reset | Worker thread already active, it will pick up the reset status.")
+                                                logger.info(f"Task {t.uid} | Reset ({reset_stage or 'complete'}) | Worker thread already active, it will pick up the reset status.")
                             except: pass
                         cmd_mode, id_buf, dash.cmd_buf = None, "", ""
                 elif ch == b'\x1b' and sys.platform == "win32": # ESC on Windows

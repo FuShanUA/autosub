@@ -116,6 +116,24 @@ class TestAutosubWechatCommand(unittest.TestCase):
         finally:
             sys.modules.pop("autosub_wechat_command_under_test", None)
 
+    def test_missing_script_reason_includes_script_path(self):
+        spec, module = self._load_module()
+        try:
+            spec.loader.exec_module(module)
+            with tempfile.TemporaryDirectory() as temp_dir:
+                _python, _script, video = self._make_upload_fixture(temp_dir)
+                missing_script = os.path.join(temp_dir, "missing_wechat_upload.py")
+
+                with patch.object(module, "WECHAT_SCRIPT", missing_script), \
+                     patch.object(module, "WECHAT_PYTHON", _python), \
+                     patch.object(module, "find_hardsub_video", lambda _workdir: video), \
+                     patch.object(module, "get_video_duration", lambda _path: 601):
+                    reason = module.get_wechat_upload_skip_reason(temp_dir)
+
+                self.assertEqual(reason, f"WeChat upload script not found: {missing_script}")
+        finally:
+            sys.modules.pop("autosub_wechat_command_under_test", None)
+
     def test_wechat_trigger_runs_upload_over_ten_minutes(self):
         spec, module = self._load_module()
         try:
@@ -171,6 +189,18 @@ class TestWechatUploadTitle(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.temp_dir)
         sys.modules.pop("wechat_upload_under_test", None)
+
+    def test_find_ffprobe_uses_homebrew_fallback_on_macos(self):
+        with patch.object(self.module.shutil, "which", return_value=None), \
+             patch.object(self.module.sys, "platform", "darwin"), \
+             patch.object(
+                 self.module.os.path,
+                 "exists",
+                 side_effect=lambda path: path == "/opt/homebrew/bin/ffprobe",
+             ):
+            ffprobe = self.module._find_ffprobe()
+
+        self.assertEqual(ffprobe, "/opt/homebrew/bin/ffprobe")
 
     def test_auto_title_comes_from_subtitle_not_filename(self):
         fake = FakeLLM(
@@ -511,6 +541,88 @@ class TestWechatUploadTitle(unittest.TestCase):
                 self.module._validate_cover_file(cover, "portrait", "旧标题")
             )
 
+    def test_wait_upload_complete_aborts_when_progress_freezes(self):
+        """A frozen progress bar fails fast instead of burning the whole timeout.
+
+        The page keeps polling WeChat's own telemetry while the upload is dead, so
+        "still connected" says nothing. Only the percentage not moving does, and
+        waiting out a 10000s timeout blocks the serial WX queue for hours.
+        """
+        progress_selectors = set(self.module.UPLOAD_PROGRESS_SELECTORS)
+
+        class FakeLocator:
+            def __init__(self, text):
+                self._text = text
+                self.first = self
+
+            async def count(self):
+                return 1 if self._text else 0
+
+            async def text_content(self):
+                return self._text
+
+            async def is_visible(self):
+                return False
+
+            async def get_attribute(self, _name):
+                return None
+
+        class FakePage:
+            def locator(self, selector):
+                return FakeLocator("67%" if selector in progress_selectors else None)
+
+        clock = {"now": 0.0}
+
+        def fake_time():
+            clock["now"] += 200.0
+            return clock["now"]
+
+        with patch.object(self.module.time, "time", fake_time), \
+             patch.object(self.module.asyncio, "sleep", _noop_sleep):
+            result = asyncio.run(
+                self.module._wait_upload_complete(FakePage(), timeout=10000)
+            )
+
+        self.assertFalse(result)
+        self.assertLess(clock["now"], 10000.0)
+
+    def test_wait_upload_complete_keeps_waiting_while_progress_moves(self):
+        """Moving progress must not trip the stall guard."""
+        progress_selectors = set(self.module.UPLOAD_PROGRESS_SELECTORS)
+        state = {"pct": 10}
+
+        class FakeLocator:
+            def __init__(self, text):
+                self._text = text
+                self.first = self
+
+            async def count(self):
+                return 1 if self._text else 0
+
+            async def text_content(self):
+                return self._text
+
+        class FakePage:
+            def locator(self, selector):
+                if selector in progress_selectors:
+                    state["pct"] = min(100, state["pct"] + 1)
+                    return FakeLocator(f"{state['pct']}%")
+                return FakeLocator(None)
+
+        clock = {"now": 0.0}
+
+        def fake_time():
+            clock["now"] += 1.0
+            return clock["now"]
+
+        with patch.object(self.module.time, "time", fake_time), \
+             patch.object(self.module.asyncio, "sleep", _noop_sleep):
+            result = asyncio.run(
+                self.module._wait_upload_complete(FakePage(), timeout=10000)
+            )
+
+        self.assertTrue(result)
+
     def test_same_page_cover_flow_sets_both_previews_without_draft_reopen(self):
         calls = []
 
@@ -587,6 +699,78 @@ class TestWechatUploadTitle(unittest.TestCase):
 
         self.assertTrue(ok)
         self.assertEqual(opened, [1])
+
+    def test_verify_draft_saved_without_covers_skips_editor_wait(self):
+        async def fake_open_draft_list(page):
+            return True
+
+        async def fake_draft_entries(page):
+            return [{"index": 0, "title": "本次描述", "time": "2026年09月28日 22:19"}]
+
+        async def fake_open_draft_entry(page, index):
+            return True
+
+        async def fake_wait(page, timeout=0):
+            raise AssertionError("cover editor must not block a coverless draft check")
+
+        async def fake_verify_fields(page, title, desc):
+            return title == "FDE的核心职能：抽象产品" and desc == "本次描述"
+
+        with patch.object(self.module, "_open_draft_list", fake_open_draft_list), \
+             patch.object(self.module, "_draft_list_entries", fake_draft_entries), \
+             patch.object(self.module, "_open_draft_entry", fake_open_draft_entry), \
+             patch.object(self.module, "_wait_cover_editor_ready", fake_wait), \
+             patch.object(self.module, "_verify_draft_form_fields", fake_verify_fields), \
+             patch.object(self.module.asyncio, "sleep", _noop_sleep):
+            ok = asyncio.run(
+                self.module._verify_draft_saved(
+                    object(),
+                    "FDE的核心职能：抽象产品",
+                    "本次描述",
+                    expected_covers=None,
+                )
+            )
+
+        self.assertTrue(ok)
+
+    def test_resource_timeout_saves_draft_before_retrying_covers(self):
+        class FakePage:
+            url = self.module.WECHAT_CREATE_URL
+
+        calls = []
+
+        async def fake_click(page, is_public):
+            calls.append(("click", is_public))
+            return "存草稿"
+
+        async def fake_verify(page, title, desc, expected_covers=None, known_drafts=None, timeout=40):
+            calls.append(("verify", title, desc, expected_covers, known_drafts))
+            return True
+
+        with patch.object(self.module, "_click_final_action", fake_click), \
+             patch.object(self.module, "_verify_draft_saved", fake_verify), \
+             patch.object(self.module.asyncio, "sleep", _noop_sleep):
+            ok = asyncio.run(
+                self.module._save_draft_after_resource_timeout(
+                    FakePage(),
+                    "FDE的核心职能：抽象产品",
+                    "本次描述",
+                    {"旧草稿"},
+                )
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual(calls[0], ("click", False))
+        self.assertEqual(
+            calls[1],
+            (
+                "verify",
+                "FDE的核心职能：抽象产品",
+                "本次描述",
+                None,
+                {"旧草稿"},
+            ),
+        )
 
     def test_wait_draft_list_ready_accepts_zero_count_empty_state(self):
         class FakePage:

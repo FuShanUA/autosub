@@ -1,8 +1,9 @@
 {
-    "input": "/Users/shanfu/cc/Projects/Palantir_-_At_AIPCon_11_Palantir_CEO_Alex_Karp_shares_the_primary_function_of_t... [2099999127257931776]/Palantir_-_At_AIPCon_11_Palantir_CEO_Alex_Karp_shares_the_primary_function_of_t... [2099999127257931776] [1080p].mp4",
+    "input": "https://x.com/impreiaxbt/status/2103884838474334642/video/1",
     "output_dir": "",
     "vendor": "Alibaba (Bailian)",
-  "llm_model": "qwen3.7-max",
+    "llm_vendor": "Alibaba (Bailian)",
+    "llm_model": "glm-5.3",
     "trans_mode": "balanced",
     "quality": "high",
     "layout": "bilingual",
@@ -19,9 +20,12 @@
     "api_key": "****************",
     "quick": false,
     "multilang": false,
+    "remove_ads": false,
     "sync_gdrive": "18iAFFSuHQmZlxVN0dri1Gbje9SmpS96f",
     "gdrive_enabled": true,
+    "wechat_enabled": true,
+    "wechat_public": false,
     "vendor_default_models": {
-    "Alibaba (Bailian)": "qwen3.7-max"
+        "Alibaba (Bailian)": "glm-5.3"
     }
 }

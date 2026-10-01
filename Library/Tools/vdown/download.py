@@ -65,6 +65,21 @@ def find_ytdlp():
 YTDLP_EXE = find_ytdlp()
 _YTDLP_FOUND = YTDLP_EXE != "yt-dlp"
 
+
+def _cookie_file_candidates():
+    """Return cookie files from this checkout and its parent checkouts."""
+    candidates = [os.path.join(os.path.expanduser("~"), "Downloads", "cookies.txt")]
+    current = os.path.dirname(os.path.abspath(__file__))
+    while True:
+        candidates.append(os.path.join(current, "cookies.txt"))
+        candidates.append(os.path.join(current, "vdown", "cookies.txt"))
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    return list(dict.fromkeys(candidates))
+
+
 def find_cookies(custom_path=None):
     """Find cookies.txt in prioritized locations."""
     # 1. Check custom path if provided
@@ -77,12 +92,9 @@ def find_cookies(custom_path=None):
         if os.path.exists(custom_path):
             return custom_path
 
-    # 2. Project standard locations
-    search_paths = [
-        os.path.join(os.path.expanduser("~"), "Downloads", "cookies.txt"), # Standard Downloads
-        os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "cookies.txt"), # Repo root
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt"), # Local tool folder
-    ]
+    # 2. Project standard locations. The macOS app may run from a nested
+    # checkout, so search parent checkouts as well as this one.
+    search_paths = _cookie_file_candidates()
     if sys.platform == "win32":
         search_paths.insert(0, r"D:\download\cookies.txt")
         search_paths.insert(1, r"D:\Downloads\cookies.txt")

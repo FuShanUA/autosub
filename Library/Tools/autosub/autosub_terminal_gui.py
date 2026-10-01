@@ -62,7 +62,7 @@ class TerminalGUI:
 
         # Set Window Icon (also sets Dock/Cmd+Tab icon on macOS via -default)
         _dir = os.path.dirname(os.path.abspath(__file__))
-        _icon_name = "autosub_v9.png" if sys.platform == "darwin" else "autosub.ico"
+        _icon_name = "autosub_launcher_neon.png" if sys.platform == "darwin" else "autosub.ico"
         _icon_path = os.path.join(_dir, _icon_name)
         if os.path.exists(_icon_path):
             try:
@@ -659,7 +659,7 @@ def main():
     try:
         from mac_icon import set_macos_app_icon
         _dir = os.path.dirname(os.path.abspath(__file__))
-        _icon_name = "autosub_v9.png" if sys.platform == "darwin" else "autosub.ico"
+        _icon_name = "autosub_launcher_neon.png" if sys.platform == "darwin" else "autosub.ico"
         set_macos_app_icon(root, os.path.join(_dir, _icon_name))
     except Exception:
         pass

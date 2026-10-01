@@ -21,6 +21,7 @@ import json
 import argparse
 import subprocess
 import tempfile
+import shutil
 
 
 if getattr(sys, "frozen", False):
@@ -44,8 +45,21 @@ try:
 except ImportError:
     pass
 
-FFMPEG = os.environ.get("FFMPEG_PATH") or "ffmpeg"
-FFPROBE = os.environ.get("FFPROBE_PATH") or "ffprobe"
+
+def _resolve_media_tool(name):
+    found = shutil.which(name)
+    if found:
+        return found
+    if sys.platform == "darwin":
+        for bin_dir in ("/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin"):
+            candidate = os.path.join(bin_dir, name)
+            if os.path.exists(candidate):
+                return candidate
+    return name
+
+
+FFMPEG = os.environ.get("FFMPEG_PATH") or _resolve_media_tool("ffmpeg")
+FFPROBE = os.environ.get("FFPROBE_PATH") or _resolve_media_tool("ffprobe")
 
 
 def fmt_srt(t):

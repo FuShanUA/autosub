@@ -4,6 +4,10 @@
 <dict>
 	<key>files</key>
 	<dict>
+		<key>Resources/autosub_gui_neon.icns</key>
+		<data>
+		ZqzkcnmHaUCN63vSTsVTerQ5+Zw=
+		</data>
 		<key>Resources/autosub_vibrant_v2.icns</key>
 		<data>
 		w1NLKM5VClfXkSM6uhFBe7Rmgws=
@@ -15,10 +19,17 @@
 		<dict>
 			<key>cdhash</key>
 			<data>
-			w8W1OzP6Rnm5dPXgPG2l4L0QJ0I=
+			xJZRk5f02fdptsl556fXMtfcBkI=
 			</data>
 			<key>requirement</key>
-			<string>cdhash H"c3c5b53b33fa4679b974f5e03c6da5e0bd102742"</string>
+			<string>cdhash H"c496519397f4d9f769b6c979e7a7d732d7dc0642"</string>
+		</dict>
+		<key>Resources/autosub_gui_neon.icns</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			MGOAQeMX+2FevkoL2EE+P60W+h85F5jLiCyeH03xCMk=
+			</data>
 		</dict>
 		<key>Resources/autosub_vibrant_v2.icns</key>
 		<dict>

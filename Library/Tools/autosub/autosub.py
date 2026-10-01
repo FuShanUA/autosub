@@ -8,6 +8,7 @@ import glob
 import shutil
 import argparse
 import io
+import signal
 
 CREATE_NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
@@ -199,7 +200,16 @@ def trigger_sync(local_dir, remote_id, headless=False):
     
     if headless:
         print(f"☁️  [Cloud Sync] Starting integrated GDrive sync (HEADLESS) for: {os.path.basename(local_dir)}")
-        sync_cmd = [py_exe, sync_script, "--local-dir", local_dir, "--remote-id", remote_id, "--credentials", creds_path, "--token", token_path, "--wrap-folder", "--headless"]
+        sync_cmd = [
+            py_exe, sync_script,
+            "--local-dir", local_dir,
+            "--remote-id", remote_id,
+            "--credentials", creds_path,
+            "--token", token_path,
+            "--wrap-folder",
+            "--exclude", "noads",
+            "--headless",
+        ]
         try:
             process = subprocess.Popen(sync_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', bufsize=1, creationflags=CREATE_NO_WINDOW)
             for line in process.stdout or []:
@@ -273,6 +283,28 @@ def find_hardsub_video(workdir):
     if not candidates:
         return None
     return os.path.join(workdir, max(candidates, key=lambda fn: os.path.getmtime(os.path.join(workdir, fn))))
+
+def find_noads_hardsub_video(workdir):
+    """Return the newest ad-cut hardsub video in workdir/noads, or None."""
+    noads_dir = os.path.join(workdir, "noads")
+    try:
+        files = os.listdir(noads_dir)
+    except Exception:
+        return None
+    candidates = [
+        fn for fn in files
+        if "_hardsub" in fn and fn.endswith(BILI_VIDEO_EXTS)
+    ]
+    if not candidates:
+        return None
+    return os.path.join(
+        noads_dir,
+        max(candidates, key=lambda fn: os.path.getmtime(os.path.join(noads_dir, fn))),
+    )
+
+def find_upload_hardsub_video(workdir):
+    """BI/WX upload the ad-cut version when available, otherwise the full video."""
+    return find_noads_hardsub_video(workdir) or find_hardsub_video(workdir)
 
 def build_bili_title(hardsub_path):
     """Derive a Bilibili title from a hardsub filename, capped at 80 chars."""
@@ -350,7 +382,7 @@ def build_bili_cmd(
     built-in LLM logic unless explicitly overridden. Returns the cmd list or None."""
     if not os.path.exists(BILI_SCRIPT) or not os.path.exists(BILI_PYTHON):
         return None
-    hardsub_path = find_hardsub_video(workdir)
+    hardsub_path = find_upload_hardsub_video(workdir)
     if not hardsub_path:
         return None
     metadata_values = (title, desc, cover_title)
@@ -386,16 +418,89 @@ def build_bili_cmd(
         cmd.append("--public")
     return cmd
 
-def run_bili_cmd(cmd, on_progress=None, on_log=None, abort_flag=None):
-    """Run a pre-built Bilibili upload command. Returns True on success.
-    on_progress(pct)/on_log(line)/abort_flag() are optional callbacks; final
-    success/failure status is NOT logged here (callers decide how to report)."""
+# Upload watchdog bounds. A healthy hour-long 1080p upload reports a new
+# percentage every 30s and finishes in 20-40 minutes, so both limits sit well
+# above normal behaviour and only fire on a genuinely wedged child.
+UPLOAD_STALL_TIMEOUT = 1800
+UPLOAD_SILENCE_TIMEOUT = 1200
+
+
+def _descendant_pids(pid):
+    """Every descendant of pid, shallowest first. Empty on Windows."""
+    found = []
+    frontier = [pid]
+    seen = {pid}
+    while frontier:
+        current = frontier.pop(0)
+        try:
+            out = subprocess.run(
+                ["pgrep", "-P", str(current)],
+                capture_output=True, text=True, timeout=5,
+            ).stdout
+        except Exception:
+            continue
+        for token in out.split():
+            try:
+                child = int(token)
+            except ValueError:
+                continue
+            if child in seen:
+                continue
+            seen.add(child)
+            found.append(child)
+            frontier.append(child)
+    return found
+
+
+def kill_proc_tree(proc, terminate=False):
+    """Signal a child process together with everything it spawned.
+
+    The uploaders launch chromium and ffmpeg. Killing only the Python wrapper
+    leaves those alive and holding the shared WeChat browser profile, so the
+    next upload in the serial queue wedges on the locked profile directory.
+    """
+    if proc is None:
+        return
+    sig = signal.SIGTERM if terminate else signal.SIGKILL
+    for pid in reversed(_descendant_pids(proc.pid)):
+        try:
+            os.kill(pid, sig)
+        except OSError:
+            pass
+    try:
+        proc.terminate() if terminate else proc.kill()
+    except Exception:
+        pass
+
+
+def _run_upload_cmd(
+    cmd,
+    label,
+    progress_pattern,
+    on_progress=None,
+    on_log=None,
+    abort_flag=None,
+    stall_timeout=UPLOAD_STALL_TIMEOUT,
+    silence_timeout=UPLOAD_SILENCE_TIMEOUT,
+):
+    """Shared stdout pump for the Bilibili and WeChat Channels uploaders.
+
+    Both children can wedge instead of exiting. The WeChat one keeps polling a
+    helper endpoint and prints a line every ten seconds while the transfer
+    itself never advances, so an output-based check alone never fires. Because
+    the WeChat slot is serial, one wedged upload parks every remaining task at
+    "queued" until the engine is restarted. Two independent timers bound that:
+    silence_timeout covers a child that stops printing, stall_timeout covers a
+    child that prints without moving the percentage. Either one kills the whole
+    process tree and returns False so the caller's existing retry path runs.
+    """
     try:
         p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', creationflags=CREATE_NO_WINDOW)
     except Exception as e:
         if on_log:
-            on_log(f"❌ Failed to start Bilibili upload: {e}")
+            on_log(f"❌ Failed to start {label} upload: {e}")
         return False
+
     if p.stdout:
         import queue as _queue
         import threading as _threading
@@ -415,11 +520,49 @@ def run_bili_cmd(cmd, on_progress=None, on_log=None, abort_flag=None):
         _rt = _threading.Thread(target=_stdout_reader, daemon=True)
         _rt.start()
 
+        started = time.time()
+        state = {"output": started, "advance": started, "pct": -1.0}
+
+        def _handle(line):
+            state["output"] = time.time()
+            stripped = line.strip()
+            if stripped and on_log:
+                on_log(stripped)
+            m = re.search(progress_pattern, line)
+            if not m:
+                return
+            pct = float(m.group(1))
+            if pct > state["pct"]:
+                state["pct"] = pct
+                state["advance"] = time.time()
+            if on_progress:
+                on_progress(pct)
+
+        def _stall_reason():
+            now = time.time()
+            if silence_timeout and now - state["output"] > silence_timeout:
+                return f"no output for {int(now - state['output'])}s"
+            if stall_timeout and now - state["advance"] > stall_timeout:
+                return f"stuck at {max(state['pct'], 0.0):.1f}% for {int(now - state['advance'])}s"
+            return None
+
         while True:
             if abort_flag and abort_flag():
-                p.kill()
+                kill_proc_tree(p)
                 _reader_stop.set()
                 break
+            # Checked every iteration, not only when the queue runs dry: the
+            # WeChat uploader can print a polling line continuously while the
+            # percentage never moves, and a queue-timeout-only check would then
+            # never fire.
+            if p.poll() is None:
+                reason = _stall_reason()
+                if reason:
+                    if on_log:
+                        on_log(f"⏱️ Watchdog: {label} upload {reason}; killing process tree and retrying")
+                    kill_proc_tree(p)
+                    _reader_stop.set()
+                    break
             try:
                 line = _line_q.get(timeout=1.0)
             except Exception:
@@ -430,23 +573,43 @@ def run_bili_cmd(cmd, on_progress=None, on_log=None, abort_flag=None):
                         except Exception:
                             break
                         if line is None: break
-                        stripped = line.strip()
-                        if stripped and on_log:
-                            on_log(stripped)
-                        m = re.search(r'Progress:\s*([\d.]+)%', line)
-                        if m and on_progress:
-                            on_progress(float(m.group(1)))
+                        _handle(line)
                     break
                 continue
             if line is None: break
-            stripped = line.strip()
-            if stripped and on_log:
-                on_log(stripped)
-            m = re.search(r'Progress:\s*([\d.]+)%', line)
-            if m and on_progress:
-                on_progress(float(m.group(1)))
-    p.wait()
+            _handle(line)
+
+        # Reap first so the reader thread reaches EOF on its own, then release
+        # the pipe. Leaving it open leaks one descriptor per upload for the
+        # whole life of the engine.
+        p.wait()
+        _reader_stop.set()
+        _rt.join(timeout=2)
+        try:
+            p.stdout.close()
+        except Exception:
+            pass
+    else:
+        p.wait()
     return p.returncode == 0
+
+
+def run_bili_cmd(cmd, on_progress=None, on_log=None, abort_flag=None,
+                 stall_timeout=UPLOAD_STALL_TIMEOUT,
+                 silence_timeout=UPLOAD_SILENCE_TIMEOUT):
+    """Run a pre-built Bilibili upload command. Returns True on success.
+    on_progress(pct)/on_log(line)/abort_flag() are optional callbacks; final
+    success/failure status is NOT logged here (callers decide how to report)."""
+    return _run_upload_cmd(
+        cmd,
+        "Bilibili",
+        r'Progress:\s*([\d.]+)%',
+        on_progress=on_progress,
+        on_log=on_log,
+        abort_flag=abort_flag,
+        stall_timeout=stall_timeout,
+        silence_timeout=silence_timeout,
+    )
 
 def trigger_bili_upload(
     workdir,
@@ -2747,7 +2910,7 @@ def generate_upload_metadata(
             provider = LLMProvider(provider_name)
         except ValueError:
             provider = None
-    hardsub_path = find_hardsub_video(workdir)
+    hardsub_path = find_upload_hardsub_video(workdir)
     if not hardsub_path:
         _log("⚠️ [MetaGen] No hardsub video found")
         return None
@@ -3034,6 +3197,55 @@ def generate_upload_metadata(
     _persist_upload_metadata(workdir, meta)
     return meta if meta else None
 
+
+def prepare_shared_upload_metadata(
+    workdir,
+    explicit_cover_title=None,
+    llm_model=None,
+    llm_provider=None,
+    on_log=None,
+):
+    """Generate and validate the metadata shared by Bilibili and WeChat."""
+    _log = on_log or (lambda msg: print(msg, flush=True))
+    meta = generate_upload_metadata(
+        workdir,
+        bili_title_max_chars=BILI_UPLOAD_TITLE_MAX_CHARS,
+        wechat_title_max_chars=SHARED_UPLOAD_TITLE_MAX_CHARS,
+        llm_model=llm_model,
+        llm_provider=llm_provider,
+        on_log=on_log,
+    )
+    if not meta:
+        _log("❌ [MetaGen] shared metadata generation failed; BI/WX uploads stopped")
+        return None
+
+    bili_title = normalize_bili_upload_title(
+        meta.get("title"),
+        max_chars=BILI_UPLOAD_TITLE_HARD_MAX_CHARS,
+    )
+    wechat_title = normalize_shared_upload_title(
+        meta.get("wechat_title"),
+        max_chars=SHARED_UPLOAD_TITLE_MAX_CHARS,
+    )
+    description = str(meta.get("description") or "").strip()
+    cover_title = str(
+        explicit_cover_title or meta.get("cover_title") or ""
+    ).strip()
+    if not bili_title or not wechat_title or not description or not cover_title:
+        _log(
+            "❌ [MetaGen] Bilibili/WeChat title, description, or cover title "
+            "incomplete; BI/WX uploads stopped"
+        )
+        return None
+
+    return {
+        "title": bili_title,
+        "wechat_title": wechat_title,
+        "desc": description,
+        "cover_title": cover_title,
+    }
+
+
 # --- WeChat Channels Upload (canonical implementation; batch engine + GUI reuse this) ---
 def build_wechat_title(hardsub_path):
     """Derive a WeChat Channels title, capped at the platform's short-title limit."""
@@ -3045,9 +3257,11 @@ def get_wechat_duration_skip_reason(duration):
 
 def get_wechat_upload_skip_reason(workdir):
     """Return a user-facing reason when WeChat upload must not start."""
-    if not os.path.exists(WECHAT_SCRIPT) or not os.path.exists(WECHAT_PYTHON):
-        return "script/python not found"
-    hardsub_path = find_hardsub_video(workdir)
+    if not os.path.exists(WECHAT_SCRIPT):
+        return f"WeChat upload script not found: {WECHAT_SCRIPT}"
+    if not os.path.exists(WECHAT_PYTHON):
+        return f"WeChat upload Python not found: {WECHAT_PYTHON}"
+    hardsub_path = find_upload_hardsub_video(workdir)
     if not hardsub_path:
         return "hardsub video not found"
     duration = get_video_duration(hardsub_path)
@@ -3077,7 +3291,7 @@ def build_wechat_cmd(
         str(value or "").strip() for value in metadata_values
     ):
         return None
-    hardsub_path = find_hardsub_video(workdir)
+    hardsub_path = find_upload_hardsub_video(workdir)
     # Omit the title by default so wechat_upload.py generates it from the
     # subtitle. A caller can still pass a title for an explicit manual override.
     _pre_generated = title is not None and desc is not None
@@ -3103,65 +3317,20 @@ def build_wechat_cmd(
     cmd.append("--headless")
     return cmd
 
-def run_wechat_cmd(cmd, on_progress=None, on_log=None, abort_flag=None):
+def run_wechat_cmd(cmd, on_progress=None, on_log=None, abort_flag=None,
+                   stall_timeout=UPLOAD_STALL_TIMEOUT,
+                   silence_timeout=UPLOAD_SILENCE_TIMEOUT):
     """Run a pre-built WeChat Channels upload command. Returns True on success."""
-    try:
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', creationflags=CREATE_NO_WINDOW)
-    except Exception as e:
-        if on_log:
-            on_log(f"❌ Failed to start WeChat Channels upload: {e}")
-        return False
-    if p.stdout:
-        import queue as _queue
-        import threading as _threading
-        _line_q: _queue.Queue = _queue.Queue()
-        _reader_stop = _threading.Event()
-
-        def _stdout_reader():
-            try:
-                for line in p.stdout:
-                    if _reader_stop.is_set(): break
-                    _line_q.put(line)
-            except Exception:
-                pass
-            finally:
-                _line_q.put(None)
-
-        _rt = _threading.Thread(target=_stdout_reader, daemon=True)
-        _rt.start()
-
-        while True:
-            if abort_flag and abort_flag():
-                p.kill()
-                _reader_stop.set()
-                break
-            try:
-                line = _line_q.get(timeout=1.0)
-            except Exception:
-                if p.poll() is not None:
-                    while True:
-                        try:
-                            line = _line_q.get(timeout=0.5)
-                        except Exception:
-                            break
-                        if line is None: break
-                        stripped = line.strip()
-                        if stripped and on_log:
-                            on_log(stripped)
-                        m = re.search(r'(?:Progress|上传进度):\s*([\d.]+)%', line)
-                        if m and on_progress:
-                            on_progress(float(m.group(1)))
-                    break
-                continue
-            if line is None: break
-            stripped = line.strip()
-            if stripped and on_log:
-                on_log(stripped)
-            m = re.search(r'(?:Progress|上传进度):\s*([\d.]+)%', line)
-            if m and on_progress:
-                on_progress(float(m.group(1)))
-    p.wait()
-    return p.returncode == 0
+    return _run_upload_cmd(
+        cmd,
+        "WeChat Channels",
+        r'(?:Progress|上传进度):\s*([\d.]+)%',
+        on_progress=on_progress,
+        on_log=on_log,
+        abort_flag=abort_flag,
+        stall_timeout=stall_timeout,
+        silence_timeout=silence_timeout,
+    )
 
 def trigger_wechat_upload(
     workdir,
@@ -3228,23 +3397,22 @@ def run_post_processing_uploads(
     if not any((need_sync, need_bili, need_wechat)):
         return
 
-    shared_uploads = need_bili and need_wechat
+    needs_shared_metadata = need_bili or need_wechat
     explicit_cover_titles = (
         str(bili_cover_title or "").strip(),
         str(wechat_cover_title or "").strip(),
     )
-    if shared_uploads and all(explicit_cover_titles) and explicit_cover_titles[0] != explicit_cover_titles[1]:
+    if needs_shared_metadata and all(explicit_cover_titles) and explicit_cover_titles[0] != explicit_cover_titles[1]:
         print("❌ [MetaGen] Bilibili and WeChat cover titles differ; shared uploads stopped", flush=True)
         need_bili = False
         need_wechat = False
-        shared_uploads = False
+        needs_shared_metadata = False
 
     meta = None
-    if shared_uploads:
-        meta = generate_upload_metadata(
+    if needs_shared_metadata:
+        meta = prepare_shared_upload_metadata(
             workdir,
-            bili_title_max_chars=BILI_UPLOAD_TITLE_MAX_CHARS,
-            wechat_title_max_chars=SHARED_UPLOAD_TITLE_MAX_CHARS,
+            explicit_cover_title=bili_cover_title or wechat_cover_title,
             llm_model=llm_model,
             llm_provider=llm_provider,
         )
@@ -3257,44 +3425,20 @@ def run_post_processing_uploads(
     if llm_provider:
         bili_kwargs["llm_provider"] = llm_provider
         wechat_kwargs["llm_provider"] = llm_provider
-    if shared_uploads and not meta:
-        print("❌ [MetaGen] shared metadata generation failed; BI/WX uploads stopped", flush=True)
+    if needs_shared_metadata and not meta:
         need_bili = False
         need_wechat = False
     elif meta:
-        bili_title = normalize_bili_upload_title(
-            meta.get("title"),
-            max_chars=BILI_UPLOAD_TITLE_HARD_MAX_CHARS,
-        )
-        wechat_title = normalize_shared_upload_title(
-            meta.get("wechat_title"),
-            max_chars=SHARED_UPLOAD_TITLE_MAX_CHARS,
-        )
-        shared_desc = str(meta.get("description") or "").strip()
-        shared_cover_title = str(
-            bili_cover_title or wechat_cover_title or meta.get("cover_title") or ""
-        ).strip()
-        if not bili_title or not wechat_title or not shared_desc or not shared_cover_title:
-            print("❌ [MetaGen] Bilibili/WeChat title, description, or cover title incomplete; BI/WX uploads stopped", flush=True)
-            need_bili = False
-            need_wechat = False
-        else:
-            shared_metadata = {
-                "title": bili_title,
-                "wechat_title": wechat_title,
-                "desc": shared_desc,
-                "cover_title": shared_cover_title,
-            }
-            bili_kwargs.update({
-                "title": bili_title,
-                "desc": shared_desc,
-                "cover_title": shared_cover_title,
-            })
-            wechat_kwargs.update({
-                "title": wechat_title,
-                "desc": shared_desc,
-                "cover_title": shared_cover_title,
-            })
+        bili_kwargs.update({
+            "title": meta["title"],
+            "desc": meta["desc"],
+            "cover_title": meta["cover_title"],
+        })
+        wechat_kwargs.update({
+            "title": meta["wechat_title"],
+            "desc": meta["desc"],
+            "cover_title": meta["cover_title"],
+        })
     elif bili_cover_title:
         bili_kwargs["cover_title"] = bili_cover_title
     elif wechat_cover_title:
@@ -3380,6 +3524,12 @@ def find_tool(tool_name):
         r"C:\ffmpeg\bin",
         r"C:\Program Files\ffmpeg\bin",
     ]
+    if sys.platform == "darwin":
+        fallbacks.extend([
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/opt/local/bin",
+        ])
     
     # Proactively check for CapCut installation to steal its FFmpeg
     # Better: check for "CapCut.exe" path and then look for ffmpeg nearby
@@ -3756,7 +3906,8 @@ def get_video_duration(path):
     try:
         cmd = [FFPROBE_EXE, "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path]
         return float(subprocess.check_output(cmd, creationflags=CREATE_NO_WINDOW).decode().strip())
-    except: return 0
+    except Exception:
+        return 0
 
 def get_video_dimensions(path):
     """Returns (width, height) using ffprobe."""

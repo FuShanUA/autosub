@@ -21,6 +21,13 @@ def set_macos_app_icon(root, icon_path):
     if not os.path.exists(icon_path):
         return
 
+    # Prefer the bundle's .icns when available; Tk keeps the PNG as fallback.
+    appkit_icon_path = icon_path
+    if icon_path.lower().endswith(".png"):
+        candidate = os.path.splitext(icon_path)[0] + ".icns"
+        if os.path.exists(candidate):
+            appkit_icon_path = candidate
+
     # --- Primary: PyObjC (NSApplication icon + process name) ---
     try:
         from AppKit import NSImage, NSData, NSApplication
@@ -35,7 +42,7 @@ def set_macos_app_icon(root, icon_path):
             pass
 
         # Load icon from file and set as application icon
-        data = NSData.dataWithContentsOfFile_(icon_path)
+        data = NSData.dataWithContentsOfFile_(appkit_icon_path)
         if data:
             image = NSImage.alloc().initWithData_(data)
             if image:
