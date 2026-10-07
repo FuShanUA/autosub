@@ -44,6 +44,11 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
 
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp()
+        self._bili_login_patcher = patch.object(
+            batch_pro, "get_bili_login_skip_reason", return_value=None
+        )
+        self._bili_login_patcher.start()
+        self.addCleanup(self._bili_login_patcher.stop)
         
     def tearDown(self):
         shutil.rmtree(self.temp_dir)
@@ -533,6 +538,7 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         }
         observed_statuses = []
         calls = []
+        upload_statuses = []
 
         def fake_disk_truth(current_task):
             if current_task.status.startswith("排队中"):
@@ -545,10 +551,12 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
 
         def fake_bili_run(_task, _cmd, result_box):
             calls.append("BI")
+            upload_statuses.append(task.status)
             result_box[0] = True
 
         def fake_wechat_run(_task, _cmd, result_box):
             calls.append("WX")
+            upload_statuses.append(task.status)
             result_box[0] = True
 
         worker = threading.Thread(target=engine.worker, args=(task,), daemon=True)
@@ -563,11 +571,83 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
             worker.join(5)
 
         self.assertFalse(worker.is_alive())
-        self.assertEqual(observed_statuses, ["运行中 (BI/WX)"])
+        self.assertEqual(observed_statuses, ["运行中 (MetaGen)"])
+        self.assertEqual(set(upload_statuses), {"运行中 (BI/WX)"})
         self.assertEqual(set(calls), {"BI", "WX"})
         self.assertEqual(task.status, "完成")
         for marker in (".bili_uploaded", ".wechat_uploaded"):
             self.assertTrue(os.path.exists(os.path.join(workdir, marker)))
+
+    def test_login_failures_stop_upload_retry(self):
+        """Expired login states are terminal and must not consume upload retries."""
+        workdir = os.path.join(self.temp_dir, "worker_login_failed")
+        os.makedirs(workdir)
+        task = SubTask(
+            uid=12,
+            url="http://test.com",
+            title="Video 12",
+            duration="01:00",
+            status="排队中 (BI/WX)",
+            workdir=workdir,
+            pcts={
+                "DL": 100.0,
+                "TR": 100.0,
+                "TL": 100.0,
+                "MR": 100.0,
+                "BR": 100.0,
+                "GD": 100.0,
+                "BI": 0.0,
+                "WX": 0.0,
+            },
+        )
+        engine = BatchEngine(
+            output_dir=self.temp_dir,
+            sub_dir_name="project",
+            state_file=os.path.join(self.temp_dir, "batch_state.json"),
+        )
+        engine.do_gdsync = False
+        engine.do_bili = True
+        engine.do_wechat = True
+        engine.task_map[task.uid] = task
+        calls = []
+
+        def fake_disk_truth(current_task):
+            if current_task.status.startswith("排队中"):
+                return
+            current_task.status = "完成"
+
+        def fake_bili_run(_task, _cmd, result_box):
+            calls.append("BI")
+            result_box[0] = False
+            result_box[1] = "B站 Bilibili (BI) 登录态失效，请先执行: login.py"
+
+        def fake_wechat_run(_task, _cmd, result_box):
+            calls.append("WX")
+            result_box[0] = False
+            result_box[1] = "视频号 WeChat (WX) 登录态失效，请先执行: wechat_upload.py --login"
+
+        worker = threading.Thread(target=engine.worker, args=(task,), daemon=True)
+        with patch.object(BatchEngine, "disk_truth", side_effect=fake_disk_truth), \
+             patch.object(batch_pro, "generate_upload_metadata", return_value={
+                 "title": "OpenAI研究员谈智能体",
+                 "wechat_title": "OpenAI研究员谈智能体",
+                 "description": "共享简介",
+                 "cover_title": "智能体",
+             }), \
+             patch.object(batch_pro, "build_bili_cmd", return_value=["bili-upload"]), \
+             patch.object(batch_pro, "build_wechat_cmd", return_value=["wechat-upload"]), \
+             patch.object(batch_pro, "get_wechat_upload_skip_reason", return_value=None), \
+             patch.object(BatchEngine, "_run_bili_upload", side_effect=fake_bili_run), \
+             patch.object(BatchEngine, "_run_wechat_upload", side_effect=fake_wechat_run):
+            worker.start()
+            worker.join(5)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(set(calls), {"BI", "WX"})
+        self.assertEqual(task.retries, 0)
+        self.assertEqual(task.status, "失败 (上传)")
+        self.assertIn("login.py", task.error)
+        self.assertIn("wechat_upload.py --login", task.error)
 
     def test_bili_marker_written_without_waiting_for_wechat(self):
         """A finished BI upload is marked at once, so a retry cannot repost it.
@@ -626,6 +706,117 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         self.assertFalse(result_box[0])
         self.assertEqual(task.error, "BI upload failed")
         self.assertFalse(os.path.exists(os.path.join(workdir, ".bili_uploaded")))
+
+    def test_bili_login_failure_surfaces_recovery_command(self):
+        """The batch worker must return the Bilibili QR-login command."""
+        workdir = os.path.join(self.temp_dir, "task_bili_login_failed")
+        os.makedirs(workdir)
+        task = SubTask(
+            uid=10,
+            url="http://test.com",
+            title="Video 10",
+            vid_id="vid10",
+            workdir=workdir,
+        )
+        engine = BatchEngine(
+            output_dir=self.temp_dir,
+            sub_dir_name="project",
+            state_file=os.path.join(self.temp_dir, "batch_state.json"),
+        )
+        engine.task_map[task.uid] = task
+        result_box = [False, None]
+
+        def fake_run(_cmd, on_log=None, **_kwargs):
+            on_log("接口返回错误代码：-101，信息：账号未登录")
+            return False
+
+        with patch.object(batch_pro, "run_bili_cmd", side_effect=fake_run):
+            engine._run_bili_upload(task, ["bili-upload"], result_box)
+
+        self.assertFalse(result_box[0])
+        self.assertIn("登录态失效", result_box[1])
+        self.assertIn("login.py", result_box[1])
+        self.assertEqual(task.error, result_box[1])
+        self.assertFalse(os.path.exists(os.path.join(workdir, ".bili_uploaded")))
+
+    def test_bili_cookie_preflight_stops_before_upload(self):
+        """Missing local cookie fields must not start or retry the uploader."""
+        workdir = os.path.join(self.temp_dir, "task_bili_cookie_missing")
+        os.makedirs(workdir)
+        with open(os.path.join(workdir, "video_hardsub.mp4"), "w") as handle:
+            handle.write("video")
+        with open(os.path.join(workdir, ".burn_complete"), "w") as handle:
+            handle.write("1")
+        task = SubTask(
+            uid=25,
+            url="http://test.com",
+            title="Video 25",
+            vid_id="vid25",
+            status="排队中 (BI)",
+            workdir=workdir,
+            pcts={"DL": 100.0, "TR": 100.0, "TL": 100.0, "MR": 100.0,
+                  "BR": 100.0, "GD": 100.0, "BI": 0.0, "WX": 100.0},
+        )
+        engine = BatchEngine(
+            output_dir=self.temp_dir,
+            sub_dir_name="project",
+            state_file=os.path.join(self.temp_dir, "batch_state.json"),
+        )
+        engine.do_gdsync = False
+        engine.do_bili = True
+        engine.do_wechat = False
+        engine.task_map[task.uid] = task
+
+        worker = threading.Thread(target=engine.worker, args=(task,), daemon=True)
+        with patch.object(
+                    batch_pro,
+                    "get_bili_login_skip_reason",
+                    return_value="Bilibili cookies missing: SESSDATA, bili_jct",
+                ), \
+             patch.object(BatchEngine, "disk_truth", lambda self, current_task: None), \
+             patch.object(batch_pro, "build_bili_cmd") as mock_build:
+            worker.start()
+            worker.join(5)
+
+        self.assertFalse(worker.is_alive())
+        mock_build.assert_not_called()
+        self.assertEqual(task.retries, 0)
+        self.assertEqual(task.status, "失败 (上传)")
+        self.assertIn("登录态失效", task.error)
+        self.assertIn("login.py", task.error)
+        self.assertIn("SESSDATA", task.error)
+
+    def test_wechat_login_failure_surfaces_recovery_command(self):
+        """The batch worker must return the WeChat visible-login command."""
+        workdir = os.path.join(self.temp_dir, "task_wechat_login_failed")
+        os.makedirs(workdir)
+        task = SubTask(
+            uid=11,
+            url="http://test.com",
+            title="Video 11",
+            vid_id="vid11",
+            workdir=workdir,
+        )
+        engine = BatchEngine(
+            output_dir=self.temp_dir,
+            sub_dir_name="project",
+            state_file=os.path.join(self.temp_dir, "batch_state.json"),
+        )
+        engine.task_map[task.uid] = task
+        result_box = [False, None]
+
+        def fake_run(_cmd, on_log=None, **_kwargs):
+            on_log("微信登录态不可用或发布页加载失败；无头上传已停止")
+            return False
+
+        with patch.object(batch_pro, "run_wechat_cmd", side_effect=fake_run):
+            engine._run_wechat_upload(task, ["wechat-upload"], result_box)
+
+        self.assertFalse(result_box[0])
+        self.assertIn("登录态失效", result_box[1])
+        self.assertIn("wechat_upload.py --login", result_box[1])
+        self.assertEqual(task.error, result_box[1])
+        self.assertFalse(os.path.exists(os.path.join(workdir, ".wechat_uploaded")))
 
     def test_load_state_requeues_stale_wechat_limit_status(self):
         """A 超限 status left over from the removed cap must not stay terminal."""
@@ -1417,7 +1608,7 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
             handle.write("video")
         llm_client = MagicMock()
         llm_client.generate_content.side_effect = [
-            "共享简介",
+            "共享简介：卡普谈Palantir数据整合，不做服务；客户没有销售团队也大规模采用。",
             '{"title":"卡普谈Palantir数据整合，不做服务并坚持工程为本","evidence":["卡普谈Palantir数据整合"]}',
             '{"title":"卡普谈Palantir数据整合","evidence":["卡普谈Palantir数据整合"]}',
             '{"central_claim":"卡普谈Palantir数据整合","candidates":[{"title":"Palantir没有销售团队，客户却大规模采用","evidence":["我们没有销售团队，却看到了大规模的采用。"]}]}',
@@ -1429,7 +1620,10 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
             title="Palantir是什么"
         )
         subtitle_title.read_subtitle_text.return_value = ("字幕内容", "subtitle.srt")
-        subtitle_title.read_full_subtitle_text.return_value = ("完整字幕内容", "subtitle.srt")
+        subtitle_title.read_full_subtitle_text.return_value = (
+            "卡普谈Palantir数据整合，不做服务。我们没有销售团队，却看到了大规模的采用。",
+            "subtitle.srt",
+        )
         subtitle_title.parse_llm_title_response.return_value = (
             "卡普谈Palantir数据整合",
             ("卡普谈Palantir数据整合",),
@@ -1467,7 +1661,10 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
             ):
             metadata = autosub.generate_upload_metadata(workdir)
 
-        self.assertEqual(metadata["description"], "共享简介")
+        self.assertEqual(
+            metadata["description"],
+            "共享简介：卡普谈Palantir数据整合，不做服务；客户没有销售团队也大规模采用。",
+        )
         self.assertEqual(metadata["title"], "卡普谈Palantir数据整合，不做服务并坚持工程为本")
         self.assertEqual(metadata["wechat_title"], "卡普谈Palantir数据整合")
         self.assertEqual(metadata["cover_title"], "Palantir没有销售团队，客户却大规模采用")
@@ -1485,7 +1682,10 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
             "不得换算数量级",
             llm_client.generate_content.call_args_list[0].args[0],
         )
-        self.assertIn("视频简介：\n共享简介", llm_client.generate_content.call_args_list[1].args[0])
+        self.assertIn(
+            "视频简介：\n共享简介：卡普谈Palantir数据整合，不做服务；客户没有销售团队也大规模采用。",
+            llm_client.generate_content.call_args_list[1].args[0],
+        )
         self.assertIn("优先 24-40 个字符", llm_client.generate_content.call_args_list[1].args[0])
         self.assertIn("基于完整中文字幕和视频简介", llm_client.generate_content.call_args_list[1].args[0])
         self.assertIn("列出访谈的 3-5 个主要内容", llm_client.generate_content.call_args_list[1].args[0])
@@ -1609,6 +1809,106 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         )
         self.assertEqual(reframed_wechat_title, "Palantir员工谈新人深水区")
 
+    def test_recent_interview_metadata_fallbacks_survive_llm_timeout(self):
+        """The two weak-title cases must have concrete offline fallbacks."""
+        sequence_description = (
+            "本期《No Priors》专访 Sequence Holdings 联合创始人兼CEO。"
+            "他们以77亿美元收购保险经纪公司 Baldwin，"
+            "成为迄今规模最大的 AI 私有化交易。"
+            "他详解永久持有控股公司的模式：以所有权取代服务商角色，"
+            "靠自建工程平台 Atlas 改造在位企业。"
+        )
+        anthropic_description = (
+            "对话 Anthropic 研究员。"
+            "访谈讨论AGI安全、产出和2030年代的技术路径。"
+        )
+
+        self.assertEqual(
+            autosub._fallback_bili_title_from_description(sequence_description, 48),
+            "Sequence Holdings谈AI私有化：用所有权和工程平台改造在位企业",
+        )
+        self.assertEqual(
+            autosub._fallback_wechat_title_from_description(sequence_description, 16),
+            "Sequence用所有权改造企业",
+        )
+        self.assertEqual(
+            autosub._fallback_cover_title_from_description(
+                sequence_description,
+                "Sequence Holdings谈AI私有化：用所有权和工程平台改造在位企业",
+                48,
+            ),
+            "AI私有化最大交易：77亿美元收购Baldwin",
+        )
+        self.assertTrue(
+            autosub._metadata_title_has_quality_issue(
+                "Sequence Holdings：77亿美元收购后，用所有权改造在位企业",
+                "",
+                True,
+                sequence_description,
+            )
+        )
+        self.assertFalse(
+            autosub._metadata_title_has_quality_issue(
+                "Sequence Holdings谈AI私有化：用所有权和工程平台改造在位企业",
+                "",
+                True,
+                sequence_description,
+            )
+        )
+        self.assertTrue(
+            autosub._cover_title_repeats_form_title(
+                "Sequence：77亿美元收购后，用所有权改造在位企业",
+                "Sequence Holdings：77亿美元收购后，用所有权改造在位企业",
+            )
+        )
+        self.assertFalse(
+            autosub._cover_title_repeats_form_title(
+                "AI私有化最大交易：77亿美元收购Baldwin",
+                "Sequence Holdings谈AI私有化：用所有权和工程平台改造在位企业",
+            )
+        )
+        self.assertEqual(
+            autosub._fallback_bili_title_from_description(anthropic_description, 48),
+            "Anthropic研究员谈AGI安全与产出",
+        )
+        self.assertEqual(
+            autosub._fallback_wechat_title_from_description(anthropic_description, 16),
+            "Anthropic谈AGI安全",
+        )
+        self.assertEqual(
+            autosub._fallback_wechat_title_from_source_title(
+                "Anthropic Researchers - How AI Will Create A Radically Better 2030s",
+                16,
+            ),
+            "",
+        )
+
+    def test_low_quality_cached_upload_metadata_is_invalidated(self):
+        """A complete cache with a spoken title must not reach BI/WX."""
+        source_title = "Re-Founding Incumbents for the AI Era"
+        description = (
+            "对话 Sequence Holdings 联合创始人兼CEO。"
+            "公司以77亿美元收购在位企业，并用所有权改造组织和经营。"
+        )
+        meta = {
+            "title": "Sequence我们有两个问题",
+            "wechat_title": "Sequence我们有两个问题",
+            "cover_title": "Sequence我们有两个问题",
+            "description": description,
+        }
+
+        invalid_fields = autosub._invalidate_cached_upload_metadata(
+            meta,
+            source_title,
+            "中文字幕",
+        )
+
+        self.assertEqual(invalid_fields, ["title", "wechat_title", "cover_title"])
+        self.assertEqual(meta["title"], "")
+        self.assertEqual(meta["wechat_title"], "")
+        self.assertEqual(meta["cover_title"], "")
+        self.assertEqual(meta["description"], description)
+
     def test_teaching_metadata_fallback_survives_llm_timeout(self):
         """A good saved summary must not degrade to a random subtitle line."""
         description = (
@@ -1679,8 +1979,8 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         self.assertEqual(wechat_title, "数据治理团队被裁后组织会烂掉")
         self.assertEqual(cover_title, "没了筋膜，身体肌肉骨骼慢慢烂掉")
 
-    def test_generate_upload_metadata_completes_after_llm_timeout(self):
-        """A timeout must not leave BI/WX blocked without local metadata."""
+    def test_generate_upload_metadata_does_not_write_fallback_after_llm_timeout(self):
+        """A timeout must stop BI/WX instead of writing new fallback fields."""
         workdir = os.path.join(self.temp_dir, "metadata_llm_timeout")
         os.makedirs(workdir)
         hardsub = os.path.join(workdir, "video_hardsub.mp4")
@@ -1722,11 +2022,15 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
              ):
             metadata = autosub.generate_upload_metadata(workdir)
 
-        self.assertEqual(metadata["wechat_title"], "数据治理一半是在穿针引线")
-        self.assertEqual(metadata["cover_title"], "数据治理一半工作是在穿针引线")
+        self.assertEqual(
+            metadata.get("title", ""),
+            "正在帮助从业者在当今的数据治理时代做出贡献、展现价值",
+        )
+        self.assertEqual(metadata.get("wechat_title", ""), "")
+        self.assertEqual(metadata.get("cover_title", ""), "")
 
-    def test_generate_upload_metadata_falls_back_from_spoken_title(self):
-        """A spoken Bilibili title still yields a WeChat title offline."""
+    def test_generate_upload_metadata_keeps_spoken_title_incomplete(self):
+        """A spoken Bilibili title must not yield an offline WeChat title."""
         workdir = os.path.join(self.temp_dir, "metadata_spoken_title")
         os.makedirs(workdir)
         hardsub = os.path.join(workdir, "video_hardsub.mp4")
@@ -1761,13 +2065,10 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
              ):
             metadata = autosub.generate_upload_metadata(workdir)
 
-        self.assertEqual(
-            metadata["wechat_title"],
-            "德国核心问题是出口导向型文化",
-        )
+        self.assertEqual(metadata.get("wechat_title", ""), "")
 
-    def test_generate_upload_metadata_falls_back_from_source_title(self):
-        """A publisher title still yields a WeChat title when hooks fail."""
+    def test_generate_upload_metadata_rejects_english_source_title_fallback(self):
+        """A publisher title must not become a low-quality English form title."""
         workdir = os.path.join(self.temp_dir, "metadata_source_title")
         os.makedirs(workdir)
         hardsub = os.path.join(workdir, "video_hardsub.mp4")
@@ -1807,7 +2108,9 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
              ):
             metadata = autosub.generate_upload_metadata(workdir)
 
-        self.assertEqual(metadata["wechat_title"], "Peter Thiel谈AI")
+        self.assertEqual(metadata.get("title", ""), "")
+        self.assertEqual(metadata.get("wechat_title", ""), "")
+        self.assertEqual(metadata.get("cover_title", ""), "")
 
     def test_extract_source_title_uses_info_file_then_filename(self):
         """Metadata generation should recover the publisher title reliably."""
@@ -1836,8 +2139,8 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
             "",
         )
 
-    def test_generate_upload_metadata_prefers_source_title_over_random_hook(self):
-        """A publisher title is the last fallback when no Chinese subtitle exists."""
+    def test_generate_upload_metadata_stops_without_source_title_fallback(self):
+        """Incomplete metadata is safer than a pure English publisher-title copy."""
         workdir = os.path.join(self.temp_dir, "metadata_source_fallback")
         os.makedirs(workdir)
         hardsub = os.path.join(
@@ -1871,9 +2174,9 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
              ):
             metadata = autosub.generate_upload_metadata(workdir)
 
-        self.assertEqual(metadata["title"], "Responsible AI Innovation for British Public")
-        self.assertEqual(metadata["wechat_title"], "Responsible AI")
-        self.assertEqual(metadata["cover_title"], "Responsible AI Innovation for British Public")
+        self.assertEqual(metadata.get("title", ""), "")
+        self.assertEqual(metadata.get("wechat_title", ""), "")
+        self.assertEqual(metadata.get("cover_title", ""), "")
 
     def test_generate_upload_metadata_rejects_english_title_with_chinese_subtitle(self):
         """A Chinese transcript must not fall back to an English source title."""
@@ -1912,10 +2215,9 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
              ):
             metadata = autosub.generate_upload_metadata(workdir)
 
-        self.assertIn("Palantir 标准", metadata["title"])
-        self.assertTrue(autosub._contains_chinese_text(metadata["title"], 6))
-        self.assertNotEqual(metadata["title"], metadata["cover_title"])
-        self.assertIn("透析", metadata["cover_title"])
+        self.assertEqual(metadata.get("title", ""), "")
+        self.assertEqual(metadata.get("wechat_title", ""), "")
+        self.assertEqual(metadata.get("cover_title", ""), "")
 
     def test_bad_upload_metadata_cache_is_regenerated(self):
         """A complete cache is not reused when its titles violate quality rules."""
@@ -1951,7 +2253,7 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         with patch.object(autosub, "find_hardsub_video", return_value=hardsub), \
              patch.object(autosub, "_load_llm_defaults", return_value=("glm-5.2", "dashscope")), \
              patch.object(autosub, "_generate_title_from_description", return_value="Palantir AIPCon访谈聚焦行业落地"), \
-             patch.object(autosub, "_derive_wechat_title_from_bili_title", return_value="Palantir聚焦落地"), \
+             patch.object(autosub, "_derive_wechat_title_from_bili_title", return_value="Palantir访谈聚焦落地"), \
              patch.object(autosub, "_generate_cover_title_from_full_subtitle", return_value="医院被攻击，就有人做不了透析"), \
              patch.dict(
                  sys.modules,
@@ -1963,12 +2265,8 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
             metadata = autosub.generate_upload_metadata(workdir)
 
         self.assertEqual(metadata["title"], "Palantir AIPCon访谈聚焦行业落地")
-        self.assertEqual(metadata["wechat_title"], "Palantir聚焦落地")
-        self.assertEqual(
-            metadata["cover_title"],
-            "AIPCon访谈：我们用自建模型提前识别了脓毒症",
-        )
-        self.assertNotEqual(metadata["title"], metadata["cover_title"])
+        self.assertEqual(metadata["wechat_title"], "Palantir访谈聚焦落地")
+        self.assertEqual(metadata.get("cover_title", ""), "")
         self.assertFalse(llm_client.generate_content.called)
 
     def test_cached_upload_title_must_cover_whole_video_summary(self):
@@ -1977,6 +2275,7 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         description = (
             "All-In Summit 2026现场，多位嘉宾讨论AI、能源与人体创新。"
             "内容包括SaaS、天然气、超加工食品、自由意志和生物黑客。"
+            "嘉宾还讨论了AI安全和监管。"
         )
 
         self.assertTrue(
@@ -1998,6 +2297,18 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
                 "All-In峰会嘉宾谈AI、能源与人体创新",
                 source_title=source_title,
                 description=description,
+            )
+        )
+        self.assertTrue(
+            autosub._metadata_title_lacks_mainline_coverage(
+                "GenSpark建立管控机制加速普及模型",
+                description,
+            )
+        )
+        self.assertFalse(
+            autosub._metadata_title_lacks_mainline_coverage(
+                "All-In峰会嘉宾谈AI、能源与人体创新",
+                description,
             )
         )
 
@@ -2121,8 +2432,8 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
 
         self.assertEqual(cover_title, "Palantir FDE一上来就被扔进深水区")
 
-    def test_generate_upload_metadata_falls_back_when_summary_title_is_bad(self):
-        """Invalid summary compression must not bypass subtitle grounding."""
+    def test_generate_upload_metadata_stops_when_summary_title_is_bad(self):
+        """Invalid summary compression must stop uploads, not use subtitle fallback."""
         workdir = os.path.join(self.temp_dir, "metadata_summary_fallback")
         os.makedirs(workdir)
         hardsub = os.path.join(workdir, "video_hardsub.mp4")
@@ -2133,10 +2444,6 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
             "共享简介",
             "bad response",
             "bad response",
-            "bad response",
-            "bad response",
-            '{"title":"Palantir整合数据不做服务"}',
-            '{"central_claim":"卡普谈Palantir数据整合","candidates":[{"title":"没有销售团队，却看到大规模采用","evidence":["我们没有销售团队，却看到了大规模的采用。"]}]}',
         ]
         subtitle_title = MagicMock()
         subtitle_title.SubtitleTitleError = ValueError
@@ -2145,14 +2452,6 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         subtitle_title.parse_llm_title_candidates.side_effect = [
             ("", ()),
             ("", ()),
-            (
-                "卡普谈Palantir数据整合",
-                (("卡普谈Palantir数据整合", ("卡普谈Palantir数据整合",)),),
-            ),
-            (
-                "卡普谈Palantir数据整合",
-                (("没有销售团队，却看到大规模采用", ("我们没有销售团队，却看到了大规模的采用。",)),),
-            ),
         ]
         subtitle_title.parse_llm_title_response.return_value = (
             "Palantir到底做什么",
@@ -2173,22 +2472,10 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
              ):
             metadata = autosub.generate_upload_metadata(workdir)
 
-        self.assertEqual(metadata["title"], "卡普谈Palantir数据整合，不做服务")
-        self.assertEqual(metadata["wechat_title"], "卡普谈Palantir数据整合")
-        self.assertEqual(subtitle_title.build_subtitle_grounded_title.call_count, 1)
-        fallback_call = subtitle_title.build_subtitle_grounded_title.call_args_list[0]
-        self.assertIn("保留主体、谓语和最具体的核心结果", fallback_call.kwargs["platform_hint"])
-        self.assertIn("保留受益者、问题或明确立场", fallback_call.kwargs["platform_hint"])
-        self.assertIn("「主体+动作+对象」压缩片段", fallback_call.kwargs["platform_hint"])
-        self.assertIn("B站表单标题没有微信的16字限制", fallback_call.kwargs["platform_hint"])
-        self.assertIn("优先24-40字", fallback_call.kwargs["platform_hint"])
-        self.assertIn("英文字母逐字符计数", fallback_call.kwargs["platform_hint"])
-        self.assertIn("禁止使用省略号", fallback_call.kwargs["platform_hint"])
-        self.assertIn("不要改写成概括句", fallback_call.kwargs["platform_hint"])
-        self.assertIn("不得用「东西」「能力」等泛词", fallback_call.kwargs["platform_hint"])
-        self.assertIn("优先删除「把/了/的/一个」等功能词和修饰语", fallback_call.kwargs["platform_hint"])
-        self.assertIn("不得用「它/他们」替代主体", fallback_call.kwargs["platform_hint"])
-        self.assertIn("视频简介第一句：共享简介", fallback_call.kwargs["platform_hint"])
+        self.assertEqual(metadata.get("title", ""), "")
+        self.assertEqual(metadata.get("wechat_title", ""), "")
+        self.assertEqual(metadata.get("cover_title", ""), "")
+        self.assertEqual(subtitle_title.build_subtitle_grounded_title.call_count, 0)
 
     def test_bili_title_prompt_requires_a_complete_summary_sentence(self):
         """The Bilibili title must summarize the interview, not pile up nouns."""
@@ -2722,6 +3009,89 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         self.assertEqual(cmd[:5], [python, "-u", script, hardsub, "FDE的核心职能：抽象产品"])
         cover_index = cmd.index("--cover-title")
         self.assertEqual(cmd[cover_index + 1], "抽象产品")
+
+    def test_bili_login_preflight_detects_missing_cookie_fields(self):
+        """A malformed local cookie file is a definite pre-upload failure."""
+        cookie_path = os.path.join(self.temp_dir, "cookies.json")
+        with open(cookie_path, "w", encoding="utf-8") as handle:
+            json.dump({"SESSDATA": "session", "bili_jct": ""}, handle)
+
+        with patch.object(autosub, "BILI_COOKIES", cookie_path):
+            reason = autosub.get_bili_login_skip_reason()
+
+        self.assertEqual(reason, "Bilibili cookies missing: bili_jct, buvid3")
+
+    def test_bili_login_preflight_classifies_code_101(self):
+        """The account API check must distinguish invalid login from network errors."""
+        cookie_path = os.path.join(self.temp_dir, "cookies.json")
+        with open(cookie_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {"SESSDATA": "session", "bili_jct": "csrf", "buvid3": "buvid"},
+                handle,
+            )
+        mock_subprocess = MagicMock()
+        mock_subprocess.run.return_value = MagicMock(
+            returncode=1,
+            stdout="",
+            stderr="ResponseCodeException: code=-101, 账号未登录",
+        )
+
+        with patch.object(autosub, "BILI_COOKIES", cookie_path), \
+             patch.object(autosub, "BILI_PYTHON", sys.executable), \
+             patch.object(autosub, "subprocess", mock_subprocess):
+            status, reason = autosub.check_bili_login()
+
+        self.assertFalse(status)
+        self.assertIn("code -101", reason)
+        self.assertIn(cookie_path, mock_subprocess.run.call_args.args[0][3])
+
+    def test_bili_login_preflight_keeps_network_errors_recoverable(self):
+        """An inconclusive check must not prevent the real upload from running."""
+        cookie_path = os.path.join(self.temp_dir, "cookies.json")
+        with open(cookie_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {"SESSDATA": "session", "bili_jct": "csrf", "buvid3": "buvid"},
+                handle,
+            )
+        mock_subprocess = MagicMock()
+        mock_subprocess.run.return_value = MagicMock(
+            returncode=1,
+            stdout="",
+            stderr="NetworkException: timeout",
+        )
+
+        with patch.object(autosub, "BILI_COOKIES", cookie_path), \
+             patch.object(autosub, "BILI_PYTHON", sys.executable), \
+             patch.object(autosub, "subprocess", mock_subprocess):
+            status, reason = autosub.check_bili_login()
+
+        self.assertIsNone(status)
+        self.assertIn("upload will still be attempted", reason)
+
+    def test_wechat_login_preflight_requires_browser_profile(self):
+        """A missing persistent profile is a definite pre-upload failure."""
+        profile = os.path.join(self.temp_dir, "browser_data")
+        os.makedirs(profile)
+
+        with patch.object(autosub, "WECHAT_BROWSER_DATA_DIR", profile):
+            self.assertIsNone(autosub.get_wechat_login_skip_reason())
+
+        with patch.object(autosub, "WECHAT_BROWSER_DATA_DIR", "/missing/profile"):
+            reason = autosub.get_wechat_login_skip_reason()
+
+        self.assertIn("WeChat browser profile not found", reason)
+
+    def test_upload_login_failure_hints_include_recovery_commands(self):
+        """Login failures surface the exact QR-login command, not only code=1."""
+        bili_hint = autosub.get_upload_login_failure_hint(
+            "📱 [Bilibili]", "{'code': -101, 'message': '账号未登录'}"
+        )
+        wechat_hint = autosub.get_upload_login_failure_hint(
+            "💬 [WeChat]", "微信登录态不可用或发布页加载失败"
+        )
+
+        self.assertIn("login.py", bili_hint)
+        self.assertIn("wechat_upload.py --login", wechat_hint)
 
     def test_trigger_bili_upload_runs_built_command(self):
         """The Bilibili trigger must execute the uploader, not just log success."""
@@ -3278,6 +3648,11 @@ class TestUploadWatchdogAndProcessTree(unittest.TestCase):
 
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp()
+        self._bili_login_patcher = patch.object(
+            batch_pro, "get_bili_login_skip_reason", return_value=None
+        )
+        self._bili_login_patcher.start()
+        self.addCleanup(self._bili_login_patcher.stop)
 
     def tearDown(self):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
@@ -3478,6 +3853,32 @@ class TestUploadWatchdogAndProcessTree(unittest.TestCase):
             ok = engine.run_process(task, "GD", cmd, start_pct=0.0, end_pct=100.0)
         self.assertTrue(ok)
         self.assertEqual(task.pcts["GD"], 100.0)
+
+    def test_run_process_surfaces_bili_login_error(self):
+        """The lone-BI path must preserve the login cause instead of Exit 1."""
+        workdir = os.path.join(self.temp_dir, "bili_login_exit")
+        os.makedirs(workdir)
+        task = SubTask(
+            uid=9, url="http://test.com", title="Video 9", duration="01:00",
+            status="排队中 (BI)", workdir=workdir,
+            pcts={"DL": 100.0, "TR": 100.0, "TL": 100.0, "MR": 100.0,
+                  "BR": 100.0, "GD": 100.0, "BI": 0.0, "WX": 100.0},
+        )
+        engine = self._engine()
+        engine.task_map[task.uid] = task
+        script = (
+            "print('CredentialNoSessdataException: "
+            "Credential 类未提供 sessdata 或者为空。', flush=True)\n"
+            "raise SystemExit(1)\n"
+        )
+        cmd = [sys.executable, "-u", "-c", script]
+        with patch.object(BatchEngine, "save_state", lambda self: None):
+            ok = engine.run_process(task, "BI", cmd, start_pct=0.0, end_pct=100.0)
+
+        self.assertFalse(ok)
+        self.assertEqual(task.status, "失败 (BI)")
+        self.assertIn("登录态失效", task.error or "")
+        self.assertIn("login.py", task.error or "")
 
     # --- which stages get a watchdog ---
 

@@ -76,8 +76,9 @@ except ImportError:
 import atexit
 import ctypes
 
-# Keep upload metadata generation responsive when the LLM endpoint stalls.
-os.environ.setdefault("LLM_REQUEST_TIMEOUT", "30")
+# Reasoning models can take longer than 30 seconds to generate upload metadata.
+# Keep retries low, but allow the request itself enough time to finish.
+os.environ.setdefault("LLM_REQUEST_TIMEOUT", "300")
 os.environ.setdefault("LLM_MAX_RETRIES", "1")
 
 CREATE_NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
@@ -240,8 +241,11 @@ from autosub import (  # noqa: E402
     VENDOR_MAP,
     build_bili_cmd,
     build_wechat_cmd,
+    get_bili_login_command,
+    get_bili_login_skip_reason,
     get_wechat_duration_skip_reason,
     get_wechat_upload_skip_reason,
+    get_upload_login_failure_hint,
     run_bili_cmd,
     run_wechat_cmd,
     generate_upload_metadata,
@@ -1760,6 +1764,23 @@ class BatchEngine:
                     logger.info(f"Task {task.uid} | {stage} | Process exited due to pause.")
                     return False
 
+                if stage in ("BI", "WX"):
+                    label = (
+                        "B站 Bilibili (BI)"
+                        if stage == "BI"
+                        else "视频号 WeChat (WX)"
+                    )
+                    login_reason = get_upload_login_failure_hint(
+                        label, "".join(output_lines)
+                    )
+                    if login_reason:
+                        task.status = f"失败 ({stage})"
+                        task.error = login_reason
+                        logger.error(
+                            f"Task {task.uid} | {stage} | FAILED | {login_reason}"
+                        )
+                        return False
+
                 # 清除脏 100% 数据（分片级假 100% 会残留），保留真实部分进度
                 if task.pcts.get(stage, 0.0) >= 100.0:
                     task.pcts[stage] = 0.0
@@ -1930,12 +1951,28 @@ class BatchEngine:
                         and not wx_over_limit
                         and not os.path.exists(os.path.join(workdir, ".wechat_uploaded"))
                     )
+                    preflight_upload_failure_reasons = []
+                    if need_bi:
+                        bili_login_skip_reason = get_bili_login_skip_reason()
+                        if bili_login_skip_reason:
+                            reason = (
+                                f"B站 Bilibili (BI) 登录态失效，请先执行: "
+                                f"{get_bili_login_command()}（{bili_login_skip_reason}）"
+                            )
+                            preflight_upload_failure_reasons.append(reason)
+                            need_bi = False
+                            logger.error(f"Task {task.uid} | BI | upload stopped: {reason}")
                     upload_llm_model, upload_llm_provider = self._get_upload_llm_settings()
 
                     # Count how many uploads are needed
                     active = sum([bool(need_gd), bool(need_bi), bool(need_wx)])
 
                     if active == 0:
+                        if preflight_upload_failure_reasons:
+                            task.status = "失败 (上传)"
+                            task.error = "；".join(preflight_upload_failure_reasons)
+                            self.save_state()
+                            break
                         if wx_over_limit:
                             task.status = "超限 (WX)"
                             task.error = f"视频号上传未启动：{wx_skip_reason}"
@@ -1983,14 +2020,12 @@ class BatchEngine:
                         # scenario where slow LLM calls delay GD sync by 20+ min.
                         sync_cmd = [str(x) for x in [PYTHON_EXE, SYNC_SCRIPT, "--local-dir", workdir, "--remote-id", self.gdsync_id, "--wrap-folder", "--headless"] if x is not None] if need_gd else None
 
-                        pending_upload_stages = []
+                        initial_upload_stages = []
                         if need_gd:
-                            pending_upload_stages.append("GD")
-                        if need_bi:
-                            pending_upload_stages.append("BI")
-                        if need_wx:
-                            pending_upload_stages.append("WX")
-                        upload_status_label = "/".join(pending_upload_stages)
+                            initial_upload_stages.append("GD")
+                        if need_bi or need_wx:
+                            initial_upload_stages.append("MetaGen")
+                        upload_status_label = "/".join(initial_upload_stages)
                         if upload_status_label:
                             with self.lock:
                                 task.status = f"运行中 ({upload_status_label})"
@@ -1998,8 +2033,8 @@ class BatchEngine:
 
                         # Phase 1: kick off GD sync + MetaGen concurrently
                         gd_result = [False]
-                        bi_result = [False]
-                        wx_result = [False]
+                        bi_result = [False, None]
+                        wx_result = [False, None]
                         meta_box = [None]
 
                         gd_thread = None
@@ -2040,8 +2075,8 @@ class BatchEngine:
                             for field in required_meta_fields
                         )
                         metadata_failed = False
-                        upload_failure_reasons = []
-                        permanent_upload_failure = False
+                        upload_failure_reasons = list(preflight_upload_failure_reasons)
+                        permanent_upload_failure = bool(preflight_upload_failure_reasons)
                         if wx_over_limit:
                             upload_failure_reasons.append(
                                 f"视频号上传未启动：{wx_skip_reason}"
@@ -2139,6 +2174,19 @@ class BatchEngine:
                             task.pcts["WX"] = 100.0
                         self.save_state()
 
+                        if need_bi and not bi_result[0]:
+                            upload_failure_reasons.append(
+                                bi_result[1] if len(bi_result) > 1 and bi_result[1] else "BI upload failed"
+                            )
+                        if need_wx and not wx_result[0]:
+                            upload_failure_reasons.append(
+                                wx_result[1] if len(wx_result) > 1 and wx_result[1] else "WX upload failed"
+                            )
+                        permanent_upload_failure = permanent_upload_failure or any(
+                            "登录态失效" in reason
+                            for reason in upload_failure_reasons
+                        )
+
                         all_ok = (
                             not metadata_failed
                             and not upload_failure_reasons
@@ -2218,6 +2266,10 @@ class BatchEngine:
                         self.disk_truth(task)
                     else:
                         # 失败重试逻辑
+                        if task.error and "登录态失效" in task.error:
+                            task.status = f"失败 ({stage})"
+                            self.save_state()
+                            break
                         if task.retries < 3:
                             task.retries += 1
                             task.status = f"排队中 ({stage})"
@@ -2367,6 +2419,7 @@ class BatchEngine:
             with self.lock:
                 task.pcts["BI"] = 0.0
             logger.info(f"Task {task.uid} | BI | Start (parallel): {' '.join(cmd)}")
+            output_lines = []
 
             def on_progress(pct):
                 if pct > task.pcts.get("BI", 0.0):
@@ -2375,9 +2428,11 @@ class BatchEngine:
                         self.save_state()
 
             def on_log(line):
+                output_lines.append(str(line))
                 logger.info(f"Task {task.uid} | BI | {line}")
 
             ok = run_bili_cmd(cmd, on_progress=on_progress, on_log=on_log, abort_flag=lambda: self.abort)
+            output = "\n".join(output_lines)
             if ok:
                 with self.lock:
                     task.pcts["BI"] = 100.0
@@ -2385,11 +2440,17 @@ class BatchEngine:
                 result_box[0] = True
                 logger.info(f"Task {task.uid} | BI | Success")
             else:
-                task.error = "BI upload failed"
-                logger.error(f"Task {task.uid} | BI | Failed")
+                reason = get_upload_login_failure_hint("B站 Bilibili (BI)", output) or "BI upload failed"
+                task.error = reason
+                if len(result_box) > 1:
+                    result_box[1] = reason
+                logger.error(f"Task {task.uid} | BI | Failed: {reason}")
         except Exception as e:
-           task.error = str(e)
-           logger.error(f"Task {task.uid} | BI | Exception: {e}")
+            reason = str(e)
+            task.error = reason
+            if len(result_box) > 1:
+                result_box[1] = reason
+            logger.error(f"Task {task.uid} | BI | Exception: {e}")
         finally:
            if has_sem:
                sem.release()
@@ -2407,8 +2468,10 @@ class BatchEngine:
             with self.lock:
                 task.pcts["WX"] = 0.0
             logger.info(f"Task {task.uid} | WX | Start (parallel): {' '.join(cmd)}")
+            output_lines = []
 
             def on_log(line):
+                output_lines.append(str(line))
                 logger.info(f"Task {task.uid} | WX | {line}")
 
             def on_progress(pct):
@@ -2423,6 +2486,7 @@ class BatchEngine:
                 on_log=on_log,
                 abort_flag=lambda: self.abort,
             )
+            output = "\n".join(output_lines)
             if ok:
                 with self.lock:
                     task.pcts["WX"] = 100.0
@@ -2430,10 +2494,16 @@ class BatchEngine:
                 result_box[0] = True
                 logger.info(f"Task {task.uid} | WX | Success")
             else:
-                task.error = "WX upload failed"
-                logger.error(f"Task {task.uid} | WX | Failed")
+                reason = get_upload_login_failure_hint("视频号 WeChat (WX)", output) or "WX upload failed"
+                task.error = reason
+                if len(result_box) > 1:
+                    result_box[1] = reason
+                logger.error(f"Task {task.uid} | WX | Failed: {reason}")
         except Exception as e:
-            task.error = str(e)
+            reason = str(e)
+            task.error = reason
+            if len(result_box) > 1:
+                result_box[1] = reason
             logger.error(f"Task {task.uid} | WX | Exception: {e}")
         finally:
             if has_sem:

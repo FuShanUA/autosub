@@ -259,8 +259,15 @@ def trigger_sync(local_dir, remote_id, headless=False):
 # --- Bilibili Upload (canonical implementation; batch engine + GUI reuse this) ---
 BILI_SCRIPT = "/Users/shanfu/.gemini/config/skills/bilibili-uploader/scripts/bili_upload.py"
 BILI_PYTHON = "/Users/shanfu/.gemini/config/skills/bilibili-uploader/.venv/bin/python"
+BILI_LOGIN_SCRIPT = os.path.join(os.path.dirname(BILI_SCRIPT), "login.py")
+BILI_COOKIES = os.path.join(
+    os.path.dirname(os.path.dirname(BILI_SCRIPT)), "assets", "cookies.json"
+)
 BILI_VIDEO_EXTS = ('.mp4', '.mkv', '.webm', '.mov', '.ts')
 WECHAT_SCRIPT = os.path.expanduser("~/.codex/skills/wechat-channel-uploader/scripts/wechat_upload.py")
+WECHAT_BROWSER_DATA_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(WECHAT_SCRIPT)), "assets", "browser_data"
+)
 SHARED_UPLOAD_TITLE_MAX_CHARS = 16
 BILI_UPLOAD_TITLE_MAX_CHARS = 48
 BILI_UPLOAD_TITLE_HARD_MAX_CHARS = 80
@@ -272,6 +279,112 @@ _wechat_venv_python = os.path.join(
     "python.exe" if sys.platform == "win32" else "python",
 )
 WECHAT_PYTHON = _wechat_venv_python if os.path.exists(_wechat_venv_python) else sys.executable
+
+def get_bili_login_command():
+    """Return the visible Bilibili QR-login command shown to the user."""
+    return f"{BILI_PYTHON} -u {BILI_LOGIN_SCRIPT}"
+
+def get_wechat_login_command():
+    """Return the visible WeChat Channels QR-login command."""
+    return f"{WECHAT_PYTHON} -u {WECHAT_SCRIPT} --login"
+
+def get_bili_login_skip_reason():
+    """Check the local Bilibili cookie file before starting an upload."""
+    if not os.path.isfile(BILI_COOKIES):
+        return f"Bilibili cookies not found: {BILI_COOKIES}"
+    try:
+        with open(BILI_COOKIES, "r", encoding="utf-8") as handle:
+            cookies = json.load(handle)
+    except (OSError, ValueError) as exc:
+        return f"cannot read Bilibili cookies: {exc}"
+    required = ("SESSDATA", "bili_jct", "buvid3")
+    missing = [name for name in required if not str(cookies.get(name) or "").strip()]
+    if missing:
+        return "Bilibili cookies missing: " + ", ".join(missing)
+    return None
+
+def get_wechat_login_skip_reason():
+    """Check that the persistent WeChat browser profile exists."""
+    if not os.path.isdir(WECHAT_BROWSER_DATA_DIR):
+        return f"WeChat browser profile not found: {WECHAT_BROWSER_DATA_DIR}"
+    return None
+
+def _bili_output_says_not_logged_in(output):
+    text = str(output)
+    return any(
+        marker in text
+        for marker in (
+            "账号未登录",
+            "code=-101",
+            "'code': -101",
+            '"code": -101',
+            "CredentialNoSessdataException",
+            "未提供 sessdata",
+        )
+    )
+
+def check_bili_login(timeout=20):
+    """Verify Bilibili cookies with the account's own lightweight API.
+
+    Returns (True, None) for a valid login, (False, reason) for a definite
+    login failure, and (None, reason) when the check is inconclusive. An
+    inconclusive network error must not block the upload attempt itself.
+    """
+    skip_reason = get_bili_login_skip_reason()
+    if skip_reason:
+        return False, skip_reason
+    if not os.path.isfile(BILI_PYTHON):
+        return None, "Bilibili login check unavailable: upload Python not found"
+
+    check_code = f"""
+import asyncio, json
+from bilibili_api import Credential
+from bilibili_api.user import get_self_info
+
+async def main():
+    with open({BILI_COOKIES!r}, "r", encoding="utf-8") as handle:
+        cookies = json.load(handle)
+    credential = Credential(
+        sessdata=cookies["SESSDATA"],
+        bili_jct=cookies["bili_jct"],
+        buvid3=cookies["buvid3"],
+        buvid4=cookies.get("buvid4"),
+    )
+    await get_self_info(credential=credential)
+
+asyncio.run(main())
+"""
+    try:
+        result = subprocess.run(
+            [BILI_PYTHON, "-u", "-c", check_code],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return None, "Bilibili login check timed out; upload will still be attempted"
+    except OSError as exc:
+        return None, f"Bilibili login check failed; upload will still be attempted: {exc}"
+
+    output = (result.stdout or "") + (result.stderr or "")
+    if result.returncode == 0:
+        return True, None
+    if _bili_output_says_not_logged_in(output):
+        return False, "Bilibili login is invalid (code -101)"
+    brief = " ".join(output.split())[:240]
+    return None, f"Bilibili login check failed; upload will still be attempted: {brief}"
+
+def get_upload_login_failure_hint(label, output):
+    """Turn uploader login errors into the visible recovery command."""
+    text = str(output)
+    if "Bilibili" in label and _bili_output_says_not_logged_in(text):
+        return f"{label} 登录态失效，请先执行: {get_bili_login_command()}"
+    if "WeChat" in label and any(
+        marker in text
+        for marker in ("登录态不可用", "登录态已失效", "需要扫码登录", "请先执行一次可见登录命令")
+    ):
+        return f"{label} 登录态失效，请先执行: {get_wechat_login_command()}"
+    return None
 
 def find_hardsub_video(workdir):
     """Return the most recently modified *_hardsub* video in workdir, or None."""
@@ -685,7 +798,7 @@ def _load_llm_defaults():
 
 
 _SHARED_TITLE_BANNED_TERMS = (
-    "它", "他们", "她们", "东西", "能力", "到底", "究竟",
+    "我们", "它", "他们", "她们", "东西", "能力", "到底", "究竟",
     "为什么", "为何", "如何", "怎么", "怎样", "什么",
     "死活",
 )
@@ -697,7 +810,7 @@ _SHARED_TITLE_ACTION_MARKERS = (
 )
 _SHARED_TITLE_CONTEXT_MARKERS = (
     "访谈", "对话", "谈", "讲", "为", "帮", "给", "客户", "企业", "主题",
-    "问题", "不做", "不是", "不招", "押注", "才是", "隐私",
+    "问题", "不做", "不是", "不招", "押注", "才是", "隐私", "一半",
     "被裁", "烂掉",
 )
 _PUBLIC_TITLE_STYLE_EXAMPLES = (
@@ -755,6 +868,8 @@ _COVER_TITLE_ABSTRACT_MARKERS = (
 _COVER_TITLE_THESIS_ACTION_MARKERS = (
     "用", "整合", "识别", "救治", "优化", "合作", "布局",
     "推进", "建立", "采用", "穿针引线",
+    "解决", "放大", "谈",
+    "收购",
 )
 _COVER_TITLE_TRANSLATION_TERMS = (
     "内部模型",
@@ -765,6 +880,12 @@ def _title_has_naturalness_issue(title):
     """Reject headline Chinese that reads like translation or filler speech."""
     value = re.sub(r"\s+", " ", str(title or "")).strip()
     if not value:
+        return True
+    if "..." in value or "……" in value or "。" in value:
+        return True
+    if re.match(r"^(?:有意思|现在|显然|其实|当然)", value):
+        return True
+    if re.search(r"一个是.{1,24}?一个是", value):
         return True
     if any(value.startswith(prefix) for prefix in _TITLE_NATURALNESS_BAD_PREFIXES):
         return True
@@ -798,7 +919,10 @@ def _cover_title_information_units(title):
     """Count the concrete units a viewer can decode in three seconds."""
     value = re.sub(r"\s+", " ", str(title or "")).strip()
     latin_subject = bool(
-        re.search(r"\b[A-Za-z][A-Za-z0-9_-]{2,}\b", value)
+        re.search(
+            r"(?<![A-Za-z0-9_-])[A-Za-z][A-Za-z0-9_-]{2,}(?![A-Za-z0-9_-])",
+            value,
+        )
         and value.lower() not in {"the", "and", "for"}
     )
     return (
@@ -1043,8 +1167,17 @@ def _title_candidate_score(
 
 def _cover_title_repeats_form_title(title, form_title):
     """Reject generated covers that merely restate the form title."""
-    normalize = lambda value: re.sub(r"\s+", "", str(value or ""))
-    return bool(form_title) and normalize(title) == normalize(form_title)
+    normalized_title = _comparison_title(title)
+    normalized_form = _comparison_title(form_title)
+    if not normalized_title or not normalized_form:
+        return False
+    if normalized_title == normalized_form:
+        return True
+    title_tokens = _title_scoring_tokens(title)
+    if not title_tokens:
+        return False
+    overlap = len(title_tokens & _title_scoring_tokens(form_title))
+    return overlap / len(title_tokens) >= 0.75
 
 
 def _contains_chinese_text(value, min_chars=2):
@@ -1094,6 +1227,26 @@ def _metadata_title_has_whole_video_issue(title, source_title="", description=""
     return coverage < 0.15
 
 
+def _metadata_title_lacks_mainline_coverage(title, description):
+    """Require a form title to cover the whole-video summary."""
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(r"[。！？\n]", str(description or ""))
+        if sentence.strip()
+    ]
+    if len(sentences) < 2:
+        return False
+    strongest_sentence_coverage = max(
+        _title_reference_coverage(title, sentence)
+        for sentence in sentences
+    )
+    whole_description_coverage = _title_reference_coverage(title, description)
+    return not (
+        strongest_sentence_coverage >= 0.45
+        and whole_description_coverage >= 0.55
+    )
+
+
 def _metadata_title_has_quality_issue(
     title,
     source_title,
@@ -1104,8 +1257,6 @@ def _metadata_title_has_quality_issue(
     value = re.sub(r"\s+", " ", str(title or "")).strip()
     if not value:
         return True
-    if not require_chinese:
-        return False
     if require_chinese and not _contains_chinese_text(value):
         return True
     if _metadata_title_is_source_copy(value, source_title):
@@ -1115,6 +1266,8 @@ def _metadata_title_has_quality_issue(
         source_title=source_title,
         description=description,
     ):
+        return True
+    if _metadata_title_lacks_mainline_coverage(value, description):
         return True
     return bool(_shared_title_has_quality_issue(value))
 
@@ -1142,6 +1295,8 @@ def _metadata_cover_title_has_quality_issue(
         _comparison_title(form_title),
         _comparison_title(wechat_title),
     }:
+        return True
+    if _cover_title_repeats_form_title(value, form_title):
         return True
     if _cover_title_has_engagement_issue(value):
         return True
@@ -1311,6 +1466,9 @@ def _generate_title_from_description(
         "B站标题没有微信的 16 字限制，要表达得更充分："
         "通常覆盖 3 个实质信息点，例如访谈主题、核心业务/做法、"
         "明确立场或结果；不要为了短而删成分类标签。"
+        "表单标题负责概括整场访谈，不得只放一个钩子；"
+        "收购金额、发布事件或单句金句只能作为一个信息点，"
+        "不得成为标题主体。"
         "表单标题禁用「把」字句；"
         "用「主体+为+受益者+动作+对象」或「主体+解决+对象+问题」表达完整谓语。"
         "先在内部完成三步：列出访谈的 3-5 个主要内容；"
@@ -2182,7 +2340,7 @@ def _fallback_bili_title_from_source_title(source_title, max_chars):
         if cut < max_chars // 2:
             cut = max_chars
         value = value[:cut].rstrip(" .,:;!?")
-    return value
+    return normalize_bili_upload_title(value, max_chars=max_chars)
 
 
 def _fallback_wechat_title_from_source_title(source_title, max_chars):
@@ -2206,7 +2364,7 @@ def _fallback_wechat_title_from_source_title(source_title, max_chars):
         normalized = normalize_shared_upload_title(candidate, max_chars=max_chars)
         if normalized:
             return normalized
-    return sanitize_wechat_title(value, max_chars=max_chars)
+    return normalize_shared_upload_title(value, max_chars=max_chars)
 
 
 _SUBTITLE_HOOK_MARKERS = (
@@ -2606,6 +2764,45 @@ def _load_upload_metadata(workdir):
         return {}
 
 
+def _description_title_fragments(description):
+    """Extract conservative title building blocks from a saved summary."""
+    value = re.sub(r"\s+", " ", str(description or "")).strip()
+    if not value:
+        return {}
+    first_sentence = re.split(r"[。！？\n]", value, maxsplit=1)[0]
+    subject_match = re.search(
+        r"(?:专访|对话)\s*([A-Za-z][A-Za-z0-9&.-]*(?:\s+[A-Za-z][A-Za-z0-9&.-]*)?)",
+        first_sentence,
+    )
+    subject = subject_match.group(1).strip() if subject_match else ""
+    amount_match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*亿美元", value)
+    acquisition_match = re.search(
+        r"收购(?:保险经纪公司\s*)?([A-Za-z][A-Za-z0-9&.-]*)",
+        value,
+    )
+    compact_value = re.sub(r"\s+", "", value)
+    return {
+        "subject": subject,
+        "short_subject": subject.split()[0] if subject else "",
+        "amount": f"{amount_match.group(1)}亿美元" if amount_match else "",
+        "acquisition_target": (
+            acquisition_match.group(1) if acquisition_match else ""
+        ),
+        "ai_privatization": "AI私有化" in compact_value,
+        "largest_ai_privatization": (
+            "AI私有化" in compact_value and "规模最大" in compact_value
+        ),
+        "engineering_platform": (
+            "工程平台" in compact_value or "Atlas" in value
+        ),
+        "incumbents": "在位企业" in compact_value,
+        "ownership": "所有权" in value
+        and ("改造" in value or "在位企业" in value),
+        "agi_safety": "AGI" in value and "安全" in value,
+        "output": "产出" in value,
+    }
+
+
 def _fallback_bili_title_from_subtitle(
     subtitle_text,
     source_title=None,
@@ -2660,6 +2857,37 @@ def _fallback_bili_title_from_description(description, max_chars):
         return ""
     if not _contains_chinese_text(value, 8):
         return ""
+
+    fragments = _description_title_fragments(value)
+    candidates = []
+    if fragments.get("subject") and fragments.get("ai_privatization"):
+        mainline_title = f"{fragments['subject']}谈AI私有化"
+        if fragments.get("ownership"):
+            method = "用所有权"
+            if fragments.get("engineering_platform"):
+                method += "和工程平台"
+            if fragments.get("incumbents"):
+                mainline_title += f"：{method}改造在位企业"
+            else:
+                mainline_title += f"：{method}改造企业"
+        candidates.append(mainline_title)
+    if fragments.get("subject") and fragments.get("ownership"):
+        ownership_title = f"{fragments['subject']}：用所有权改造在位企业"
+        if fragments.get("amount"):
+            ownership_title = (
+                f"{fragments['subject']}：{fragments['amount']}收购后，"
+                "用所有权改造在位企业"
+            )
+        candidates.append(ownership_title)
+    if fragments.get("subject") and fragments.get("agi_safety"):
+        safety_title = f"{fragments['subject']}研究员谈AGI安全"
+        if fragments.get("output"):
+            safety_title = f"{fragments['subject']}研究员谈AGI安全与产出"
+        candidates.append(safety_title)
+    for candidate in candidates:
+        normalized = normalize_bili_upload_title(candidate, max_chars=max_chars)
+        if normalized:
+            return normalized
 
     first_sentence = re.split(r"[。！？\n]", value, maxsplit=1)[0]
     if "教你用好" in first_sentence:
@@ -2730,6 +2958,20 @@ def _fallback_wechat_title_from_description(description, max_chars):
     value = re.sub(r"\s+", " ", str(description or "")).strip()
     if not value or not _contains_chinese_text(value, 8):
         return ""
+
+    fragments = _description_title_fragments(value)
+    candidates = []
+    if fragments.get("short_subject") and fragments.get("ownership"):
+        candidates.append(f"{fragments['short_subject']}用所有权改造企业")
+    if fragments.get("short_subject") and fragments.get("agi_safety"):
+        candidates.append(f"{fragments['short_subject']}谈AGI安全")
+    for candidate in candidates:
+        normalized = normalize_shared_upload_title(
+            candidate,
+            max_chars=max_chars,
+        )
+        if normalized:
+            return normalized
 
     first_sentence = re.split(r"[。！？\n]", value, maxsplit=1)[0]
     if "教你用好" in first_sentence:
@@ -2834,6 +3076,24 @@ def _fallback_cover_title_from_description(
     if not value or not _contains_chinese_text(value, 8):
         return ""
 
+    fragments = _description_title_fragments(value)
+    if (
+        fragments.get("largest_ai_privatization")
+        and fragments.get("amount")
+        and fragments.get("acquisition_target")
+    ):
+        candidate = (
+            f"AI私有化最大交易：{fragments['amount']}"
+            f"收购{fragments['acquisition_target']}"
+        )
+        if (
+            12 <= len(candidate) <= max_chars
+            and not _cover_title_repeats_form_title(candidate, form_title)
+            and not _cover_title_has_quality_issue(candidate)
+            and not _cover_title_has_engagement_issue(candidate)
+        ):
+            return candidate
+
     first_sentence = re.split(r"[。！？\n]", value, maxsplit=1)[0]
     if "教你用好" not in first_sentence:
         return ""
@@ -2890,7 +3150,6 @@ def generate_upload_metadata(
     _log = on_log or (lambda msg: print(msg, flush=True))
     try:
         from subtitle_title import (
-            build_subtitle_grounded_title,
             read_full_subtitle_text,
         )
     except Exception as e:
@@ -2980,9 +3239,8 @@ def generate_upload_metadata(
         except Exception as e:
             _log(f"⚠️ [MetaGen] Description generation failed: {e}")
 
-    # Prefer a title compressed from the whole-video description. The older
-    # subtitle-candidate path remains as a fallback when this grounded path
-    # cannot produce a valid short title.
+    # The whole-video description is the only title source. If this model call
+    # fails or is rejected, leave the field empty so upload preflight stops.
     if not meta.get("title") and meta.get("description") and sub_text and llm_client:
         try:
             summary_title = _generate_title_from_description(
@@ -3001,81 +3259,8 @@ def generate_upload_metadata(
         except Exception as e:
             _log(f"⚠️ [MetaGen] Bilibili title generation failed: {e}")
 
-    # 1. Bilibili form title (fuller editorial summary)
-    description_context = ""
-    if meta.get("description"):
-        description_context = str(meta["description"]).splitlines()[0].strip()[:120]
     if not meta.get("title"):
-        try:
-            platform_hint = (
-                "B站表单标题没有微信的16字限制，优先24-40字。"
-                "它必须像视频简介第一句的完整编辑版："
-                "保留主体、谓语和最具体的核心结果，并保留受益者、问题或明确立场，"
-                "禁止只剩过程、代词、泛化判断或「主体+动作+对象」压缩片段。"
-                "优先覆盖访谈主题、核心业务/做法和明确立场或结果。"
-                "英文名逐字符计数；不要为了覆盖第三个信息点超过 48 字符。"
-                "英文字母逐字符计数，例如 Palantir 为 8 字符。"
-                "候选 evidence 必须逐字复制字幕原文，禁止使用省略号；"
-                "不确定时选择包含标题关键词的完整原行，不要改写成概括句。"
-                "不得用「东西」「能力」等泛词替代字幕中的具体对象。"
-                "信息过多时优先删除「把/了/的/一个」等功能词和修饰语，"
-                "保留主体、具体对象、核心做法和结果。"
-                "不得用「它/他们」替代主体。"
-            )
-            if description_context:
-                platform_hint += f"视频简介第一句：{description_context}"
-            if source_title:
-                platform_hint += (
-                    "视频原标题只作题材和场景参考，不是唯一事实来源。"
-                    "若字幕反复聚焦另一个主体，优先反映字幕主线，"
-                    "并保留原标题中有用的场景或受益者。"
-                    f"视频原标题：{source_title}"
-                )
-            grounded = build_subtitle_grounded_title(
-                hardsub_path, llm_client=llm_client, model_name=model,
-                max_title_chars=bili_title_max_chars,
-                min_title_chars=min(
-                    BILI_UPLOAD_TITLE_TARGET_MIN_CHARS,
-                    bili_title_max_chars,
-                ),
-                platform_hint=platform_hint,
-                title_style="plain",
-                provider=provider,
-            )
-            fallback_title = normalize_bili_upload_title(
-                grounded.title,
-                max_chars=bili_title_max_chars,
-            )
-            if fallback_title:
-                meta["title"] = fallback_title
-                _log(f">>> [MetaGen] B站标题: {fallback_title}")
-            else:
-                _log("⚠️ [MetaGen] Fallback Bilibili title rejected by quality rules")
-        except Exception as e:
-            _log(f"⚠️ [MetaGen] Fallback Bilibili title generation failed: {e}")
-
-    if not meta.get("title"):
-        fallback_title = _fallback_bili_title_from_description(
-            meta.get("description"),
-            max_chars=bili_title_max_chars,
-        )
-        fallback_source = "本地"
-        if not fallback_title:
-            fallback_title = _fallback_bili_title_from_subtitle(
-                sub_text,
-                source_title=source_title,
-                max_chars=bili_title_max_chars,
-            )
-            fallback_source = "字幕"
-        if not fallback_title and not sub_text:
-            fallback_title = _fallback_bili_title_from_source_title(
-                source_title,
-                max_chars=bili_title_max_chars,
-            )
-            fallback_source = "原标题"
-        if fallback_title:
-            meta["title"] = fallback_title
-            _log(f">>> [MetaGen] B站标题 ({fallback_source}兜底): {fallback_title}")
+        _log("⚠️ [MetaGen] Bilibili title generation failed; no local fallback")
 
     # 2. WeChat form title, derived from the Bilibili title rather than
     # regenerating a separate theme under a tighter character budget.
@@ -3103,34 +3288,8 @@ def generate_upload_metadata(
         except Exception as e:
             _log(f"⚠️ [MetaGen] WeChat title generation failed: {e}")
 
-    if not meta.get("wechat_title") and meta.get("title"):
-        fallback_wechat_title = _fallback_wechat_title_from_subtitle(
-            sub_text,
-            max_chars=wechat_title_max_chars,
-            form_title=meta.get("title"),
-        )
-        fallback_source = "字幕钩子"
-        if not fallback_wechat_title:
-            fallback_wechat_title = _fallback_wechat_title_from_bili_title(
-                meta["title"],
-                max_chars=wechat_title_max_chars,
-            )
-            fallback_source = "本地"
-        if not fallback_wechat_title and meta.get("description"):
-            fallback_wechat_title = _fallback_wechat_title_from_description(
-                meta.get("description"),
-                max_chars=wechat_title_max_chars,
-            )
-            fallback_source = "简介"
-        if not fallback_wechat_title and source_title:
-            fallback_wechat_title = _fallback_wechat_title_from_source_title(
-                source_title,
-                max_chars=wechat_title_max_chars,
-            )
-            fallback_source = "原标题"
-        if fallback_wechat_title:
-            meta["wechat_title"] = fallback_wechat_title
-            _log(f">>> [MetaGen] 视频号标题 ({fallback_source}兜底): {fallback_wechat_title}")
+    if not meta.get("wechat_title"):
+        _log("⚠️ [MetaGen] WeChat title generation failed; no local fallback")
 
     # 3. Cover title (editorial headline style)
     if not meta.get("cover_title") and sub_text and llm_client:
@@ -3163,33 +3322,18 @@ def generate_upload_metadata(
             _log(f"⚠️ [MetaGen] Cover title generation failed: {e}")
 
     if not meta.get("cover_title"):
-        fallback_cover_title = _fallback_cover_title_from_subtitle(
-            sub_text,
-            form_title=meta.get("title"),
-            description=meta.get("description"),
-            source_title=source_title,
-            max_chars=48,
+        _log("⚠️ [MetaGen] Cover title generation failed; no local fallback")
+
+    final_invalid_fields = _invalidate_cached_upload_metadata(
+        meta,
+        source_title,
+        sub_text,
+    )
+    if final_invalid_fields:
+        _log(
+            "⚠️ [MetaGen] 元数据最终质量校验未通过，已停止复用："
+            + "、".join(final_invalid_fields)
         )
-        fallback_source = "字幕钩子"
-        if not fallback_cover_title and meta.get("description"):
-            fallback_cover_title = _fallback_cover_title_from_description(
-                meta.get("description"),
-                form_title=meta.get("title"),
-                max_chars=48,
-            )
-            fallback_source = "简介"
-        if not fallback_cover_title and not sub_text:
-            fallback_cover_title = _fallback_cover_title(meta)
-            fallback_source = "本地"
-        if not fallback_cover_title and not sub_text and source_title:
-            fallback_cover_title = _fallback_bili_title_from_source_title(
-                source_title,
-                max_chars=48,
-            )
-            fallback_source = "原标题"
-        if fallback_cover_title:
-            meta["cover_title"] = fallback_cover_title
-            _log(f">>> [MetaGen] 封面标题 ({fallback_source}兜底): {fallback_cover_title}")
 
     if not meta.get("title"):
         _persist_upload_metadata(workdir, meta)

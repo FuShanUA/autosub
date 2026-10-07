@@ -1,0 +1,702 @@
+Line 7: │ 26  │ The Reality of AX According to the CEO of Korea's F │  50:37   │   RUN    │ ██████████ │ ██████████ │ ██████████ │ ░░░░░░░░░░ │ ░░░░░░░░░░ │ ░░░░░░░░░░ │ ░░░░░░░░░░ │ ░░░░░░░░░░ │
+  Char 071: '│' -> fg_94
+  Char 072: ' ' -> normal
+  Char 073: ' ' -> fg_94_bold
+  Char 074: ' ' -> fg_94_bold
+  Char 075: 'R' -> fg_94_bold
+  Char 076: 'U' -> fg_94_bold
+  Char 077: 'N' -> fg_94_bold
+  Char 078: ' ' -> fg_94_bold
+  Char 079: ' ' -> fg_94_bold
+  Char 080: ' ' -> fg_94_bold
+  Char 081: ' ' -> normal
+  Char 082: '│' -> fg_94
+  Char 083: ' ' -> normal
+  Char 084: '█' -> fg_32
+  Char 085: '█' -> fg_32
+  Char 086: '█' -> fg_32
+  Char 087: '█' -> fg_32
+  Char 088: '█' -> fg_32
+  Char 089: '█' -> fg_32
+  Char 090: '█' -> fg_32
+  Char 091: '█' -> fg_32
+  Char 092: '█' -> fg_32
+  Char 093: '█' -> fg_32
+  Char 094: ' ' -> normal
+  Char 095: '│' -> fg_94
+  Char 096: ' ' -> normal
+  Char 097: '█' -> fg_32
+  Char 098: '█' -> fg_32
+  Char 099: '█' -> fg_32
+  Char 100: '█' -> fg_32
+  Char 101: '█' -> fg_32
+  Char 102: '█' -> fg_32
+  Char 103: '█' -> fg_32
+  Char 104: '█' -> fg_32
+  Char 105: '█' -> fg_32
+  Char 106: '█' -> fg_32
+  Char 107: ' ' -> normal
+  Char 108: '│' -> fg_94
+  Char 109: ' ' -> normal
+  Char 110: '█' -> fg_94
+  Char 111: '█' -> fg_94
+  Char 112: '█' -> fg_94
+  Char 113: '█' -> fg_94
+  Char 114: '█' -> fg_94
+  Char 115: '█' -> fg_94
+  Char 116: '█' -> fg_94
+  Char 117: '█' -> fg_94
+  Char 118: '█' -> fg_94
+  Char 119: '█' -> fg_94
+  Char 120: ' ' -> normal
+  Char 121: '│' -> fg_94
+  Char 122: ' ' -> normal
+  Char 123: '░' -> fg_90
+  Char 124: '░' -> fg_90
+  Char 125: '░' -> fg_90
+  Char 126: '░' -> fg_90
+  Char 127: '░' -> fg_90
+  Char 128: '░' -> fg_90
+  Char 129: '░' -> fg_90
+  Char 130: '░' -> fg_90
+  Char 131: '░' -> fg_90
+  Char 132: '░' -> fg_90
+  Char 133: ' ' -> normal
+  Char 134: '│' -> fg_94
+  Char 135: ' ' -> normal
+  Char 136: '░' -> fg_90
+  Char 137: '░' -> fg_90
+  Char 138: '░' -> fg_90
+  Char 139: '░' -> fg_90
+  Char 140: '░' -> fg_90
+  Char 141: '░' -> fg_90
+  Char 142: '░' -> fg_90
+  Char 143: '░' -> fg_90
+  Char 144: '░' -> fg_90
+  Char 145: '░' -> fg_90
+  Char 146: ' ' -> normal
+  Char 147: '│' -> fg_94
+  Char 148: ' ' -> normal
+  Char 149: '░' -> fg_90
+  Char 150: '░' -> fg_90
+  Char 151: '░' -> fg_90
+  Char 152: '░' -> fg_90
+  Char 153: '░' -> fg_90
+  Char 154: '░' -> fg_90
+  Char 155: '░' -> fg_90
+  Char 156: '░' -> fg_90
+  Char 157: '░' -> fg_90
+  Char 158: '░' -> fg_90
+  Char 159: ' ' -> normal
+  Char 160: '│' -> fg_94
+  Char 161: ' ' -> normal
+  Char 162: '░' -> fg_90
+  Char 163: '░' -> fg_90
+  Char 164: '░' -> fg_90
+  Char 165: '░' -> fg_90
+  Char 166: '░' -> fg_90
+  Char 167: '░' -> fg_90
+  Char 168: '░' -> fg_90
+  Char 169: '░' -> fg_90
+  Char 170: '░' -> fg_90
+  Char 171: '░' -> fg_90
+  Char 172: ' ' -> normal
+  Char 173: '│' -> fg_94
+  Char 174: ' ' -> normal
+  Char 175: '░' -> fg_90
+  Char 176: '░' -> fg_90
+  Char 177: '░' -> fg_90
+  Char 178: '░' -> fg_90
+  Char 179: '░' -> fg_90
+  Char 180: '░' -> fg_90
+  Char 181: '░' -> fg_90
+  Char 182: '░' -> fg_90
+  Char 183: '░' -> fg_90
+  Char 184: '░' -> fg_90
+  Char 185: ' ' -> normal
+  Char 186: '│' -> fg_94
+Line 13: │ 28  │ FDEs Are Sensors in the Field | Rahul Agarwal, FDE  │  33:54   │   WAIT   │ ██████████ │ ░░░░░░░░░░ │ ░░░░░░░░░░ │ ░░░░░░░░░░ │ ░░░░░░░░░░ │ ░░░░░░░░░░ │ ░░░░░░░░░░ │ ░░░░░░░░░░ │
+  Char 071: '│' -> fg_94
+  Char 072: ' ' -> normal
+  Char 073: ' ' -> fg_90
+  Char 074: ' ' -> fg_90
+  Char 075: 'W' -> fg_90
+  Char 076: 'A' -> fg_90
+  Char 077: 'I' -> fg_90
+  Char 078: 'T' -> fg_90
+  Char 079: ' ' -> fg_90
+  Char 080: ' ' -> fg_90
+  Char 081: ' ' -> normal
+  Char 082: '│' -> fg_94
+  Char 083: ' ' -> normal
+  Char 084: '█' -> fg_32
+  Char 085: '█' -> fg_32
+  Char 086: '█' -> fg_32
+  Char 087: '█' -> fg_32
+  Char 088: '█' -> fg_32
+  Char 089: '█' -> fg_32
+  Char 090: '█' -> fg_32
+  Char 091: '█' -> fg_32
+  Char 092: '█' -> fg_32
+  Char 093: '█' -> fg_32
+  Char 094: ' ' -> normal
+  Char 095: '│' -> fg_94
+  Char 096: ' ' -> normal
+  Char 097: '░' -> fg_94
+  Char 098: '░' -> fg_94
+  Char 099: '░' -> fg_94
+  Char 100: '░' -> fg_94
+  Char 101: '░' -> fg_94
+  Char 102: '░' -> fg_94
+  Char 103: '░' -> fg_94
+  Char 104: '░' -> fg_94
+  Char 105: '░' -> fg_94
+  Char 106: '░' -> fg_94
+  Char 107: ' ' -> normal
+  Char 108: '│' -> fg_94
+  Char 109: ' ' -> normal
+  Char 110: '░' -> fg_90
+  Char 111: '░' -> fg_90
+  Char 112: '░' -> fg_90
+  Char 113: '░' -> fg_90
+  Char 114: '░' -> fg_90
+  Char 115: '░' -> fg_90
+  Char 116: '░' -> fg_90
+  Char 117: '░' -> fg_90
+  Char 118: '░' -> fg_90
+  Char 119: '░' -> fg_90
+  Char 120: ' ' -> normal
+  Char 121: '│' -> fg_94
+  Char 122: ' ' -> normal
+  Char 123: '░' -> fg_90
+  Char 124: '░' -> fg_90
+  Char 125: '░' -> fg_90
+  Char 126: '░' -> fg_90
+  Char 127: '░' -> fg_90
+  Char 128: '░' -> fg_90
+  Char 129: '░' -> fg_90
+  Char 130: '░' -> fg_90
+  Char 131: '░' -> fg_90
+  Char 132: '░' -> fg_90
+  Char 133: ' ' -> normal
+  Char 134: '│' -> fg_94
+  Char 135: ' ' -> normal
+  Char 136: '░' -> fg_90
+  Char 137: '░' -> fg_90
+  Char 138: '░' -> fg_90
+  Char 139: '░' -> fg_90
+  Char 140: '░' -> fg_90
+  Char 141: '░' -> fg_90
+  Char 142: '░' -> fg_90
+  Char 143: '░' -> fg_90
+  Char 144: '░' -> fg_90
+  Char 145: '░' -> fg_90
+  Char 146: ' ' -> normal
+  Char 147: '│' -> fg_94
+  Char 148: ' ' -> normal
+  Char 149: '░' -> fg_90
+  Char 150: '░' -> fg_90
+  Char 151: '░' -> fg_90
+  Char 152: '░' -> fg_90
+  Char 153: '░' -> fg_90
+  Char 154: '░' -> fg_90
+  Char 155: '░' -> fg_90
+  Char 156: '░' -> fg_90
+  Char 157: '░' -> fg_90
+  Char 158: '░' -> fg_90
+  Char 159: ' ' -> normal
+  Char 160: '│' -> fg_94
+  Char 161: ' ' -> normal
+  Char 162: '░' -> fg_90
+  Char 163: '░' -> fg_90
+  Char 164: '░' -> fg_90
+  Char 165: '░' -> fg_90
+  Char 166: '░' -> fg_90
+  Char 167: '░' -> fg_90
+  Char 168: '░' -> fg_90
+  Char 169: '░' -> fg_90
+  Char 170: '░' -> fg_90
+  Char 171: '░' -> fg_90
+  Char 172: ' ' -> normal
+  Char 173: '│' -> fg_94
+  Char 174: ' ' -> normal
+  Char 175: '░' -> fg_90
+  Char 176: '░' -> fg_90
+  Char 177: '░' -> fg_90
+  Char 178: '░' -> fg_90
+  Char 179: '░' -> fg_90
+  Char 180: '░' -> fg_90
+  Char 181: '░' -> fg_90
+  Char 182: '░' -> fg_90
+  Char 183: '░' -> fg_90
+  Char 184: '░' -> fg_90
+  Char 185: ' ' -> normal
+  Char 186: '│' -> fg_94
+Line 16: │ 29  │ Enterprises Are Demanding FDEs | Srikrishnan Ganesa │  24:21   │   WAIT   │ ██████████ │ ░░░░░░░░░░ │ ░░░░░░░░░░ │ ░░░░░░░░░░ │ ░░░░░░░░░░ │ ░░░░░░░░░░ │ ░░░░░░░░░░ │ ░░░░░░░░░░ │
+  Char 071: '│' -> fg_94
+  Char 072: ' ' -> normal
+  Char 073: ' ' -> fg_90
+  Char 074: ' ' -> fg_90
+  Char 075: 'W' -> fg_90
+  Char 076: 'A' -> fg_90
+  Char 077: 'I' -> fg_90
+  Char 078: 'T' -> fg_90
+  Char 079: ' ' -> fg_90
+  Char 080: ' ' -> fg_90
+  Char 081: ' ' -> normal
+  Char 082: '│' -> fg_94
+  Char 083: ' ' -> normal
+  Char 084: '█' -> fg_32
+  Char 085: '█' -> fg_32
+  Char 086: '█' -> fg_32
+  Char 087: '█' -> fg_32
+  Char 088: '█' -> fg_32
+  Char 089: '█' -> fg_32
+  Char 090: '█' -> fg_32
+  Char 091: '█' -> fg_32
+  Char 092: '█' -> fg_32
+  Char 093: '█' -> fg_32
+  Char 094: ' ' -> normal
+  Char 095: '│' -> fg_94
+  Char 096: ' ' -> normal
+  Char 097: '░' -> fg_94
+  Char 098: '░' -> fg_94
+  Char 099: '░' -> fg_94
+  Char 100: '░' -> fg_94
+  Char 101: '░' -> fg_94
+  Char 102: '░' -> fg_94
+  Char 103: '░' -> fg_94
+  Char 104: '░' -> fg_94
+  Char 105: '░' -> fg_94
+  Char 106: '░' -> fg_94
+  Char 107: ' ' -> normal
+  Char 108: '│' -> fg_94
+  Char 109: ' ' -> normal
+  Char 110: '░' -> fg_90
+  Char 111: '░' -> fg_90
+  Char 112: '░' -> fg_90
+  Char 113: '░' -> fg_90
+  Char 114: '░' -> fg_90
+  Char 115: '░' -> fg_90
+  Char 116: '░' -> fg_90
+  Char 117: '░' -> fg_90
+  Char 118: '░' -> fg_90
+  Char 119: '░' -> fg_90
+  Char 120: ' ' -> normal
+  Char 121: '│' -> fg_94
+  Char 122: ' ' -> normal
+  Char 123: '░' -> fg_90
+  Char 124: '░' -> fg_90
+  Char 125: '░' -> fg_90
+  Char 126: '░' -> fg_90
+  Char 127: '░' -> fg_90
+  Char 128: '░' -> fg_90
+  Char 129: '░' -> fg_90
+  Char 130: '░' -> fg_90
+  Char 131: '░' -> fg_90
+  Char 132: '░' -> fg_90
+  Char 133: ' ' -> normal
+  Char 134: '│' -> fg_94
+  Char 135: ' ' -> normal
+  Char 136: '░' -> fg_90
+  Char 137: '░' -> fg_90
+  Char 138: '░' -> fg_90
+  Char 139: '░' -> fg_90
+  Char 140: '░' -> fg_90
+  Char 141: '░' -> fg_90
+  Char 142: '░' -> fg_90
+  Char 143: '░' -> fg_90
+  Char 144: '░' -> fg_90
+  Char 145: '░' -> fg_90
+  Char 146: ' ' -> normal
+  Char 147: '│' -> fg_94
+  Char 148: ' ' -> normal
+  Char 149: '░' -> fg_90
+  Char 150: '░' -> fg_90
+  Char 151: '░' -> fg_90
+  Char 152: '░' -> fg_90
+  Char 153: '░' -> fg_90
+  Char 154: '░' -> fg_90
+  Char 155: '░' -> fg_90
+  Char 156: '░' -> fg_90
+  Char 157: '░' -> fg_90
+  Char 158: '░' -> fg_90
+  Char 159: ' ' -> normal
+  Char 160: '│' -> fg_94
+  Char 161: ' ' -> normal
+  Char 162: '░' -> fg_90
+  Char 163: '░' -> fg_90
+  Char 164: '░' -> fg_90
+  Char 165: '░' -> fg_90
+  Char 166: '░' -> fg_90
+  Char 167: '░' -> fg_90
+  Char 168: '░' -> fg_90
+  Char 169: '░' -> fg_90
+  Char 170: '░' -> fg_90
+  Char 171: '░' -> fg_90
+  Char 172: ' ' -> normal
+  Char 173: '│' -> fg_94
+  Char 174: ' ' -> normal
+  Char 175: '░' -> fg_90
+  Char 176: '░' -> fg_90
+  Char 177: '░' -> fg_90
+  Char 178: '░' -> fg_90
+  Char 179: '░' -> fg_90
+  Char 180: '░' -> fg_90
+  Char 181: '░' -> fg_90
+  Char 182: '░' -> fg_90
+  Char 183: '░' -> fg_90
+  Char 184: '░' -> fg_90
+  Char 185: ' ' -> normal
+  Char 186: '│' -> fg_94
+Line 19: │ 30  │ PCI, OTP, and Evals: What FDEs Actually Build for I │  41:42   │   WAIT   │ ██████████ │ ░░░░░░░░░░ │ ░░░░░░░░░░ │ ░░░░░░░░░░ │ ░░░░░░░░░░ │ ░░░░░░░░░░ │ ░░░░░░░░░░ │ ░░░░░░░░░░ │
+  Char 071: '│' -> fg_94
+  Char 072: ' ' -> normal
+  Char 073: ' ' -> fg_90
+  Char 074: ' ' -> fg_90
+  Char 075: 'W' -> fg_90
+  Char 076: 'A' -> fg_90
+  Char 077: 'I' -> fg_90
+  Char 078: 'T' -> fg_90
+  Char 079: ' ' -> fg_90
+  Char 080: ' ' -> fg_90
+  Char 081: ' ' -> normal
+  Char 082: '│' -> fg_94
+  Char 083: ' ' -> normal
+  Char 084: '█' -> fg_32
+  Char 085: '█' -> fg_32
+  Char 086: '█' -> fg_32
+  Char 087: '█' -> fg_32
+  Char 088: '█' -> fg_32
+  Char 089: '█' -> fg_32
+  Char 090: '█' -> fg_32
+  Char 091: '█' -> fg_32
+  Char 092: '█' -> fg_32
+  Char 093: '█' -> fg_32
+  Char 094: ' ' -> normal
+  Char 095: '│' -> fg_94
+  Char 096: ' ' -> normal
+  Char 097: '░' -> fg_94
+  Char 098: '░' -> fg_94
+  Char 099: '░' -> fg_94
+  Char 100: '░' -> fg_94
+  Char 101: '░' -> fg_94
+  Char 102: '░' -> fg_94
+  Char 103: '░' -> fg_94
+  Char 104: '░' -> fg_94
+  Char 105: '░' -> fg_94
+  Char 106: '░' -> fg_94
+  Char 107: ' ' -> normal
+  Char 108: '│' -> fg_94
+  Char 109: ' ' -> normal
+  Char 110: '░' -> fg_90
+  Char 111: '░' -> fg_90
+  Char 112: '░' -> fg_90
+  Char 113: '░' -> fg_90
+  Char 114: '░' -> fg_90
+  Char 115: '░' -> fg_90
+  Char 116: '░' -> fg_90
+  Char 117: '░' -> fg_90
+  Char 118: '░' -> fg_90
+  Char 119: '░' -> fg_90
+  Char 120: ' ' -> normal
+  Char 121: '│' -> fg_94
+  Char 122: ' ' -> normal
+  Char 123: '░' -> fg_90
+  Char 124: '░' -> fg_90
+  Char 125: '░' -> fg_90
+  Char 126: '░' -> fg_90
+  Char 127: '░' -> fg_90
+  Char 128: '░' -> fg_90
+  Char 129: '░' -> fg_90
+  Char 130: '░' -> fg_90
+  Char 131: '░' -> fg_90
+  Char 132: '░' -> fg_90
+  Char 133: ' ' -> normal
+  Char 134: '│' -> fg_94
+  Char 135: ' ' -> normal
+  Char 136: '░' -> fg_90
+  Char 137: '░' -> fg_90
+  Char 138: '░' -> fg_90
+  Char 139: '░' -> fg_90
+  Char 140: '░' -> fg_90
+  Char 141: '░' -> fg_90
+  Char 142: '░' -> fg_90
+  Char 143: '░' -> fg_90
+  Char 144: '░' -> fg_90
+  Char 145: '░' -> fg_90
+  Char 146: ' ' -> normal
+  Char 147: '│' -> fg_94
+  Char 148: ' ' -> normal
+  Char 149: '░' -> fg_90
+  Char 150: '░' -> fg_90
+  Char 151: '░' -> fg_90
+  Char 152: '░' -> fg_90
+  Char 153: '░' -> fg_90
+  Char 154: '░' -> fg_90
+  Char 155: '░' -> fg_90
+  Char 156: '░' -> fg_90
+  Char 157: '░' -> fg_90
+  Char 158: '░' -> fg_90
+  Char 159: ' ' -> normal
+  Char 160: '│' -> fg_94
+  Char 161: ' ' -> normal
+  Char 162: '░' -> fg_90
+  Char 163: '░' -> fg_90
+  Char 164: '░' -> fg_90
+  Char 165: '░' -> fg_90
+  Char 166: '░' -> fg_90
+  Char 167: '░' -> fg_90
+  Char 168: '░' -> fg_90
+  Char 169: '░' -> fg_90
+  Char 170: '░' -> fg_90
+  Char 171: '░' -> fg_90
+  Char 172: ' ' -> normal
+  Char 173: '│' -> fg_94
+  Char 174: ' ' -> normal
+  Char 175: '░' -> fg_90
+  Char 176: '░' -> fg_90
+  Char 177: '░' -> fg_90
+  Char 178: '░' -> fg_90
+  Char 179: '░' -> fg_90
+  Char 180: '░' -> fg_90
+  Char 181: '░' -> fg_90
+  Char 182: '░' -> fg_90
+  Char 183: '░' -> fg_90
+  Char 184: '░' -> fg_90
+  Char 185: ' ' -> normal
+  Char 186: '│' -> fg_94
+Line 22: │ 31  │ Don't Buy the Espresso Machine: The FDE Case for En │  44:42   │   RUN    │ ██████████ │ ██████░░░░ │ ░░░░░░░░░░ │ ░░░░░░░░░░ │ ░░░░░░░░░░ │ ░░░░░░░░░░ │ ░░░░░░░░░░ │ ░░░░░░░░░░ │
+  Char 071: '│' -> fg_94
+  Char 072: ' ' -> normal
+  Char 073: ' ' -> fg_94_bold
+  Char 074: ' ' -> fg_94_bold
+  Char 075: 'R' -> fg_94_bold
+  Char 076: 'U' -> fg_94_bold
+  Char 077: 'N' -> fg_94_bold
+  Char 078: ' ' -> fg_94_bold
+  Char 079: ' ' -> fg_94_bold
+  Char 080: ' ' -> fg_94_bold
+  Char 081: ' ' -> normal
+  Char 082: '│' -> fg_94
+  Char 083: ' ' -> normal
+  Char 084: '█' -> fg_32
+  Char 085: '█' -> fg_32
+  Char 086: '█' -> fg_32
+  Char 087: '█' -> fg_32
+  Char 088: '█' -> fg_32
+  Char 089: '█' -> fg_32
+  Char 090: '█' -> fg_32
+  Char 091: '█' -> fg_32
+  Char 092: '█' -> fg_32
+  Char 093: '█' -> fg_32
+  Char 094: ' ' -> normal
+  Char 095: '│' -> fg_94
+  Char 096: ' ' -> normal
+  Char 097: '█' -> fg_94
+  Char 098: '█' -> fg_94
+  Char 099: '█' -> fg_94
+  Char 100: '█' -> fg_94
+  Char 101: '█' -> fg_94
+  Char 102: '█' -> fg_94
+  Char 103: '░' -> fg_94
+  Char 104: '░' -> fg_94
+  Char 105: '░' -> fg_94
+  Char 106: '░' -> fg_94
+  Char 107: ' ' -> normal
+  Char 108: '│' -> fg_94
+  Char 109: ' ' -> normal
+  Char 110: '░' -> fg_90
+  Char 111: '░' -> fg_90
+  Char 112: '░' -> fg_90
+  Char 113: '░' -> fg_90
+  Char 114: '░' -> fg_90
+  Char 115: '░' -> fg_90
+  Char 116: '░' -> fg_90
+  Char 117: '░' -> fg_90
+  Char 118: '░' -> fg_90
+  Char 119: '░' -> fg_90
+  Char 120: ' ' -> normal
+  Char 121: '│' -> fg_94
+  Char 122: ' ' -> normal
+  Char 123: '░' -> fg_90
+  Char 124: '░' -> fg_90
+  Char 125: '░' -> fg_90
+  Char 126: '░' -> fg_90
+  Char 127: '░' -> fg_90
+  Char 128: '░' -> fg_90
+  Char 129: '░' -> fg_90
+  Char 130: '░' -> fg_90
+  Char 131: '░' -> fg_90
+  Char 132: '░' -> fg_90
+  Char 133: ' ' -> normal
+  Char 134: '│' -> fg_94
+  Char 135: ' ' -> normal
+  Char 136: '░' -> fg_90
+  Char 137: '░' -> fg_90
+  Char 138: '░' -> fg_90
+  Char 139: '░' -> fg_90
+  Char 140: '░' -> fg_90
+  Char 141: '░' -> fg_90
+  Char 142: '░' -> fg_90
+  Char 143: '░' -> fg_90
+  Char 144: '░' -> fg_90
+  Char 145: '░' -> fg_90
+  Char 146: ' ' -> normal
+  Char 147: '│' -> fg_94
+  Char 148: ' ' -> normal
+  Char 149: '░' -> fg_90
+  Char 150: '░' -> fg_90
+  Char 151: '░' -> fg_90
+  Char 152: '░' -> fg_90
+  Char 153: '░' -> fg_90
+  Char 154: '░' -> fg_90
+  Char 155: '░' -> fg_90
+  Char 156: '░' -> fg_90
+  Char 157: '░' -> fg_90
+  Char 158: '░' -> fg_90
+  Char 159: ' ' -> normal
+  Char 160: '│' -> fg_94
+  Char 161: ' ' -> normal
+  Char 162: '░' -> fg_90
+  Char 163: '░' -> fg_90
+  Char 164: '░' -> fg_90
+  Char 165: '░' -> fg_90
+  Char 166: '░' -> fg_90
+  Char 167: '░' -> fg_90
+  Char 168: '░' -> fg_90
+  Char 169: '░' -> fg_90
+  Char 170: '░' -> fg_90
+  Char 171: '░' -> fg_90
+  Char 172: ' ' -> normal
+  Char 173: '│' -> fg_94
+  Char 174: ' ' -> normal
+  Char 175: '░' -> fg_90
+  Char 176: '░' -> fg_90
+  Char 177: '░' -> fg_90
+  Char 178: '░' -> fg_90
+  Char 179: '░' -> fg_90
+  Char 180: '░' -> fg_90
+  Char 181: '░' -> fg_90
+  Char 182: '░' -> fg_90
+  Char 183: '░' -> fg_90
+  Char 184: '░' -> fg_90
+  Char 185: ' ' -> normal
+  Char 186: '│' -> fg_94
+Line 25: │ 32  │ Beyond Happy Path: Test/Eval Is How FDEs Build Ente │  34:54   │   WAIT   │ ██████████ │ ░░░░░░░░░░ │ ░░░░░░░░░░ │ ░░░░░░░░░░ │ ░░░░░░░░░░ │ ░░░░░░░░░░ │ ░░░░░░░░░░ │ ░░░░░░░░░░ │
+  Char 071: '│' -> fg_94
+  Char 072: ' ' -> normal
+  Char 073: ' ' -> fg_90
+  Char 074: ' ' -> fg_90
+  Char 075: 'W' -> fg_90
+  Char 076: 'A' -> fg_90
+  Char 077: 'I' -> fg_90
+  Char 078: 'T' -> fg_90
+  Char 079: ' ' -> fg_90
+  Char 080: ' ' -> fg_90
+  Char 081: ' ' -> normal
+  Char 082: '│' -> fg_94
+  Char 083: ' ' -> normal
+  Char 084: '█' -> fg_32
+  Char 085: '█' -> fg_32
+  Char 086: '█' -> fg_32
+  Char 087: '█' -> fg_32
+  Char 088: '█' -> fg_32
+  Char 089: '█' -> fg_32
+  Char 090: '█' -> fg_32
+  Char 091: '█' -> fg_32
+  Char 092: '█' -> fg_32
+  Char 093: '█' -> fg_32
+  Char 094: ' ' -> normal
+  Char 095: '│' -> fg_94
+  Char 096: ' ' -> normal
+  Char 097: '░' -> fg_94
+  Char 098: '░' -> fg_94
+  Char 099: '░' -> fg_94
+  Char 100: '░' -> fg_94
+  Char 101: '░' -> fg_94
+  Char 102: '░' -> fg_94
+  Char 103: '░' -> fg_94
+  Char 104: '░' -> fg_94
+  Char 105: '░' -> fg_94
+  Char 106: '░' -> fg_94
+  Char 107: ' ' -> normal
+  Char 108: '│' -> fg_94
+  Char 109: ' ' -> normal
+  Char 110: '░' -> fg_90
+  Char 111: '░' -> fg_90
+  Char 112: '░' -> fg_90
+  Char 113: '░' -> fg_90
+  Char 114: '░' -> fg_90
+  Char 115: '░' -> fg_90
+  Char 116: '░' -> fg_90
+  Char 117: '░' -> fg_90
+  Char 118: '░' -> fg_90
+  Char 119: '░' -> fg_90
+  Char 120: ' ' -> normal
+  Char 121: '│' -> fg_94
+  Char 122: ' ' -> normal
+  Char 123: '░' -> fg_90
+  Char 124: '░' -> fg_90
+  Char 125: '░' -> fg_90
+  Char 126: '░' -> fg_90
+  Char 127: '░' -> fg_90
+  Char 128: '░' -> fg_90
+  Char 129: '░' -> fg_90
+  Char 130: '░' -> fg_90
+  Char 131: '░' -> fg_90
+  Char 132: '░' -> fg_90
+  Char 133: ' ' -> normal
+  Char 134: '│' -> fg_94
+  Char 135: ' ' -> normal
+  Char 136: '░' -> fg_90
+  Char 137: '░' -> fg_90
+  Char 138: '░' -> fg_90
+  Char 139: '░' -> fg_90
+  Char 140: '░' -> fg_90
+  Char 141: '░' -> fg_90
+  Char 142: '░' -> fg_90
+  Char 143: '░' -> fg_90
+  Char 144: '░' -> fg_90
+  Char 145: '░' -> fg_90
+  Char 146: ' ' -> normal
+  Char 147: '│' -> fg_94
+  Char 148: ' ' -> normal
+  Char 149: '░' -> fg_90
+  Char 150: '░' -> fg_90
+  Char 151: '░' -> fg_90
+  Char 152: '░' -> fg_90
+  Char 153: '░' -> fg_90
+  Char 154: '░' -> fg_90
+  Char 155: '░' -> fg_90
+  Char 156: '░' -> fg_90
+  Char 157: '░' -> fg_90
+  Char 158: '░' -> fg_90
+  Char 159: ' ' -> normal
+  Char 160: '│' -> fg_94
+  Char 161: ' ' -> normal
+  Char 162: '░' -> fg_90
+  Char 163: '░' -> fg_90
+  Char 164: '░' -> fg_90
+  Char 165: '░' -> fg_90
+  Char 166: '░' -> fg_90
+  Char 167: '░' -> fg_90
+  Char 168: '░' -> fg_90
+  Char 169: '░' -> fg_90
+  Char 170: '░' -> fg_90
+  Char 171: '░' -> fg_90
+  Char 172: ' ' -> normal
+  Char 173: '│' -> fg_94
+  Char 174: ' ' -> normal
+  Char 175: '░' -> fg_90
+  Char 176: '░' -> fg_90
+  Char 177: '░' -> fg_90
+  Char 178: '░' -> fg_90
+  Char 179: '░' -> fg_90
+  Char 180: '░' -> fg_90
+  Char 181: '░' -> fg_90
+  Char 182: '░' -> fg_90
+  Char 183: '░' -> fg_90
+  Char 184: '░' -> fg_90
+  Char 185: ' ' -> normal
+  Char 186: '│' -> fg_94

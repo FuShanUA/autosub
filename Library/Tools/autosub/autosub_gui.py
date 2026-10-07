@@ -877,6 +877,43 @@ class AutoSubGUI:
                 if not ad_removal_ok:
                     bili_pending = False
                     wechat_pending = False
+                login_failures = []
+                if bili_pending:
+                    from autosub import (
+                        check_bili_login,
+                        get_bili_login_command,
+                        get_bili_login_skip_reason,
+                    )
+                    login_reason = get_bili_login_skip_reason()
+                    if login_reason:
+                        _persist(f"📱 [Bilibili] 上传跳过：{login_reason}")
+                        _persist(f"📱 [Bilibili] 请先执行: {get_bili_login_command()}")
+                        bili_pending = False
+                        login_failures.append("📱 [Bilibili]")
+                    else:
+                        login_ok, login_detail = check_bili_login()
+                        if login_ok:
+                            _persist("📱 [Bilibili] 登录态有效")
+                        elif login_ok is False:
+                            _persist(f"📱 [Bilibili] 上传跳过：{login_detail}")
+                            _persist(f"📱 [Bilibili] 请先执行: {get_bili_login_command()}")
+                            bili_pending = False
+                            login_failures.append("📱 [Bilibili]")
+                        elif login_detail:
+                            _persist(f"⚠️ {login_detail}")
+                if wechat_pending:
+                    from autosub import (
+                        get_wechat_login_command,
+                        get_wechat_login_skip_reason,
+                    )
+                    login_reason = get_wechat_login_skip_reason()
+                    if login_reason:
+                        _persist(f"💬 [WeChat] 上传跳过：{login_reason}")
+                        _persist(f"💬 [WeChat] 请先执行: {get_wechat_login_command()}")
+                        wechat_pending = False
+                        login_failures.append("💬 [WeChat]")
+                    else:
+                        _persist("💬 [WeChat] 已找到持久化浏览器配置，登录态将在上传时验证")
                 shared_metadata = None
                 if sync_dir and (bili_pending or wechat_pending):
                     from autosub import prepare_shared_upload_metadata
@@ -981,21 +1018,35 @@ class AutoSubGUI:
                             else:
                                 _persist("⚠️ 未找到生成的 hardsub 视频文件，跳过微信视频号上传。")
                 # Launch all upload jobs concurrently, wait for all to finish
+                upload_results = {}
                 if upload_jobs:
                     self.root.after(0, lambda: self.status_label.config(text="📤 正在上传..."))
                     def run_upload(label, ucmd, marker):
                         _persist(f"{label} 开始上传...")
                         proc = None
+                        upload_ok = False
+                        output_lines = []
                         try:
                             proc = subprocess.Popen(ucmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', bufsize=1)
                             self._register_process(proc)
                             if proc.stdout:
                                 for line in proc.stdout:
+                                    output_lines.append(line.strip())
+                                    if len(output_lines) > 300:
+                                        output_lines.pop(0)
                                     _persist(f"{label} {line.strip()}")
                             proc.wait()
-                            mark = "✅" if proc.returncode == 0 else "⚠️"
+                            upload_ok = proc.returncode == 0
+                            mark = "✅" if upload_ok else "⚠️"
                             _persist(f"{label} {mark} 上传结束 (code={proc.returncode})")
-                            if proc.returncode == 0 and marker and sync_dir:
+                            if not upload_ok:
+                                from autosub import get_upload_login_failure_hint
+                                login_hint = get_upload_login_failure_hint(
+                                    label, "\n".join(output_lines)
+                                )
+                                if login_hint:
+                                    _persist(login_hint)
+                            if upload_ok and marker and sync_dir:
                                 try:
                                     with open(os.path.join(sync_dir, marker), "w", encoding="utf-8") as marker_file:
                                         marker_file.write("1")
@@ -1006,6 +1057,8 @@ class AutoSubGUI:
                         finally:
                             if proc is not None:
                                 self._unregister_process(proc)
+                        upload_results[label] = upload_ok
+                        return upload_ok
                     upload_threads = []
                     for label, ucmd, marker in upload_jobs:
                         t = threading.Thread(target=run_upload, args=(label, ucmd, marker), daemon=True)
@@ -1015,8 +1068,15 @@ class AutoSubGUI:
                         t.join()
                 else:
                     _persist("⚠️ 没有可执行的上传任务。")
-                _persist("✅ 全部完成！")
-                self.root.after(0, lambda: self.status_label.config(text="✅ 完成！"))
+                failed_uploads = login_failures + [
+                    label for label, upload_ok in upload_results.items() if not upload_ok
+                ]
+                if failed_uploads:
+                    _persist("⚠️ 上传未全部完成: " + ", ".join(failed_uploads))
+                    self.root.after(0, lambda: self.status_label.config(text="⚠️ 部分上传失败"))
+                else:
+                    _persist("✅ 全部完成！")
+                    self.root.after(0, lambda: self.status_label.config(text="✅ 完成！"))
         except Exception as e:
             _persist(f"错误: {str(e)}")
             self.root.after(0, self.log, f"错误: {str(e)}")
