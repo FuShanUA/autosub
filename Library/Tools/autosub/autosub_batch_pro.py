@@ -248,7 +248,8 @@ from autosub import (  # noqa: E402
     get_upload_login_failure_hint,
     run_bili_cmd,
     run_wechat_cmd,
-    generate_upload_metadata,
+    prepare_bili_upload_metadata,
+    prepare_wechat_upload_metadata,
     UPLOAD_STALL_TIMEOUT,
     UPLOAD_SILENCE_TIMEOUT,
 )
@@ -2014,10 +2015,10 @@ class BatchEngine:
                                 break
                     else:
                         # === OVERLAPPING UPLOAD PIPELINE ===
-                        # GD sync starts immediately (it doesn't need MetaGen).
-                        # MetaGen runs in a parallel thread; BI/WX uploads start
-                        # as soon as MetaGen finishes. This eliminates the
-                        # scenario where slow LLM calls delay GD sync by 20+ min.
+                        # GD sync starts immediately. Bilibili metadata is
+                        # prepared next; once it is complete, BI starts before
+                        # WeChat's shorter title is derived. A WeChat metadata
+                        # failure therefore cannot block a publishable BI task.
                         sync_cmd = [str(x) for x in [PYTHON_EXE, SYNC_SCRIPT, "--local-dir", workdir, "--remote-id", self.gdsync_id, "--wrap-folder", "--headless"] if x is not None] if need_gd else None
 
                         initial_upload_stages = []
@@ -2031,11 +2032,13 @@ class BatchEngine:
                                 task.status = f"运行中 ({upload_status_label})"
                                 self.save_state()
 
-                        # Phase 1: kick off GD sync + MetaGen concurrently
+                        # Phase 1: kick off GD sync + Bilibili metadata concurrently
                         gd_result = [False]
                         bi_result = [False, None]
                         wx_result = [False, None]
-                        meta_box = [None]
+                        bili_metadata = None
+                        wechat_metadata = None
+                        upload_threads = []
 
                         gd_thread = None
                         if need_gd and sync_cmd:
@@ -2053,27 +2056,6 @@ class BatchEngine:
                             gd_thread = threading.Thread(target=_run_gd, daemon=True)
                             gd_thread.start()
 
-                        meta_thread = None
-                        if need_bi or need_wx:
-                            def _run_meta():
-                                meta_box[0] = generate_upload_metadata(
-                                    workdir,
-                                    on_log=lambda msg: logger.info(f"Task {task.uid} | MetaGen | {msg}"),
-                                    llm_model=upload_llm_model,
-                                    llm_provider=upload_llm_provider,
-                                )
-                            meta_thread = threading.Thread(target=_run_meta, daemon=True)
-                            meta_thread.start()
-
-                        # Phase 2: wait for MetaGen, then build and launch BI/WX
-                        if meta_thread:
-                            meta_thread.join()
-                        meta = meta_box[0]
-                        required_meta_fields = ("title", "description", "cover_title")
-                        meta_is_complete = bool(meta) and all(
-                            str(meta.get(field) or "").strip()
-                            for field in required_meta_fields
-                        )
                         metadata_failed = False
                         upload_failure_reasons = list(preflight_upload_failure_reasons)
                         permanent_upload_failure = bool(preflight_upload_failure_reasons)
@@ -2081,44 +2063,89 @@ class BatchEngine:
                             upload_failure_reasons.append(
                                 f"视频号上传未启动：{wx_skip_reason}"
                             )
-                        if need_wx and meta and not str(meta.get("wechat_title") or "").strip():
-                            meta_is_complete = False
-                        if (need_bi or need_wx) and not meta_is_complete:
-                            logger.error(
-                                f"Task {task.uid} | MetaGen | shared metadata incomplete; "
-                                "BI/WX uploads stopped"
-                            )
-                            metadata_failed = True
-                            upload_failure_reasons.append("上传元数据不完整，BI/WX上传未启动")
-                            need_bi = False
-                            need_wx = False
 
                         bili_cmd = None
-                        wechat_cmd = None
                         if need_bi:
-                            bili_cmd = build_bili_cmd(workdir, title=meta.get("title") if meta else None,
-                                desc=meta.get("description") if meta else None,
-                                cover_title=meta.get("cover_title") if meta else None,
+                            bili_metadata = prepare_bili_upload_metadata(
+                                workdir,
                                 llm_model=upload_llm_model,
                                 llm_provider=upload_llm_provider,
-                                require_complete_metadata=True)
+                                on_log=lambda msg: logger.info(
+                                    f"Task {task.uid} | MetaGen | {msg}"
+                                ),
+                            )
+                        if need_bi and bili_metadata:
+                            bili_cmd = build_bili_cmd(
+                                workdir,
+                                title=bili_metadata.get("title"),
+                                desc=bili_metadata.get("desc"),
+                                cover_title=bili_metadata.get("cover_title"),
+                                llm_model=upload_llm_model,
+                                llm_provider=upload_llm_provider,
+                                require_complete_metadata=True,
+                            )
                             if not bili_cmd:
                                 logger.error(
                                     f"Task {task.uid} | BI | upload stopped: "
                                     "complete pre-generated metadata is required"
                                 )
-                                upload_failure_reasons.append("B站上传命令构建失败，未开始上传")
+                                upload_failure_reasons.append(
+                                    "B站上传命令构建失败，未开始上传"
+                                )
                                 need_bi = False
+                        elif need_bi:
+                            logger.error(
+                                f"Task {task.uid} | MetaGen | Bilibili metadata "
+                                "incomplete; BI upload stopped"
+                            )
+                            metadata_failed = True
+                            upload_failure_reasons.append(
+                                "B站元数据生成失败或不完整，BI上传未启动"
+                            )
+                            need_bi = False
+
+                        # Start BI before deriving WeChat's 16-character title.
+                        if need_bi and bili_cmd:
+                            bili_thread = threading.Thread(
+                                target=self._run_bili_upload,
+                                args=(task, bili_cmd, bi_result),
+                                daemon=True,
+                            )
+                            upload_threads.append(bili_thread)
+                            bili_thread.start()
+
+                        wechat_cmd = None
                         if need_wx:
+                            wechat_metadata = prepare_wechat_upload_metadata(
+                                workdir,
+                                llm_model=upload_llm_model,
+                                llm_provider=upload_llm_provider,
+                                on_log=lambda msg: logger.info(
+                                    f"Task {task.uid} | MetaGen | {msg}"
+                                ),
+                            )
                             wx_skip_reason = get_wechat_upload_skip_reason(workdir)
-                            wechat_cmd = build_wechat_cmd(workdir,
-                                title=meta.get("wechat_title") if meta else None,
-                                desc=meta.get("description") if meta else None,
-                                cover_title=meta.get("cover_title") if meta else None,
+                        if need_wx and not wechat_metadata:
+                            logger.error(
+                                f"Task {task.uid} | MetaGen | WeChat metadata "
+                                "incomplete; WX upload stopped"
+                            )
+                            metadata_failed = True
+                            upload_failure_reasons.append(
+                                "视频号元数据生成失败或不完整，WX上传未启动"
+                            )
+                            need_wx = False
+                        elif need_wx:
+                            wechat_cmd = build_wechat_cmd(
+                                workdir,
+                                title=wechat_metadata.get("wechat_title"),
+                                desc=wechat_metadata.get("desc"),
+                                cover_title=wechat_metadata.get("cover_title"),
                                 public=self.wechat_public,
                                 llm_model=upload_llm_model,
                                 llm_provider=upload_llm_provider,
-                                require_complete_metadata=True)
+                                require_complete_metadata=True,
+                            )
                             if not wechat_cmd:
                                 logger.error(
                                     f"Task {task.uid} | WX | upload stopped: "
@@ -2131,12 +2158,14 @@ class BatchEngine:
                                     upload_failure_reasons.append("视频号上传命令构建失败，未开始上传")
                                 need_wx = False
 
-                        # Start BI/WX uploads (GD sync may already be running)
-                        upload_threads = []
-                        if need_bi and bili_cmd:
-                            upload_threads.append(threading.Thread(target=self._run_bili_upload, args=(task, bili_cmd, bi_result), daemon=True))
                         if need_wx and wechat_cmd:
-                            upload_threads.append(threading.Thread(target=self._run_wechat_upload, args=(task, wechat_cmd, wx_result), daemon=True))
+                            wechat_thread = threading.Thread(
+                                target=self._run_wechat_upload,
+                                args=(task, wechat_cmd, wx_result),
+                                daemon=True,
+                            )
+                            upload_threads.append(wechat_thread)
+                            wechat_thread.start()
 
                         active_stages = []
                         if gd_thread and gd_thread.is_alive():
@@ -2150,7 +2179,6 @@ class BatchEngine:
                                 task.status = f"运行中 ({'/'.join(active_stages)})"
                                 self.save_state()
 
-                        for t in upload_threads: t.start()
                         # Wait for GD sync (may already be done)
                         if gd_thread:
                             gd_thread.join()
@@ -2316,25 +2344,6 @@ class BatchEngine:
             return "失败 (GD)"
         return "失败 (上传)"
 
-    def _resolve_upload_metadata(self, workdir, llm_model=None, llm_provider=None):
-        """Return complete pre-generated upload metadata for workdir, else None.
-
-        generate_upload_metadata() reuses upload_metadata.json and only calls the
-        LLM for fields that are missing or stale, so this stays cheap on retries.
-        """
-        meta = generate_upload_metadata(
-            workdir,
-            on_log=lambda msg: logger.info(f"MetaGen | {msg}"),
-            llm_model=llm_model,
-            llm_provider=llm_provider,
-        )
-        if not meta:
-            return None
-        for field in ("title", "description", "cover_title"):
-            if not str(meta.get(field) or "").strip():
-                return None
-        return meta
-
     def _build_bili_cmd(self, workdir, llm_model=None, llm_provider=None):
         """Build Bilibili upload command via the canonical autosub.build_bili_cmd.
 
@@ -2343,11 +2352,18 @@ class BatchEngine:
         bili_upload.py falls back to its own LLM title and a retry publishes
         different metadata than the first attempt.
         """
-        meta = self._resolve_upload_metadata(workdir, llm_model, llm_provider)
+        meta = prepare_bili_upload_metadata(
+            workdir,
+            llm_model=llm_model,
+            llm_provider=llm_provider,
+            on_log=lambda msg: logger.info(f"MetaGen | {msg}"),
+        )
+        if not meta:
+            return None
         cmd = build_bili_cmd(
             workdir,
             title=meta.get("title") if meta else None,
-            desc=meta.get("description") if meta else None,
+            desc=meta.get("desc") if meta else None,
             cover_title=meta.get("cover_title") if meta else None,
             llm_model=llm_model,
             llm_provider=llm_provider,
@@ -2366,13 +2382,18 @@ class BatchEngine:
         Mirrors the overlapping pipeline: the form title comes from wechat_title
         and the command is refused when pre-generated metadata is incomplete.
         """
-        meta = self._resolve_upload_metadata(workdir, llm_model, llm_provider)
-        if meta and not str(meta.get("wechat_title") or "").strip():
-            meta = None
+        meta = prepare_wechat_upload_metadata(
+            workdir,
+            llm_model=llm_model,
+            llm_provider=llm_provider,
+            on_log=lambda msg: logger.info(f"MetaGen | {msg}"),
+        )
+        if not meta:
+            return None
         cmd = build_wechat_cmd(
             workdir,
             title=meta.get("wechat_title") if meta else None,
-            desc=meta.get("description") if meta else None,
+            desc=meta.get("desc") if meta else None,
             cover_title=meta.get("cover_title") if meta else None,
             public=self.wechat_public,
             llm_model=llm_model,

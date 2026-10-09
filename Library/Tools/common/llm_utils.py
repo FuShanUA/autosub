@@ -8,6 +8,7 @@ import json
 import requests
 import base64
 import warnings
+from urllib.parse import urlparse
 from enum import Enum
 from typing import List, Dict, Optional, Union, Tuple
 
@@ -218,6 +219,50 @@ class LLMClient:
     # Same-provider model cascade for Dashscope (Bailian / 百炼).
     # When the primary model fails, try these in order before crossing to other providers.
     DASHSCOPE_FALLBACK_CHAIN = ["qwen3.7-max", "kimi-k2.6", "deepseek-v4-pro"]
+
+    @staticmethod
+    def _normalize_openai_base_url(base_url: str) -> str:
+        """Accept both /v1 and a full /chat/completions endpoint URL."""
+        value = str(base_url or "").strip()
+        if value.endswith("/chat/completions"):
+            value = value[: -len("/chat/completions")]
+        return value.rstrip("/")
+
+    @staticmethod
+    def _should_fallback_dashscope_gateway(exc: Exception) -> bool:
+        """Only switch gateways for quota, network, and server-side failures."""
+        message = str(exc).lower()
+        markers = (
+            "status 429",
+            "too many requests",
+            "status 401",
+            "status 403",
+            "status 500",
+            "status 502",
+            "status 503",
+            "status 504",
+            "timeout",
+            "timed out",
+            "connection",
+            "remotedisconnected",
+            "could not resolve host",
+            "name or service not known",
+            "ssl",
+            "proxy",
+        )
+        return any(marker in message for marker in markers)
+
+    def _get_dashscope_fallback_target(self, model_name: str):
+        base_url = self._normalize_openai_base_url(
+            os.environ.get("DASHSCOPE_FALLBACK_BASE_URL", "")
+        )
+        api_key = os.environ.get("DASHSCOPE_FALLBACK_API_KEY", "").strip()
+        if not base_url or not api_key:
+            return None
+        fallback_model = (
+            os.environ.get("DASHSCOPE_FALLBACK_MODEL", "").strip() or model_name
+        )
+        return base_url, api_key, fallback_model
 
     def __init__(self, api_key: Optional[str] = None, provider: Optional[LLMProvider] = None):
         self.api_keys = {
@@ -530,7 +575,9 @@ class LLMClient:
         # frequently hang on aliyuncs.com, producing uniform 90s read timeouts.
         # trust_env=False makes requests ignore HTTP(S)_PROXY/ALL_PROXY env vars
         # entirely, so even SOCKS proxies can't hijack domestic endpoints.
-        if "aliyuncs.com" in base_url:
+        _host = urlparse(base_url).hostname or ""
+        _force_direct = "aliyuncs.com" in _host or _host.endswith((".cn", ".com.cn"))
+        if _force_direct:
             _session = requests.Session()
             _session.trust_env = False
             _post = _session.post
@@ -701,7 +748,43 @@ class LLMClient:
         elif provider == LLMProvider.MOONSHOT:
             return self._call_openai_compatible(model_name, content, "https://api.moonshot.cn/v1", api_key, disable_thinking=disable_thinking)
         elif provider == LLMProvider.DASHSCOPE:
-            return self._call_openai_compatible(model_name, content, "https://dashscope.aliyuncs.com/compatible-mode/v1", api_key, disable_thinking=disable_thinking)
+            primary_base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+            try:
+                return self._call_openai_compatible(
+                    model_name,
+                    content,
+                    primary_base_url,
+                    api_key,
+                    disable_thinking=disable_thinking,
+                )
+            except Exception as primary_exc:
+                fallback_target = self._get_dashscope_fallback_target(model_name)
+                if fallback_target is None:
+                    raise
+                if not self._should_fallback_dashscope_gateway(primary_exc):
+                    raise
+
+                fallback_base_url, fallback_key, fallback_model = fallback_target
+                print(
+                    "🔄 DashScope gateway fallback: "
+                    f"{model_name} -> {fallback_model} via {fallback_base_url}"
+                )
+                try:
+                    result = self._call_openai_compatible(
+                        fallback_model,
+                        content,
+                        fallback_base_url,
+                        fallback_key,
+                        disable_thinking=disable_thinking,
+                    )
+                    if result:
+                        return result
+                    raise Exception("DashScope fallback gateway returned no content")
+                except Exception as fallback_exc:
+                    raise Exception(
+                        f"DashScope primary gateway failed: {primary_exc}; "
+                        f"fallback gateway failed: {fallback_exc}"
+                    ) from fallback_exc
         elif provider == LLMProvider.ZHIPU:
             return self._call_openai_compatible(model_name, content, "https://open.bigmodel.cn/api/paas/v4", api_key, disable_thinking=disable_thinking)
         elif provider == LLMProvider.DEEPSEEK:

@@ -8,6 +8,7 @@ import os
 import json
 import re
 import psutil
+from datetime import datetime
 
 class ProcessTree:
     """Manages cross-platform process suspension and termination."""
@@ -83,6 +84,203 @@ while True:
 BASE_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "Projects")
 # Video extensions that hardsub files can have (matches download_video in autosub.py)
 VIDEO_EXTS = ('.mp4', '.mkv', '.webm', '.mov', '.ts')
+
+
+def _read_history_source(workdir):
+    """Read the original URL/path recorded at the start of workflow.log."""
+    log_path = os.path.join(workdir, "workflow.log")
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as handle:
+            head = handle.read(8192)
+        match = re.search(r"^--- 任务启动: (.+?) ---$", head, re.MULTILINE)
+        return match.group(1).strip() if match else ""
+    except OSError:
+        return ""
+
+
+def _history_video_name(workdir):
+    """Pick the source video name, preferring the original over hardsub."""
+    original = ""
+    hardsub = ""
+    try:
+        names = os.listdir(workdir)
+    except OSError:
+        return ""
+    for name in names:
+        root, ext = os.path.splitext(name)
+        if ext.lower() not in VIDEO_EXTS:
+            continue
+        if "hardsub" in root.lower():
+            if not hardsub:
+                hardsub = root
+        elif not original:
+            original = root
+    return original or hardsub or os.path.basename(workdir)
+
+
+def _history_marker(workdir, marker):
+    return os.path.exists(os.path.join(workdir, marker))
+
+
+def _history_has_subtitle(workdir):
+    try:
+        names = os.listdir(workdir)
+    except OSError:
+        return False
+    return any(name.lower().endswith((".srt", ".ass")) for name in names)
+
+
+def _history_has_hardsub(workdir):
+    try:
+        names = os.listdir(workdir)
+    except OSError:
+        return False
+    return any(
+        "hardsub" in os.path.splitext(name)[0].lower()
+        and os.path.splitext(name)[1].lower() in VIDEO_EXTS
+        for name in names
+    )
+
+
+def _history_timestamp(workdir):
+    paths = [os.path.join(workdir, name) for name in ("workflow.log",)]
+    try:
+        names = os.listdir(workdir)
+    except OSError:
+        names = []
+    paths.extend(
+        os.path.join(workdir, name)
+        for name in names
+        if name in {
+            ".burn_complete", ".synced", ".bili_uploaded", ".wechat_uploaded"
+        } or os.path.splitext(name)[1].lower() in VIDEO_EXTS
+    )
+    latest = 0.0
+    for path in paths:
+        try:
+            latest = max(latest, os.path.getmtime(path))
+        except OSError:
+            continue
+    if not latest:
+        return ""
+    return datetime.fromtimestamp(latest).strftime("%Y-%m-%d %H:%M")
+
+
+def scan_task_history(base_dir, limit=300):
+    """Build a compact processing history from project folders."""
+    base_dir = os.path.abspath(str(base_dir or ""))
+    candidates = []
+    if _history_has_hardsub(base_dir):
+        candidates.append(base_dir)
+    try:
+        candidates.extend(
+            os.path.join(base_dir, name)
+            for name in os.listdir(base_dir)
+            if os.path.isdir(os.path.join(base_dir, name))
+        )
+    except OSError:
+        return []
+
+    records = []
+    for workdir in candidates:
+        if not os.path.exists(os.path.join(workdir, "workflow.log")):
+            if not _history_has_hardsub(workdir):
+                continue
+        completed = []
+        missing = []
+        if _history_has_subtitle(workdir):
+            completed.append("字幕")
+        else:
+            missing.append("字幕")
+        if _history_has_hardsub(workdir):
+            completed.append("压制")
+        else:
+            missing.append("压制")
+        for label, marker in (
+            ("GDrive", ".synced"),
+            ("B站", ".bili_uploaded"),
+            ("微信", ".wechat_uploaded"),
+        ):
+            if _history_marker(workdir, marker):
+                completed.append(label)
+            else:
+                missing.append(label)
+        if os.path.isdir(os.path.join(workdir, "noads")):
+            completed.append("去广告")
+
+        if not os.path.exists(os.path.join(workdir, "workflow.log")):
+            status = "有产物，无处理日志"
+        elif missing[:2] == ["字幕", "压制"]:
+            status = "未生成字幕和压制视频"
+        elif "字幕" in missing:
+            status = "字幕未完成"
+        elif "压制" in missing:
+            status = "字幕完成，压制未完成"
+        elif missing:
+            status = "本地完成，上传未完成"
+        else:
+            status = "全部完成"
+
+        records.append(
+            {
+                "workdir": os.path.abspath(workdir),
+                "name": _history_video_name(workdir),
+                "source": _read_history_source(workdir),
+                "updated_at": _history_timestamp(workdir),
+                "status": status,
+                "completed": completed,
+                "missing": missing,
+            }
+        )
+    records.sort(key=lambda item: item["updated_at"], reverse=True)
+    return records[:limit]
+
+
+def find_history_record_for_input(records, input_value):
+    """Match a saved input to its project record."""
+    value = str(input_value or "").strip()
+    if not value:
+        return None
+    if value.startswith(("http://", "https://")):
+        return next((item for item in records if item["source"] == value), None)
+
+    input_path = os.path.abspath(value)
+    for item in records:
+        source_path = os.path.abspath(item["source"]) if item["source"] else ""
+        workdir = item["workdir"]
+        if input_path == source_path or input_path == workdir:
+            return item
+        if input_path.startswith(workdir + os.sep):
+            return item
+    return None
+
+
+def is_project_complete(record, requirements):
+    """Check core outputs plus only the uploads enabled for this run."""
+    if not record:
+        return False
+    completed = set(record["completed"])
+    if not {"字幕", "压制"}.issubset(completed):
+        return False
+    return all(stage in completed for stage in requirements)
+
+
+def select_startup_input(records, saved_input, requirements):
+    """Keep a completed task out of the input box, but retain unfinished work."""
+    saved_input = str(saved_input or "").strip()
+    if saved_input:
+        record = find_history_record_for_input(records, saved_input)
+        if record and is_project_complete(record, requirements):
+            return ""
+        return saved_input
+
+    unfinished = next(
+        (item for item in records if not is_project_complete(item, requirements)),
+        None,
+    )
+    if unfinished:
+        return unfinished["source"] or unfinished["workdir"]
+    return ""
 
 class AutoSubGUI:
     input_var: tk.StringVar
@@ -160,8 +358,10 @@ class AutoSubGUI:
         self._process_lock = threading.Lock()
         self.last_was_progress = False
         self.is_paused = False
+        self.task_history = []
 
         self.setup_ui()
+        self.restore_pending_input()
 
         if sys.platform == "darwin":
             self.root.update_idletasks()
@@ -216,10 +416,12 @@ class AutoSubGUI:
         self.tab1 = ttk.Frame(self.notebook, padding=10)
         self.tab2 = ttk.Frame(self.notebook, padding=10)
         self.tab3 = ttk.Frame(self.notebook, padding=10)
+        self.tab4 = ttk.Frame(self.notebook, padding=10)
 
         self.notebook.add(self.tab1, text=" 任务配置 ")
         self.notebook.add(self.tab2, text=" 字幕样式 ")
         self.notebook.add(self.tab3, text=" 执行日志 ")
+        self.notebook.add(self.tab4, text=" 处理历史 ")
 
         # 1. Input Section (Parent: tab1)
         f1 = ttk.LabelFrame(self.tab1, text=" 输入源 ", padding=10)
@@ -375,6 +577,68 @@ class AutoSubGUI:
         self.log_text = tk.Text(log_frame, height=10, state="disabled", font=self.log_font, bg="#ffffff", padx=5, pady=5, yscrollcommand=lambda *a: self.log_scrollbar.set(*a))
         self.log_text.pack(side="left", fill="both", expand=True)
 
+        # 5.5 Task History (Parent: tab4)
+        history_frame = ttk.Frame(self.tab4)
+        history_frame.pack(fill="both", expand=True)
+        history_toolbar = ttk.Frame(history_frame)
+        history_toolbar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        ttk.Button(
+            history_toolbar,
+            text="刷新",
+            command=self.refresh_history,
+        ).pack(side="left", padx=(0, 5))
+        ttk.Button(
+            history_toolbar,
+            text="载入选中输入",
+            command=self.load_selected_history_input,
+        ).pack(side="left")
+
+        history_columns = ("time", "name", "source", "status", "completed", "missing")
+        self.history_tree = ttk.Treeview(
+            history_frame,
+            columns=history_columns,
+            show="headings",
+            selectmode="browse",
+        )
+        headings = (
+            ("time", "最近更新", 125),
+            ("name", "视频名称", 300),
+            ("source", "视频URL/输入", 330),
+            ("status", "处理结果", 165),
+            ("completed", "已完成输出/上传", 220),
+            ("missing", "未完成", 180),
+        )
+        for column, text, width in headings:
+            self.history_tree.heading(column, text=text)
+            self.history_tree.column(
+                column,
+                width=width,
+                minwidth=90,
+                stretch=True,
+                anchor="w",
+            )
+        history_scroll_y = ttk.Scrollbar(
+            history_frame,
+            orient="vertical",
+            command=self.history_tree.yview,
+        )
+        history_scroll_x = ttk.Scrollbar(
+            history_frame,
+            orient="horizontal",
+            command=self.history_tree.xview,
+        )
+        self.history_tree.configure(
+            yscrollcommand=history_scroll_y.set,
+            xscrollcommand=history_scroll_x.set,
+        )
+        self.history_tree.grid(row=1, column=0, sticky="nsew")
+        history_scroll_y.grid(row=1, column=1, sticky="ns")
+        history_scroll_x.grid(row=2, column=0, sticky="ew")
+        history_frame.rowconfigure(1, weight=1)
+        history_frame.columnconfigure(0, weight=1)
+        self.history_tree.bind("<Double-1>", lambda _event: self.load_selected_history_input())
+        self.refresh_history()
+
         # 6. Controls (Parent: root)
         f6 = ttk.Frame(self.root, padding=10)
         f6.pack(fill="x", side="bottom")
@@ -413,6 +677,102 @@ class AutoSubGUI:
         setattr(self, v2, var2)
         if val2: ttk.Combobox(p, textvariable=var2, values=val2, width=22).grid(row=r, column=3, sticky="w", padx=5)
         else: ttk.Entry(p, textvariable=var2, width=24).grid(row=r, column=3, sticky="w", padx=5)
+
+    def _history_requirements(self):
+        requirements = []
+        if self.gdrive_enabled_var.get():
+            requirements.append("GDrive")
+        if self.bili_enabled_var.get():
+            requirements.append("B站")
+        if self.wechat_enabled_var.get():
+            requirements.append("微信")
+        return requirements
+
+    def _persist_input_value(self, value):
+        """Persist only the input field, without showing a dialog."""
+        data = {}
+        if os.path.exists(SETTINGS_FILE):
+            try:
+                with open(SETTINGS_FILE, "r", encoding="utf-8") as handle:
+                    data = json.load(handle)
+            except Exception:
+                data = {}
+        data["input"] = value
+        try:
+            with open(SETTINGS_FILE, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, indent=4, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def restore_pending_input(self):
+        """Leave the input box empty when the saved task is fully complete."""
+        saved_input = self.input_var.get().strip()
+        startup_input = select_startup_input(
+            self.task_history,
+            saved_input,
+            self._history_requirements(),
+        )
+        if startup_input != self.input_var.get():
+            self.input_var.set(startup_input)
+        self._persist_input_value(startup_input)
+
+    def _update_input_after_run(self, input_video):
+        """Clear a finished task, or retain it for the next upload-only retry."""
+        current_input = self.input_var.get().strip()
+        if current_input and current_input != str(input_video):
+            return
+        record = find_history_record_for_input(self.task_history, input_video)
+        if record and is_project_complete(record, self._history_requirements()):
+            self.input_var.set("")
+            self._persist_input_value("")
+        else:
+            self._persist_input_value(str(input_video))
+
+    def refresh_history(self):
+        base_dirs = [BASE_OUTPUT_DIR]
+        custom_output = self.output_dir_var.get().strip()
+        if custom_output:
+            custom_output = os.path.abspath(custom_output)
+            if custom_output != BASE_OUTPUT_DIR:
+                base_dirs.append(custom_output)
+
+        records_by_workdir = {}
+        for base_dir in base_dirs:
+            for record in scan_task_history(base_dir):
+                records_by_workdir[record["workdir"]] = record
+        self.task_history = sorted(
+            records_by_workdir.values(),
+            key=lambda item: item["updated_at"],
+            reverse=True,
+        )
+
+        self.history_tree.delete(*self.history_tree.get_children())
+        for record in self.task_history:
+            self.history_tree.insert(
+                "",
+                "end",
+                values=(
+                    record["updated_at"],
+                    record["name"],
+                    record["source"] or record["workdir"],
+                    record["status"],
+                    "、".join(record["completed"]) or "无",
+                    "、".join(record["missing"]) or "无",
+                ),
+            )
+
+    def load_selected_history_input(self):
+        selection = self.history_tree.selection()
+        if not selection:
+            return
+        index = self.history_tree.index(selection[0])
+        if index >= len(self.task_history):
+            return
+        record = self.task_history[index]
+        value = record["source"] or record["workdir"]
+        self.input_var.set(value)
+        self._persist_input_value(value)
+        self.notebook.select(self.tab1)
 
     def browse_video(self): f = filedialog.askopenfilename(); self.input_var.set(f) if f else None
     def browse_cookies(self): f = filedialog.askopenfilename(); self.cookies_var.set(f) if f else None
@@ -703,6 +1063,7 @@ class AutoSubGUI:
         gdrive_folder = self.sync_gdrive_var.get().strip() if self.gdrive_enabled_var.get() else ""
 
         print(f"🚀 [GUI] Launching: {' '.join(cmd)}")
+        self._persist_input_value(v)
         threading.Thread(target=self.run_worker, args=(cmd, v, self.output_dir_var.get(), gdrive_folder, py_exe), daemon=True).start()
 
     def start_upload_only(self):
@@ -737,6 +1098,7 @@ class AutoSubGUI:
         gdrive_folder = self.sync_gdrive_var.get().strip() if self.gdrive_enabled_var.get() else ""
 
         print(f"📤 [GUI] Upload-only: {' '.join(cmd)}")
+        self._persist_input_value(v)
         threading.Thread(target=self.run_worker, args=(cmd, v, self.output_dir_var.get(), gdrive_folder, py_exe), daemon=True).start()
 
     def run_worker(self, cmd, input_video, output_dir, gdrive_folder="", py_exe=None):
@@ -867,7 +1229,71 @@ class AutoSubGUI:
                     if not ad_removal_ok:
                         _persist("⚠️ 广告剪除失败，Bilibili/微信上传已停止；Google Drive 仍同步完整版。")
 
-                upload_jobs = []  # (label, cmd, marker) tuples launched concurrently
+                upload_results = {}
+                upload_threads = []
+
+                def run_upload(label, ucmd, marker):
+                    _persist(f"{label} 开始上传...")
+                    proc = None
+                    upload_ok = False
+                    output_lines = []
+                    try:
+                        proc = subprocess.Popen(
+                            ucmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            text=True,
+                            encoding="utf-8",
+                            errors="replace",
+                            bufsize=1,
+                        )
+                        self._register_process(proc)
+                        if proc.stdout:
+                            for line in proc.stdout:
+                                output_lines.append(line.strip())
+                                if len(output_lines) > 300:
+                                    output_lines.pop(0)
+                                _persist(f"{label} {line.strip()}")
+                        proc.wait()
+                        upload_ok = proc.returncode == 0
+                        mark = "✅" if upload_ok else "⚠️"
+                        _persist(f"{label} {mark} 上传结束 (code={proc.returncode})")
+                        if not upload_ok:
+                            from autosub import get_upload_login_failure_hint
+                            login_hint = get_upload_login_failure_hint(
+                                label,
+                                "\n".join(output_lines),
+                            )
+                            if login_hint:
+                                _persist(login_hint)
+                        if upload_ok and marker and sync_dir:
+                            try:
+                                marker_path = os.path.join(sync_dir, marker)
+                                with open(marker_path, "w", encoding="utf-8") as marker_file:
+                                    marker_file.write("1")
+                            except Exception as marker_error:
+                                _persist(f"{label} ⚠️ 写入上传标记失败: {marker_error}")
+                    except Exception as ue:
+                        _persist(f"{label} ❌ 异常: {ue}")
+                    finally:
+                        if proc is not None:
+                            self._unregister_process(proc)
+                    upload_results[label] = upload_ok
+                    return upload_ok
+
+                def start_upload_job(label, ucmd, marker):
+                    self.root.after(
+                        0,
+                        lambda: self.status_label.config(text="📤 正在上传..."),
+                    )
+                    thread = threading.Thread(
+                        target=run_upload,
+                        args=(label, ucmd, marker),
+                        daemon=True,
+                    )
+                    upload_threads.append(thread)
+                    thread.start()
+
                 bili_pending = self.bili_enabled_var.get() and not (
                     sync_dir and os.path.exists(os.path.join(sync_dir, ".bili_uploaded"))
                 )
@@ -878,6 +1304,7 @@ class AutoSubGUI:
                     bili_pending = False
                     wechat_pending = False
                 login_failures = []
+                metadata_failures = []
                 if bili_pending:
                     from autosub import (
                         check_bili_login,
@@ -914,20 +1341,20 @@ class AutoSubGUI:
                         login_failures.append("💬 [WeChat]")
                     else:
                         _persist("💬 [WeChat] 已找到持久化浏览器配置，登录态将在上传时验证")
-                shared_metadata = None
-                if sync_dir and (bili_pending or wechat_pending):
-                    from autosub import prepare_shared_upload_metadata
-                    shared_metadata = prepare_shared_upload_metadata(
+                bili_metadata = None
+                if sync_dir and bili_pending:
+                    from autosub import prepare_bili_upload_metadata
+                    bili_metadata = prepare_bili_upload_metadata(
                         sync_dir,
-                        explicit_cover_title=self.wechat_cover_title_var.get().strip() or None,
+                        explicit_cover_title=None,
                         llm_model=self.llm_model_var.get(),
                         llm_provider=self.vendor_map.get(self.vendor_var.get(), ""),
                         on_log=_persist,
                     )
-                    if not shared_metadata:
-                        _persist("⚠️ Bilibili/微信上传跳过：共享表单元数据生成失败或不完整。")
+                    if not bili_metadata:
+                        _persist("⚠️ Bilibili上传跳过：B站元数据生成失败或不完整。")
                         bili_pending = False
-                        wechat_pending = False
+                        metadata_failures.append("📱 [Bilibili]")
                 # 1) Google Drive sync (mirrors autosub.py trigger_sync headless branch)
                 if gdrive_folder and sync_dir:
                     if os.path.exists(os.path.join(sync_dir, ".synced")):
@@ -948,7 +1375,7 @@ class AutoSubGUI:
                                 "--exclude", "noads",
                                 "--headless",
                             ]
-                            upload_jobs.append(("☁️ [GDrive]", gdrive_cmd, ".synced"))
+                            start_upload_job("☁️ [GDrive]", gdrive_cmd, ".synced")
                         else:
                             _persist(f"⚠️ 找不到 GDrive 同步脚本或凭证，跳过 Drive 同步: {sync_script}")
                 # 2) Bilibili upload (cmd built by the canonical autosub.build_bili_cmd,
@@ -974,20 +1401,38 @@ class AutoSubGUI:
                             category_name=bili_category,
                             tags=self.bili_tags_var.get().strip() or None,
                             season=self.bili_season_var.get().strip() or None,
-                            title=shared_metadata["title"],
-                            desc=shared_metadata["desc"],
-                            cover_title=shared_metadata["cover_title"],
+                            title=bili_metadata["title"],
+                            desc=bili_metadata["desc"],
+                            cover_title=bili_metadata["cover_title"],
                             llm_model=self.llm_model_var.get(),
                             llm_provider=self.vendor_map.get(self.vendor_var.get(), ""),
                             require_complete_metadata=True,
                         )
                         if bili_cmd:
                             _persist(f"📱 找到上传视频: {os.path.basename(bili_cmd[2])}")
-                            upload_jobs.append(("📱 [Bilibili]", bili_cmd, ".bili_uploaded"))
+                            start_upload_job(
+                                "📱 [Bilibili]",
+                                bili_cmd,
+                                ".bili_uploaded",
+                            )
                         elif newest_video:
                             _persist("⚠️ Bilibili 上传跳过（未找到上传脚本或虚拟环境）。")
                         else:
                             _persist("⚠️ 未找到生成的 hardsub 视频文件，跳过 Bilibili 上传。")
+                wechat_metadata = None
+                if sync_dir and wechat_pending:
+                    from autosub import prepare_wechat_upload_metadata
+                    wechat_metadata = prepare_wechat_upload_metadata(
+                        sync_dir,
+                        explicit_cover_title=self.wechat_cover_title_var.get().strip() or None,
+                        llm_model=self.llm_model_var.get(),
+                        llm_provider=self.vendor_map.get(self.vendor_var.get(), ""),
+                        on_log=_persist,
+                    )
+                    if not wechat_metadata:
+                        _persist("⚠️ 微信视频号上传跳过：微信标题生成失败或不完整。")
+                        wechat_pending = False
+                        metadata_failures.append("💬 [WeChat]")
                 # 3) WeChat Channels upload (default: draft; public requires explicit checkbox)
                 if self.wechat_enabled_var.get():
                     if sync_dir and os.path.exists(os.path.join(sync_dir, ".wechat_uploaded")):
@@ -1003,72 +1448,30 @@ class AutoSubGUI:
                             wechat_cmd = build_wechat_cmd(
                                 sync_dir,
                                 public=self.wechat_public_var.get(),
-                                title=shared_metadata["wechat_title"],
-                                desc=shared_metadata["desc"],
-                                cover_title=shared_metadata["cover_title"],
+                                title=wechat_metadata["wechat_title"],
+                                desc=wechat_metadata["desc"],
+                                cover_title=wechat_metadata["cover_title"],
                                 llm_model=self.llm_model_var.get(),
                                 llm_provider=self.vendor_map.get(self.vendor_var.get(), ""),
                                 require_complete_metadata=True,
                             )
                             if wechat_cmd:
                                 _persist(f"💬 找到上传视频: {os.path.basename(wechat_cmd[2])}")
-                                upload_jobs.append(("💬 [WeChat]", wechat_cmd, ".wechat_uploaded"))
+                                start_upload_job(
+                                    "💬 [WeChat]",
+                                    wechat_cmd,
+                                    ".wechat_uploaded",
+                                )
                             elif newest_video:
                                 _persist("⚠️ 微信视频号上传命令构建失败。")
                             else:
                                 _persist("⚠️ 未找到生成的 hardsub 视频文件，跳过微信视频号上传。")
-                # Launch all upload jobs concurrently, wait for all to finish
-                upload_results = {}
-                if upload_jobs:
-                    self.root.after(0, lambda: self.status_label.config(text="📤 正在上传..."))
-                    def run_upload(label, ucmd, marker):
-                        _persist(f"{label} 开始上传...")
-                        proc = None
-                        upload_ok = False
-                        output_lines = []
-                        try:
-                            proc = subprocess.Popen(ucmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', bufsize=1)
-                            self._register_process(proc)
-                            if proc.stdout:
-                                for line in proc.stdout:
-                                    output_lines.append(line.strip())
-                                    if len(output_lines) > 300:
-                                        output_lines.pop(0)
-                                    _persist(f"{label} {line.strip()}")
-                            proc.wait()
-                            upload_ok = proc.returncode == 0
-                            mark = "✅" if upload_ok else "⚠️"
-                            _persist(f"{label} {mark} 上传结束 (code={proc.returncode})")
-                            if not upload_ok:
-                                from autosub import get_upload_login_failure_hint
-                                login_hint = get_upload_login_failure_hint(
-                                    label, "\n".join(output_lines)
-                                )
-                                if login_hint:
-                                    _persist(login_hint)
-                            if upload_ok and marker and sync_dir:
-                                try:
-                                    with open(os.path.join(sync_dir, marker), "w", encoding="utf-8") as marker_file:
-                                        marker_file.write("1")
-                                except Exception as marker_error:
-                                    _persist(f"{label} ⚠️ 写入上传标记失败: {marker_error}")
-                        except Exception as ue:
-                            _persist(f"{label} ❌ 异常: {ue}")
-                        finally:
-                            if proc is not None:
-                                self._unregister_process(proc)
-                        upload_results[label] = upload_ok
-                        return upload_ok
-                    upload_threads = []
-                    for label, ucmd, marker in upload_jobs:
-                        t = threading.Thread(target=run_upload, args=(label, ucmd, marker), daemon=True)
-                        upload_threads.append(t)
-                        t.start()
-                    for t in upload_threads:
-                        t.join()
+                if upload_threads:
+                    for upload_thread in upload_threads:
+                        upload_thread.join()
                 else:
                     _persist("⚠️ 没有可执行的上传任务。")
-                failed_uploads = login_failures + [
+                failed_uploads = login_failures + metadata_failures + [
                     label for label, upload_ok in upload_results.items() if not upload_ok
                 ]
                 if failed_uploads:
@@ -1089,6 +1492,8 @@ class AutoSubGUI:
             self.root.after(0, lambda: self.upload_btn.config(state="normal"))
             self.root.after(0, lambda: self.stop_btn.config(state="disabled"))
             self.root.after(0, lambda: self.pause_btn.config(state="disabled", text="暂停 (Pause)"))
+            self.root.after(0, self.refresh_history)
+            self.root.after(0, lambda: self._update_input_after_run(input_video))
             self.is_paused = False
 
     def toggle_pause(self):

@@ -797,19 +797,50 @@ def _load_llm_defaults():
     )
 
 
+def _metadata_model_candidates(primary_model, provider, llm_client):
+    """Return model candidates used only by upload metadata generation."""
+    primary = str(primary_model or "").strip()
+    provider_name = str(getattr(provider, "value", provider) or "").strip().lower()
+    if not primary or provider_name != "dashscope" or llm_client is None:
+        return [primary] if primary else []
+
+    configured = os.environ.get("DASHSCOPE_METADATA_FALLBACK_MODELS")
+    if configured is not None:
+        if configured.strip().lower() in {"0", "false", "off", "none", "disabled"}:
+            return [primary]
+        fallback_models = re.split(r"[,;\s]+", configured.strip())
+    else:
+        gateway_model = os.environ.get("DASHSCOPE_FALLBACK_MODEL", "").strip()
+        fallback_models = ([gateway_model] if gateway_model else []) + list(
+            getattr(llm_client, "DASHSCOPE_FALLBACK_CHAIN", [])
+        )
+
+    candidates = []
+    seen = set()
+    for model_name in [primary] + fallback_models:
+        value = str(model_name or "").strip()
+        key = value.casefold()
+        if not value or key in seen:
+            continue
+        seen.add(key)
+        candidates.append(value)
+    return candidates
+
+
 _SHARED_TITLE_BANNED_TERMS = (
     "我们", "它", "他们", "她们", "东西", "能力", "到底", "究竟",
     "为什么", "为何", "如何", "怎么", "怎样", "什么",
     "死活",
 )
 _SHARED_TITLE_ACTION_MARKERS = (
-    "谈", "讲", "靠", "用", "做", "让", "成为", "押", "是",
+    "谈", "讲", "靠", "用", "做", "让", "成为", "押", "是", "培养",
     "招", "卖", "买", "建立", "打造", "解决", "守住", "聚焦", "变成", "保护",
     "整合", "引领", "炮轰", "反对", "支持", "梳理", "展示",
     "被裁", "烂掉",
 )
 _SHARED_TITLE_CONTEXT_MARKERS = (
     "访谈", "对话", "谈", "讲", "为", "帮", "给", "客户", "企业", "主题",
+    "人才", "名校",
     "问题", "不做", "不是", "不招", "押注", "才是", "隐私", "一半",
     "被裁", "烂掉",
 )
@@ -2803,6 +2834,72 @@ def _description_title_fragments(description):
     }
 
 
+def _description_fallback_subject(description, prefer_company=False):
+    """Extract a conservative interview subject from a saved summary."""
+    value = re.sub(r"\s+", " ", str(description or "")).strip()
+    if not value:
+        return ""
+    first_sentence = re.split(r"[。！？\n]", value, maxsplit=1)[0]
+
+    company_match = re.search(
+        r"([A-Za-z][A-Za-z0-9_-]*(?:\s+[A-Za-z][A-Za-z0-9_-]*)*)"
+        r"\s*(?:联合创始人|创始人|CEO)",
+        first_sentence,
+    )
+    if company_match:
+        company = company_match.group(1).strip()
+        if prefer_company or "创始人" in first_sentence:
+            role = "创始人" if "创始人" in first_sentence else "CEO"
+            return f"{company}{role}"
+
+    named_role_match = re.search(
+        r"(?:之一|请来)\s*([A-Za-z][A-Za-z0-9_-]*(?:\s+[A-Za-z][A-Za-z0-9_-]*)*)",
+        first_sentence,
+    )
+    if named_role_match:
+        return named_role_match.group(1).strip()
+
+    fde_company_match = re.search(
+        r"([A-Za-z][A-Za-z0-9_-]*)\s*的\s*FDE",
+        first_sentence,
+    )
+    if fde_company_match:
+        return f"{fde_company_match.group(1)} FDE"
+
+    dialog_match = re.search(
+        r"(?:对话|对谈|专访|回访)\s*"
+        r"([A-Za-z][A-Za-z0-9_-]*(?:\s+[A-Za-z][A-Za-z0-9_-]*)*)",
+        first_sentence,
+    )
+    if dialog_match:
+        return dialog_match.group(1).strip()
+    return ""
+
+
+def _description_cover_subject(source_title, description):
+    """Find a Latin subject shared by the publisher title and summary."""
+    source_tokens = re.findall(
+        r"\b[A-Za-z][A-Za-z0-9_-]*\b",
+        str(source_title or ""),
+    )
+    description_tokens = {
+        token.casefold()
+        for token in re.findall(
+            r"\b[A-Za-z][A-Za-z0-9_-]*\b",
+            str(description or ""),
+        )
+    }
+    for token in source_tokens:
+        normalized = token.casefold()
+        if (
+            len(normalized) >= 3
+            and normalized not in _TITLE_LATIN_STOPWORDS
+            and normalized in description_tokens
+        ):
+            return token
+    return ""
+
+
 def _fallback_bili_title_from_subtitle(
     subtitle_text,
     source_title=None,
@@ -2884,6 +2981,21 @@ def _fallback_bili_title_from_description(description, max_chars):
         if fragments.get("output"):
             safety_title = f"{fragments['subject']}研究员谈AGI安全与产出"
         candidates.append(safety_title)
+
+    compact_value = re.sub(r"\s+", "", value)
+    subject = _description_fallback_subject(value)
+    if subject and "FDE" in compact_value and "全程负责" in compact_value:
+        candidates.append(f"{subject}谈FDE从发掘客户到部署全程负责")
+    if subject and "前线传感器" in compact_value:
+        candidates.append(f"{subject}谈FDE做客户组织前线传感器")
+    if subject and "复合技能" in compact_value and "担责" in compact_value:
+        candidates.append(f"{subject}谈FDE复合技能与担责")
+    if (
+        subject
+        and "测试评估" in compact_value
+        and ("智能体" in compact_value or "打磨系统" in compact_value)
+    ):
+        candidates.append(f"{subject} FDE用测试评估打磨企业智能体")
     for candidate in candidates:
         normalized = normalize_bili_upload_title(candidate, max_chars=max_chars)
         if normalized:
@@ -3024,6 +3136,28 @@ def _fallback_wechat_title_from_description(description, max_chars):
 def _fallback_wechat_title_from_bili_title(bili_title, max_chars):
     """Compress the local Bilibili fallback without another model call."""
     value = re.sub(r"\s+", " ", str(bili_title or "")).strip()
+    compact_value = re.sub(r"\s+", "", value)
+    generic_candidates = []
+    if "全程负责" in compact_value:
+        subject = compact_value.split("谈", 1)[0]
+        if subject.endswith("创始人"):
+            subject = subject[: -len("创始人")]
+        generic_candidates.append(f"{subject}谈FDE全程负责")
+    if "前线传感器" in compact_value:
+        generic_candidates.append("FDE是客户组织传感器")
+    if "复合技能" in compact_value:
+        generic_candidates.append("FDE为客户做AI担责")
+    if "测试评估" in compact_value:
+        generic_candidates.append("FDE用测试评估帮客户")
+    if "老年用户" in compact_value:
+        generic_candidates.append("Cresta为老人做智能体")
+    if "新的麦肯锡" in compact_value:
+        generic_candidates.append("FDE为客户解决AI交付")
+    for candidate in generic_candidates:
+        normalized = normalize_shared_upload_title(candidate, max_chars=max_chars)
+        if normalized:
+            return normalized
+
     marker = value.find("谈")
     if marker > 0:
         subject = re.sub(r"\s+", "", value[:marker])
@@ -3066,10 +3200,65 @@ def _fallback_wechat_title_from_bili_title(bili_title, max_chars):
         return normalize_shared_upload_title(cleaned, max_chars=max_chars)
     return ""
 
+
+def _fallback_wechat_hook_from_bili_title(bili_title, max_chars):
+    """Build a short hook from the subject and stance in a Bilibili title."""
+    compact = re.sub(r"\s+", "", str(bili_title or "")).strip()
+    if not compact:
+        return ""
+
+    subject_match = re.search(
+        r"(?<![A-Za-z0-9_-])([A-Z][A-Za-z0-9_-]{2,})(?![A-Za-z0-9_-])",
+        compact,
+    )
+    if not subject_match:
+        return ""
+    subject = subject_match.group(1)
+
+    clauses = re.split(r"[，,。.；;：:、]", compact)
+    anchor_clause = next((clause for clause in clauses if subject in clause), "")
+    if not anchor_clause:
+        return ""
+    tail = anchor_clause.split(subject, 1)[1]
+    tail = re.sub(r"^(?:干脆|直接|选择|决定|开始|转而)", "", tail)
+    tail = re.split(
+        r"(?:其|并且|而且|以及|同时|却|但|不过)",
+        tail,
+        maxsplit=1,
+    )[0]
+    tail = re.sub(r"^(?:就是|真的|确实)", "", tail)
+
+    candidates = []
+    if "培养" in tail:
+        object_value = "人才" if "人才" in tail else "学生"
+        stance = ""
+        if "名校" in compact and any(
+            marker in compact
+            for marker in ("不再只盯着", "不盯", "不看", "打破")
+        ):
+            stance = "不看名校"
+        candidates.append(f"{subject}培养{object_value}{stance}")
+        candidates.append(f"{subject}自己培养{object_value}")
+    if tail:
+        candidates.append(f"{subject}{tail}")
+
+    for candidate in candidates:
+        if len(candidate) > max_chars:
+            continue
+        normalized = normalize_shared_upload_title(
+            candidate,
+            max_chars=max_chars,
+        )
+        if normalized:
+            return normalized
+    return ""
+
+
 def _fallback_cover_title_from_description(
     description,
     form_title="",
     max_chars=48,
+    source_title="",
 ):
     """Turn a saved teaching summary and its metaphor into a cover headline."""
     value = re.sub(r"\s+", " ", str(description or "")).strip()
@@ -3093,6 +3282,32 @@ def _fallback_cover_title_from_description(
             and not _cover_title_has_engagement_issue(candidate)
         ):
             return candidate
+
+    compact_value = re.sub(r"\s+", "", value)
+    generic_candidates = []
+    if "FDE" in compact_value and "追责" in compact_value:
+        generic_candidates.append("FDE解决企业客户追责问题")
+    if "评测" in compact_value and "智能体" in compact_value:
+        anchor = _description_cover_subject(source_title, value)
+        if anchor and anchor != "FDE":
+            generic_candidates.append(f"{anchor}用评测解决智能体问题")
+        else:
+            generic_candidates.append("FDE用测试评估解决智能体问题")
+    if "不担责" in compact_value or "担不了责任" in compact_value:
+        generic_candidates.append("AI不担责，FDE解决责任")
+    if "交付的不是PPT" in compact_value and "智能体" in compact_value:
+        generic_candidates.append("FDE用智能体解决客户交付")
+    for candidate in generic_candidates:
+        if not 12 <= len(candidate) <= max_chars:
+            continue
+        if _cover_title_repeats_form_title(candidate, form_title):
+            continue
+        if (
+            _cover_title_has_quality_issue(candidate)
+            or _cover_title_has_engagement_issue(candidate)
+        ):
+            continue
+        return candidate
 
     first_sentence = re.split(r"[。！？\n]", value, maxsplit=1)[0]
     if "教你用好" not in first_sentence:
@@ -3141,6 +3356,7 @@ def generate_upload_metadata(
     wechat_title_max_chars=SHARED_UPLOAD_TITLE_MAX_CHARS,
     llm_model=None,
     llm_provider=None,
+    include_wechat=True,
 ):
     """Generate Bilibili/WeChat form titles and shared upload metadata.
 
@@ -3169,6 +3385,8 @@ def generate_upload_metadata(
             provider = LLMProvider(provider_name)
         except ValueError:
             provider = None
+    metadata_models = _metadata_model_candidates(model, provider, llm_client)
+    preferred_model = model
     hardsub_path = find_upload_hardsub_video(workdir)
     if not hardsub_path:
         _log("⚠️ [MetaGen] No hardsub video found")
@@ -3198,7 +3416,9 @@ def generate_upload_metadata(
             + "、".join(invalid_cached_fields)
         )
 
-    required_fields = ("title", "wechat_title", "description", "cover_title")
+    required_fields = ["title", "description", "cover_title"]
+    if include_wechat:
+        required_fields.append("wechat_title")
     if all(str(meta.get(field) or "").strip() for field in required_fields):
         return meta
 
@@ -3239,90 +3459,217 @@ def generate_upload_metadata(
         except Exception as e:
             _log(f"⚠️ [MetaGen] Description generation failed: {e}")
 
-    # The whole-video description is the only title source. If this model call
-    # fails or is rejected, leave the field empty so upload preflight stops.
+    # The whole-video description is the title source. If every model candidate
+    # fails, use a conservative local summary only when it passes the same gate.
     if not meta.get("title") and meta.get("description") and sub_text and llm_client:
-        try:
-            summary_title = _generate_title_from_description(
-                meta["description"],
-                sub_text,
-                full_sub_text,
-                llm_client,
-                model,
-                bili_title_max_chars,
-                provider,
-                source_title=source_title,
-            )
-            if summary_title:
-                meta["title"] = summary_title
-                _log(f">>> [MetaGen] B站标题: {summary_title}")
-        except Exception as e:
-            _log(f"⚠️ [MetaGen] Bilibili title generation failed: {e}")
+        for candidate_model in metadata_models:
+            try:
+                summary_title = _generate_title_from_description(
+                    meta["description"],
+                    sub_text,
+                    full_sub_text,
+                    llm_client,
+                    candidate_model,
+                    bili_title_max_chars,
+                    provider,
+                    source_title=source_title,
+                )
+                if summary_title and _metadata_title_has_quality_issue(
+                    summary_title,
+                    source_title,
+                    bool(sub_text),
+                    meta["description"],
+                ):
+                    _log(
+                        "⚠️ [MetaGen] Bilibili title rejected "
+                        f"({candidate_model}): {summary_title}"
+                    )
+                    continue
+                if summary_title:
+                    meta["title"] = summary_title
+                    preferred_model = candidate_model
+                    _log(f">>> [MetaGen] B站标题: {summary_title}")
+                    break
+            except Exception as e:
+                _log(
+                    "⚠️ [MetaGen] Bilibili title generation failed "
+                    f"({candidate_model}): {e}"
+                )
 
     if not meta.get("title"):
-        _log("⚠️ [MetaGen] Bilibili title generation failed; no local fallback")
+        local_title = _fallback_bili_title_from_description(
+            meta.get("description"),
+            bili_title_max_chars,
+        )
+        if local_title and _metadata_title_has_quality_issue(
+            local_title,
+            source_title,
+            bool(sub_text),
+            meta.get("description"),
+        ):
+            _log(f"⚠️ [MetaGen] Bilibili local fallback rejected: {local_title}")
+        elif local_title:
+            meta["title"] = local_title
+            _log(f">>> [MetaGen] B站标题（本地兜底）: {local_title}")
+        else:
+            _log("⚠️ [MetaGen] Bilibili title generation failed; no local fallback")
 
     # 2. WeChat form title, derived from the Bilibili title rather than
     # regenerating a separate theme under a tighter character budget.
-    if (
+    if include_wechat and (
         not meta.get("wechat_title")
         and meta.get("title")
         and meta.get("description")
         and sub_text
         and llm_client
     ):
-        try:
-            wechat_title = _derive_wechat_title_from_bili_title(
-                meta["title"],
-                meta["description"],
-                sub_text,
-                llm_client,
-                model,
-                max_chars=wechat_title_max_chars,
-                provider=provider,
-                source_title=source_title,
-            )
-            if wechat_title:
-                meta["wechat_title"] = wechat_title
-                _log(f">>> [MetaGen] 视频号标题: {wechat_title}")
-        except Exception as e:
-            _log(f"⚠️ [MetaGen] WeChat title generation failed: {e}")
+        wechat_models = _metadata_model_candidates(
+            preferred_model,
+            provider,
+            llm_client,
+        )
+        for candidate_model in wechat_models:
+            try:
+                wechat_title = _derive_wechat_title_from_bili_title(
+                    meta["title"],
+                    meta["description"],
+                    sub_text,
+                    llm_client,
+                    candidate_model,
+                    max_chars=wechat_title_max_chars,
+                    provider=provider,
+                    source_title=source_title,
+                )
+                if wechat_title and _metadata_title_has_quality_issue(
+                    wechat_title,
+                    source_title,
+                    bool(sub_text),
+                    meta["description"],
+                ):
+                    _log(
+                        "⚠️ [MetaGen] WeChat title rejected "
+                        f"({candidate_model}): {wechat_title}"
+                    )
+                    continue
+                if wechat_title:
+                    meta["wechat_title"] = wechat_title
+                    preferred_model = candidate_model
+                    _log(f">>> [MetaGen] 视频号标题: {wechat_title}")
+                    break
+            except Exception as e:
+                _log(
+                    "⚠️ [MetaGen] WeChat title generation failed "
+                    f"({candidate_model}): {e}"
+                )
 
-    if not meta.get("wechat_title"):
-        _log("⚠️ [MetaGen] WeChat title generation failed; no local fallback")
+    if include_wechat and not meta.get("wechat_title"):
+        local_wechat_title = _fallback_wechat_title_from_bili_title(
+            meta.get("title"),
+            wechat_title_max_chars,
+        )
+        if not local_wechat_title:
+            local_wechat_title = _fallback_wechat_hook_from_bili_title(
+                meta.get("title"),
+                wechat_title_max_chars,
+            )
+        if not local_wechat_title:
+            local_wechat_title = _fallback_wechat_title_from_description(
+                meta.get("description"),
+                wechat_title_max_chars,
+            )
+        if not local_wechat_title:
+            local_wechat_title = _fallback_wechat_title_from_subtitle(
+                sub_text,
+                max_chars=wechat_title_max_chars,
+                form_title=meta.get("title"),
+            )
+        if local_wechat_title and _metadata_title_has_quality_issue(
+            local_wechat_title,
+            source_title,
+            bool(sub_text),
+            meta.get("description"),
+        ):
+            _log(
+                "⚠️ [MetaGen] WeChat local fallback rejected: "
+                f"{local_wechat_title}"
+            )
+        elif local_wechat_title:
+            meta["wechat_title"] = local_wechat_title
+            _log(f">>> [MetaGen] 视频号标题（本地兜底）: {local_wechat_title}")
+        else:
+            _log("⚠️ [MetaGen] WeChat title generation failed; no local fallback")
 
     # 3. Cover title (editorial headline style)
     if not meta.get("cover_title") and sub_text and llm_client:
-        try:
-            cover_title = _generate_cover_title_from_full_subtitle(
-                sub_text,
-                llm_client,
-                model,
-                min_chars=12,
-                max_chars=48,
-                provider=provider,
-                form_title=meta.get("title"),
-                source_title=source_title,
-                description=meta.get("description"),
-            )
-            if cover_title:
-                if _metadata_cover_title_has_quality_issue(
-                    cover_title,
-                    meta.get("title"),
-                    meta.get("wechat_title"),
-                    source_title,
-                    meta.get("description"),
-                    bool(sub_text),
-                ):
-                    _log(f"⚠️ [MetaGen] Cover title rejected: {cover_title}")
-                else:
+        cover_models = _metadata_model_candidates(
+            preferred_model,
+            provider,
+            llm_client,
+        )
+        for candidate_model in cover_models:
+            try:
+                cover_title = _generate_cover_title_from_full_subtitle(
+                    sub_text,
+                    llm_client,
+                    candidate_model,
+                    min_chars=12,
+                    max_chars=48,
+                    provider=provider,
+                    form_title=meta.get("title"),
+                    source_title=source_title,
+                    description=meta.get("description"),
+                )
+                if cover_title:
+                    if _metadata_cover_title_has_quality_issue(
+                        cover_title,
+                        meta.get("title"),
+                        meta.get("wechat_title"),
+                        source_title,
+                        meta.get("description"),
+                        bool(sub_text),
+                    ):
+                        _log(
+                            "⚠️ [MetaGen] Cover title rejected "
+                            f"({candidate_model}): {cover_title}"
+                        )
+                        continue
                     meta["cover_title"] = cover_title
+                    preferred_model = candidate_model
                     _log(f">>> [MetaGen] 封面标题: {cover_title}")
-        except Exception as e:
-            _log(f"⚠️ [MetaGen] Cover title generation failed: {e}")
+                    break
+            except Exception as e:
+                _log(
+                    "⚠️ [MetaGen] Cover title generation failed "
+                    f"({candidate_model}): {e}"
+                )
 
     if not meta.get("cover_title"):
-        _log("⚠️ [MetaGen] Cover title generation failed; no local fallback")
+        local_cover_title = _fallback_cover_title_from_subtitle(
+            sub_text,
+            form_title=meta.get("title"),
+            description=meta.get("description"),
+            source_title=source_title,
+        )
+        if not local_cover_title:
+            local_cover_title = _fallback_cover_title_from_description(
+                meta.get("description"),
+                form_title=meta.get("title"),
+                source_title=source_title,
+            )
+        if local_cover_title and _metadata_cover_title_has_quality_issue(
+            local_cover_title,
+            meta.get("title"),
+            meta.get("wechat_title"),
+            source_title,
+            meta.get("description"),
+            bool(sub_text),
+        ):
+            _log(f"⚠️ [MetaGen] Cover local fallback rejected: {local_cover_title}")
+        elif local_cover_title:
+            meta["cover_title"] = local_cover_title
+            _log(f">>> [MetaGen] 封面标题（本地兜底）: {local_cover_title}")
+        else:
+            _log("⚠️ [MetaGen] Cover title generation failed; no local fallback")
 
     final_invalid_fields = _invalidate_cached_upload_metadata(
         meta,
@@ -3384,6 +3731,93 @@ def prepare_shared_upload_metadata(
 
     return {
         "title": bili_title,
+        "wechat_title": wechat_title,
+        "desc": description,
+        "cover_title": cover_title,
+    }
+
+
+def prepare_bili_upload_metadata(
+    workdir,
+    explicit_cover_title=None,
+    llm_model=None,
+    llm_provider=None,
+    on_log=None,
+):
+    """Generate only the metadata required to publish Bilibili."""
+    _log = on_log or (lambda msg: print(msg, flush=True))
+    meta = generate_upload_metadata(
+        workdir,
+        bili_title_max_chars=BILI_UPLOAD_TITLE_MAX_CHARS,
+        llm_model=llm_model,
+        llm_provider=llm_provider,
+        on_log=on_log,
+        include_wechat=False,
+    )
+    if not meta:
+        _log("❌ [MetaGen] Bilibili metadata generation failed; BI upload stopped")
+        return None
+
+    bili_title = normalize_bili_upload_title(
+        meta.get("title"),
+        max_chars=BILI_UPLOAD_TITLE_HARD_MAX_CHARS,
+    )
+    description = str(meta.get("description") or "").strip()
+    cover_title = str(
+        explicit_cover_title or meta.get("cover_title") or ""
+    ).strip()
+    if not bili_title or not description or not cover_title:
+        _log(
+            "❌ [MetaGen] Bilibili title, description, or cover title "
+            "incomplete; BI upload stopped"
+        )
+        return None
+
+    return {
+        "title": bili_title,
+        "desc": description,
+        "cover_title": cover_title,
+    }
+
+
+def prepare_wechat_upload_metadata(
+    workdir,
+    explicit_cover_title=None,
+    llm_model=None,
+    llm_provider=None,
+    on_log=None,
+):
+    """Derive and validate the shorter WeChat form title after Bilibili."""
+    _log = on_log or (lambda msg: print(msg, flush=True))
+    meta = generate_upload_metadata(
+        workdir,
+        bili_title_max_chars=BILI_UPLOAD_TITLE_MAX_CHARS,
+        wechat_title_max_chars=SHARED_UPLOAD_TITLE_MAX_CHARS,
+        llm_model=llm_model,
+        llm_provider=llm_provider,
+        on_log=on_log,
+        include_wechat=True,
+    )
+    if not meta:
+        _log("❌ [MetaGen] WeChat metadata generation failed; WX upload stopped")
+        return None
+
+    wechat_title = normalize_shared_upload_title(
+        meta.get("wechat_title"),
+        max_chars=SHARED_UPLOAD_TITLE_MAX_CHARS,
+    )
+    description = str(meta.get("description") or "").strip()
+    cover_title = str(
+        explicit_cover_title or meta.get("cover_title") or ""
+    ).strip()
+    if not wechat_title or not description or not cover_title:
+        _log(
+            "❌ [MetaGen] WeChat title, description, or cover title "
+            "incomplete; WX upload stopped"
+        )
+        return None
+
+    return {
         "wechat_title": wechat_title,
         "desc": description,
         "cover_title": cover_title,
@@ -3534,32 +3968,12 @@ def run_post_processing_uploads(
     llm_model=None,
     llm_provider=None,
 ):
-    """Run GD/BI/WX uploads together and share BI/WX metadata."""
+    """Run GD/BI/WX uploads with platform-specific metadata preflight."""
     need_sync = bool(sync_gdrive) and not os.path.exists(os.path.join(workdir, ".synced"))
     need_bili = bool(bili_upload) and not os.path.exists(os.path.join(workdir, ".bili_uploaded"))
     need_wechat = bool(wechat_upload) and not os.path.exists(os.path.join(workdir, ".wechat_uploaded"))
     if not any((need_sync, need_bili, need_wechat)):
         return
-
-    needs_shared_metadata = need_bili or need_wechat
-    explicit_cover_titles = (
-        str(bili_cover_title or "").strip(),
-        str(wechat_cover_title or "").strip(),
-    )
-    if needs_shared_metadata and all(explicit_cover_titles) and explicit_cover_titles[0] != explicit_cover_titles[1]:
-        print("❌ [MetaGen] Bilibili and WeChat cover titles differ; shared uploads stopped", flush=True)
-        need_bili = False
-        need_wechat = False
-        needs_shared_metadata = False
-
-    meta = None
-    if needs_shared_metadata:
-        meta = prepare_shared_upload_metadata(
-            workdir,
-            explicit_cover_title=bili_cover_title or wechat_cover_title,
-            llm_model=llm_model,
-            llm_provider=llm_provider,
-        )
 
     bili_kwargs = {}
     wechat_kwargs = {"public": wechat_public}
@@ -3569,36 +3983,6 @@ def run_post_processing_uploads(
     if llm_provider:
         bili_kwargs["llm_provider"] = llm_provider
         wechat_kwargs["llm_provider"] = llm_provider
-    if needs_shared_metadata and not meta:
-        need_bili = False
-        need_wechat = False
-    elif meta:
-        bili_kwargs.update({
-            "title": meta["title"],
-            "desc": meta["desc"],
-            "cover_title": meta["cover_title"],
-        })
-        wechat_kwargs.update({
-            "title": meta["wechat_title"],
-            "desc": meta["desc"],
-            "cover_title": meta["cover_title"],
-        })
-    elif bili_cover_title:
-        bili_kwargs["cover_title"] = bili_cover_title
-    elif wechat_cover_title:
-        wechat_kwargs["cover_title"] = wechat_cover_title
-
-    if sum((need_sync, need_bili, need_wechat)) == 1:
-        if need_sync:
-            if trigger_sync(workdir, sync_gdrive, headless=headless) is True:
-                _write_upload_marker(workdir, ".synced")
-        elif need_bili:
-            if trigger_bili_upload(workdir, **bili_kwargs):
-                _write_upload_marker(workdir, ".bili_uploaded")
-        elif need_wechat:
-            if trigger_wechat_upload(workdir, **wechat_kwargs):
-                _write_upload_marker(workdir, ".wechat_uploaded")
-        return
 
     import threading
     sync_result = [False]
@@ -3609,18 +3993,56 @@ def run_post_processing_uploads(
     if need_sync:
         def _run_sync():
             sync_result[0] = trigger_sync(workdir, sync_gdrive, headless=headless) is True
-        threads.append(threading.Thread(target=_run_sync, daemon=True))
-    if need_bili:
-        def _run_bili():
-            bili_result[0] = trigger_bili_upload(workdir, **bili_kwargs)
-        threads.append(threading.Thread(target=_run_bili, daemon=True))
-    if need_wechat:
-        def _run_wechat():
-            wechat_result[0] = trigger_wechat_upload(workdir, **wechat_kwargs)
-        threads.append(threading.Thread(target=_run_wechat, daemon=True))
+        sync_thread = threading.Thread(target=_run_sync, daemon=True)
+        threads.append(sync_thread)
+        sync_thread.start()
 
-    for thread in threads:
-        thread.start()
+    if need_bili:
+        bili_metadata = prepare_bili_upload_metadata(
+            workdir,
+            explicit_cover_title=bili_cover_title,
+            llm_model=llm_model,
+            llm_provider=llm_provider,
+        )
+        if not bili_metadata:
+            need_bili = False
+        else:
+            bili_kwargs.update({
+                "title": bili_metadata["title"],
+                "desc": bili_metadata["desc"],
+                "cover_title": bili_metadata["cover_title"],
+            })
+
+            def _run_bili():
+                bili_result[0] = trigger_bili_upload(workdir, **bili_kwargs)
+
+            bili_thread = threading.Thread(target=_run_bili, daemon=True)
+            threads.append(bili_thread)
+            bili_thread.start()
+
+    if need_wechat:
+        wechat_metadata = prepare_wechat_upload_metadata(
+            workdir,
+            explicit_cover_title=wechat_cover_title,
+            llm_model=llm_model,
+            llm_provider=llm_provider,
+        )
+        if not wechat_metadata:
+            need_wechat = False
+        else:
+            wechat_kwargs.update({
+                "title": wechat_metadata["wechat_title"],
+                "desc": wechat_metadata["desc"],
+                "cover_title": wechat_metadata["cover_title"],
+            })
+
+            def _run_wechat():
+                wechat_result[0] = trigger_wechat_upload(workdir, **wechat_kwargs)
+
+            wechat_thread = threading.Thread(target=_run_wechat, daemon=True)
+            threads.append(wechat_thread)
+            wechat_thread.start()
+
     for thread in threads:
         thread.join()
 
