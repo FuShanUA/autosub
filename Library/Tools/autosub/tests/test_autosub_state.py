@@ -2084,6 +2084,39 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
             "",
         )
 
+    def test_interview_fallbacks_use_public_chinese_subjects(self):
+        """Tasks 6 and 9 must survive offline title generation."""
+        thiel_description = (
+            "Peter Thiel 回忆恩师 René Girard："
+            "初闻模仿理论只觉太疯狂，多年琢磨后才体会到它强大得不可思议。"
+            "这套思想后来塑造了他的商业直觉。"
+        )
+        self.assertEqual(
+            autosub._fallback_bili_title_from_source_title(
+                "Peter Thiel on René Girard",
+                80,
+                description=thiel_description,
+            ),
+            "蒂尔谈吉拉尔与模仿理论",
+        )
+        self.assertFalse(
+            autosub._metadata_title_has_quality_issue(
+                "蒂尔谈吉拉尔与模仿理论",
+                "Peter Thiel on René Girard",
+                True,
+                thiel_description,
+            )
+        )
+
+        bili_title = "Marc Andreessen在访谈中直言旧的制造业岗位回不来"
+        wechat_title = autosub._fallback_wechat_title_from_bili_title(
+            bili_title,
+            16,
+        )
+        self.assertEqual(wechat_title, "安德森谈旧的制造业岗位回不来")
+        self.assertLessEqual(len(wechat_title), 16)
+        self.assertTrue(autosub.normalize_shared_upload_title(wechat_title, 16))
+
     def test_wechat_hook_fallback_derives_short_title_from_bili_title(self):
         """The Palantir title can yield a 16-character WeChat hook offline."""
         source_title = "Palantir expands tech talent pipeline with Meritocracy Fellowship"
@@ -2506,7 +2539,7 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
              ):
             metadata = autosub.generate_upload_metadata(workdir)
 
-        self.assertEqual(metadata.get("title", ""), "")
+        self.assertEqual(metadata.get("title", ""), "蒂尔谈AI")
         self.assertEqual(metadata.get("wechat_title", ""), "蒂尔谈AI")
         self.assertEqual(
             metadata.get("cover_title", ""),

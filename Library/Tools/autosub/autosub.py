@@ -862,7 +862,7 @@ _SHARED_TITLE_ACTION_MARKERS = (
     "招", "卖", "买", "建立", "打造", "解决", "守住", "聚焦", "变成", "保护",
     "整合", "引领", "炮轰", "反对", "支持", "梳理", "展示", "迭代", "改造",
     "收购", "讨论", "推掉", "陪", "失去", "离世", "拒绝", "直面", "守",
-    "被裁", "烂掉",
+    "被裁", "烂掉", "回忆",
 )
 _SHARED_TITLE_CONTEXT_MARKERS = (
     "访谈", "对话", "谈", "讲", "为", "帮", "给", "客户", "企业", "主题",
@@ -884,6 +884,9 @@ _PROPER_NOUN_TITLE_ALIASES = {
     "Matt Damon": ("马特·达蒙", "马特达蒙"),
     "Alex Karp": ("卡普",),
     "Peter Thiel": ("彼得·蒂尔", "蒂尔"),
+    "Marc Andreessen": ("安德森",),
+    "René Girard": ("吉拉尔",),
+    "Rene Girard": ("吉拉尔",),
     "Andrej Karpathy": ("卡帕西",),
     "Elon Musk": ("马斯克",),
     "Los Angeles": ("洛杉矶",),
@@ -2684,12 +2687,42 @@ def _extract_source_title(video_path):
     } else value
 
 
-def _fallback_bili_title_from_source_title(source_title, max_chars):
+def _fallback_bili_title_from_source_title(source_title, max_chars, description=""):
     """Use the publisher title when model and subtitle titles both fail."""
     value = re.sub(r"\s+", " ", str(source_title or "")).strip()
     value = _apply_preferred_title_aliases(value, max_chars)
     if not value:
         return ""
+    interview_title = re.sub(
+        r"^([^\s：:][^：:]{0,47}?)\s+on\s+(.+)$",
+        r"\1谈\2",
+        value,
+    )
+    if interview_title == value:
+        interview_title = re.sub(
+            r"^([^\s：:][^：:]{0,47}?)\s+-\s+(.+)$",
+            r"\1谈\2",
+            value,
+        )
+        dash_match = re.match(
+            r"^([^\s：:][^：:]{0,47}?)\s+-\s+(.+)$",
+            value,
+        )
+        if dash_match:
+            topic_match = re.search(
+                r"\b(AI|GPT|Europe|America|China|OpenAI|Google|Meta|Palantir|AfD)\b",
+                dash_match.group(2),
+                re.IGNORECASE,
+            )
+            if topic_match:
+                interview_title = (
+                    f"{dash_match.group(1).strip()}谈{topic_match.group(1)}"
+                )
+    if interview_title != value:
+        value = interview_title
+        summary = str(description or "")
+        if "模仿理论" in summary and "模仿理论" not in value:
+            value += "与模仿理论"
     if len(value) > max_chars:
         cut = value.rfind(" ", 0, max_chars + 1)
         if cut < max_chars // 2:
@@ -3469,6 +3502,30 @@ def _fallback_wechat_title_from_bili_title(bili_title, max_chars):
     value = re.sub(r"\s+", " ", str(bili_title or "")).strip()
     value = _apply_preferred_title_aliases(value, max_chars)
     compact_value = re.sub(r"\s+", "", value)
+
+    interview_match = re.match(
+        r"^(.{2,32}?)"
+        r"(?:在访谈中直言|在专访中直言|在访谈中说|在专访中说|在访谈中指出)"
+        r"[:：]?(.+)$",
+        value,
+    )
+    if interview_match:
+        subject = interview_match.group(1).strip()
+        tail = re.split(
+            r"[，,。.；;：:]",
+            interview_match.group(2),
+            maxsplit=1,
+        )[0]
+        tail = tail.strip(" ：:，,。.！!？?；;")
+        if subject and tail:
+            candidate = f"{subject}谈{tail}"
+            normalized = normalize_shared_upload_title(
+                candidate,
+                max_chars=max_chars,
+            )
+            if normalized:
+                return normalized
+
     generic_candidates = []
     if "全程负责" in compact_value:
         subject = compact_value.split("谈", 1)[0]
@@ -4026,6 +4083,7 @@ def generate_upload_metadata(
         meta["title"] = _fallback_bili_title_from_source_title(
             source_title,
             bili_title_max_chars,
+            description=meta.get("description"),
         )
         _log(f">>> [MetaGen] B站标题（原标题兜底）: {meta['title']}")
     if include_wechat and not meta.get("wechat_title") and source_title:
