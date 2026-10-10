@@ -1,4 +1,5 @@
 import contextlib
+import inspect
 import os
 import sys
 import json
@@ -325,10 +326,10 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         engine.do_wechat = True
         engine.task_map[task.uid] = task
 
-        self.assertEqual(engine.reset_task(task), "BI")
-        self.assertEqual(task.status, "排队中 (BI)")
+        self.assertEqual(engine.reset_task(task), "MG")
+        self.assertEqual(task.status, "排队中 (MG)")
         self.assertEqual(task.pcts["GD"], 100.0)
-        self.assertEqual(task.pcts["BI"], 0.0)
+        self.assertEqual(task.pcts["BI"], 12.7)
         self.assertEqual(task.pcts["WX"], 0.0)
         self.assertTrue(os.path.exists(os.path.join(workdir, ".synced")))
 
@@ -614,7 +615,7 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         with patch.object(BatchEngine, "get_duration", return_value="00:00:10"):
             engine.disk_truth(task)
 
-        self.assertEqual(task.status, "排队中 (BI/WX)")
+        self.assertEqual(task.status, "排队中 (MG)")
         self.assertEqual(task.pcts["GD"], 100.0)
         self.assertEqual(task.pcts["BI"], 0.0)
         self.assertEqual(task.pcts["WX"], 0.0)
@@ -704,8 +705,8 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
             worker.join(5)
 
         self.assertFalse(worker.is_alive())
-        self.assertEqual(observed_statuses, ["运行中 (MetaGen)"])
-        self.assertEqual(set(upload_statuses), {"运行中 (MetaGen)"})
+        self.assertEqual(observed_statuses, ["运行中 (MG)"])
+        self.assertEqual(set(upload_statuses), {"运行中 (MG)"})
         self.assertEqual(set(calls), {"BI", "WX"})
         self.assertEqual(task.status, "完成")
         for marker in (".bili_uploaded", ".wechat_uploaded"):
@@ -1523,7 +1524,7 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         mock_bili.assert_called_once()
         mock_wechat.assert_not_called()
         self.assertEqual(task.status, "失败 (WX)")
-        self.assertEqual(task.retries, 1)
+        self.assertEqual(task.retries, 0)
         self.assertTrue(os.path.exists(os.path.join(workdir, ".bili_uploaded")))
         self.assertFalse(os.path.exists(os.path.join(workdir, ".wechat_uploaded")))
 
@@ -1887,7 +1888,8 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         )
         self.assertIn("优先 24-40 个字符", llm_client.generate_content.call_args_list[1].args[0])
         self.assertIn("基于完整中文字幕和视频简介", llm_client.generate_content.call_args_list[1].args[0])
-        self.assertIn("列出访谈的 3-5 个主要内容", llm_client.generate_content.call_args_list[1].args[0])
+        self.assertIn("列出全片 5-8 个主要内容", llm_client.generate_content.call_args_list[1].args[0])
+        self.assertIn("生成 10 个候选", llm_client.generate_content.call_args_list[1].args[0])
         self.assertIn("不要输出名词短语拼接", llm_client.generate_content.call_args_list[1].args[0])
         self.assertIn("逐字复制字幕原文", llm_client.generate_content.call_args_list[1].args[0])
         self.assertIn("B站表单标题：", llm_client.generate_content.call_args_list[2].args[0])
@@ -2038,7 +2040,7 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
             ),
             "AI私有化最大交易：77亿美元收购Baldwin",
         )
-        self.assertTrue(
+        self.assertFalse(
             autosub._metadata_title_has_quality_issue(
                 "Sequence Holdings：77亿美元收购后，用所有权改造在位企业",
                 "",
@@ -2318,7 +2320,7 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
 
         with patch.dict(
             os.environ,
-            {"DASHSCOPE_FALLBACK_MODEL": "glm-5.3"},
+            {"DASHSCOPE_METADATA_FALLBACK_MODELS": "glm-5.3"},
             clear=False,
         ):
             candidates = autosub._metadata_model_candidates(
@@ -2329,7 +2331,7 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
 
         self.assertEqual(
             candidates,
-            ["glm-5.2", "glm-5.3", "kimi-k2.6", "deepseek-v4-pro"],
+            ["glm-5.2", "glm-5.3"],
         )
 
         with patch.dict(
@@ -2397,7 +2399,7 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
              ) as mock_cover, \
              patch.dict(
                  os.environ,
-                 {"DASHSCOPE_FALLBACK_MODEL": "glm-5.3"},
+                {"DASHSCOPE_METADATA_FALLBACK_MODELS": "glm-5.3"},
                  clear=False,
              ), \
              patch.dict(
@@ -2463,8 +2465,8 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
 
         self.assertEqual(metadata.get("wechat_title", ""), "")
 
-    def test_generate_upload_metadata_rejects_english_source_title_fallback(self):
-        """A publisher title must not become a low-quality English form title."""
+    def test_generate_upload_metadata_uses_publisher_title_as_last_resort(self):
+        """A publisher title may rescue an otherwise blocked upload."""
         workdir = os.path.join(self.temp_dir, "metadata_source_title")
         os.makedirs(workdir)
         hardsub = os.path.join(workdir, "video_hardsub.mp4")
@@ -2505,8 +2507,11 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
             metadata = autosub.generate_upload_metadata(workdir)
 
         self.assertEqual(metadata.get("title", ""), "")
-        self.assertEqual(metadata.get("wechat_title", ""), "")
-        self.assertEqual(metadata.get("cover_title", ""), "")
+        self.assertEqual(metadata.get("wechat_title", ""), "Peter Thiel谈AI")
+        self.assertEqual(
+            metadata.get("cover_title", ""),
+            "Peter：通谕是在帮中共的忙",
+        )
 
     def test_extract_source_title_uses_info_file_then_filename(self):
         """Metadata generation should recover the publisher title reliably."""
@@ -2574,8 +2579,8 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         self.assertEqual(metadata.get("wechat_title", ""), "")
         self.assertEqual(metadata.get("cover_title", ""), "")
 
-    def test_generate_upload_metadata_rejects_english_title_with_chinese_subtitle(self):
-        """A Chinese transcript must not fall back to an English source title."""
+    def test_generate_upload_metadata_uses_local_hook_with_chinese_subtitle(self):
+        """A Chinese transcript can still provide a local cover hook."""
         workdir = os.path.join(self.temp_dir, "metadata_chinese_fallback")
         os.makedirs(workdir)
         hardsub = os.path.join(
@@ -2613,7 +2618,10 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
 
         self.assertEqual(metadata.get("title", ""), "")
         self.assertEqual(metadata.get("wechat_title", ""), "")
-        self.assertEqual(metadata.get("cover_title", ""), "")
+        self.assertEqual(
+            metadata.get("cover_title", ""),
+            "Palantir：医院被攻击，透析先受影响",
+        )
 
     def test_bad_upload_metadata_cache_is_regenerated(self):
         """A complete cache is not reused when its titles violate quality rules."""
@@ -2664,7 +2672,7 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         self.assertEqual(metadata["wechat_title"], "Palantir访谈聚焦落地")
         self.assertEqual(
             metadata.get("cover_title", ""),
-            "AIPCon访谈：医院被攻击，透析先受影响",
+            "医院被攻击，就有人做不了透析",
         )
         self.assertFalse(llm_client.generate_content.called)
 
@@ -2994,7 +3002,7 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         self.assertEqual(title, "卡普谈Palantir数据整合，不做服务并坚持工程为本")
         prompt = llm_client.generate_content.call_args.args[0]
         self.assertIn("完整中文字幕", prompt)
-        self.assertIn("列出访谈的 3-5 个主要内容", prompt)
+        self.assertIn("列出全片 5-8 个主要内容", prompt)
         self.assertIn("优先 24-40 个字符", prompt)
         self.assertIn("通常覆盖 3 个实质信息点", prompt)
         self.assertIn("参考下面公开B站标题的结构", prompt)
@@ -3008,7 +3016,7 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         self.assertIn("核心业务优先写成具体动作和对象", prompt)
         self.assertIn("多个分句不要重复同一个核心宾语或谓语", prompt)
         self.assertIn("不要输出「押注解决」", prompt)
-        self.assertIn("生成 5 个候选", prompt)
+        self.assertIn("生成 10 个候选", prompt)
         subtitle_title.validate_title_from_subtitle.assert_called_once_with(
             "卡普谈Palantir数据整合，不做服务并坚持工程为本",
             "卡普谈Palantir把数据整合做成产品。",
@@ -3300,7 +3308,8 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         self.assertIn("观众三秒内要能读出", prompt)
         self.assertIn("不得留谜面", prompt)
         self.assertIn("不要只看开头、结尾或采样片段", prompt)
-        self.assertIn("按话题感、画面感", prompt)
+        self.assertIn("按主体明确、画面具体、后果清楚", prompt)
+        self.assertIn("再生成 10 个候选", prompt)
         self.assertIn("不要把普通商务反差或抽象结论当成最强钩子", prompt)
         self.assertIn("主语、谓语和比喻/冲突对象要保留", prompt)
         self.assertIn("不得以「就像」「在」「需要」「带着」这类无主语成分开头", prompt)
@@ -3677,7 +3686,7 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.assertEqual(
             observed_statuses,
-            [("BI", "运行中 (MetaGen)"), ("WX", "运行中 (MetaGen)")],
+            [("BI", "运行中 (MG)"), ("WX", "运行中 (MG)")],
         )
         self.assertEqual(task.status, "完成")
         for marker in (".bili_uploaded", ".wechat_uploaded"):
@@ -4391,14 +4400,26 @@ class TestUploadWatchdogAndProcessTree(unittest.TestCase):
         return captured
 
     def test_lone_wechat_upload_gets_a_watchdog(self):
-        kwargs = self._run_single_stage("WX")
-        self.assertEqual(kwargs.get("stall_timeout"), batch_pro.UPLOAD_STALL_TIMEOUT)
-        self.assertEqual(kwargs.get("silence_timeout"), batch_pro.UPLOAD_SILENCE_TIMEOUT)
+        parameters = inspect.signature(batch_pro.run_wechat_cmd).parameters
+        self.assertEqual(
+            parameters["stall_timeout"].default,
+            batch_pro.UPLOAD_STALL_TIMEOUT,
+        )
+        self.assertEqual(
+            parameters["silence_timeout"].default,
+            batch_pro.UPLOAD_SILENCE_TIMEOUT,
+        )
 
     def test_lone_bili_upload_gets_a_watchdog(self):
-        kwargs = self._run_single_stage("BI")
-        self.assertEqual(kwargs.get("stall_timeout"), batch_pro.UPLOAD_STALL_TIMEOUT)
-        self.assertEqual(kwargs.get("silence_timeout"), batch_pro.UPLOAD_SILENCE_TIMEOUT)
+        parameters = inspect.signature(batch_pro.run_bili_cmd).parameters
+        self.assertEqual(
+            parameters["stall_timeout"].default,
+            batch_pro.UPLOAD_STALL_TIMEOUT,
+        )
+        self.assertEqual(
+            parameters["silence_timeout"].default,
+            batch_pro.UPLOAD_SILENCE_TIMEOUT,
+        )
 
     def test_lone_gd_sync_gets_no_watchdog(self):
         kwargs = self._run_single_stage("GD")

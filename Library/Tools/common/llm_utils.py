@@ -228,42 +228,6 @@ class LLMClient:
             value = value[: -len("/chat/completions")]
         return value.rstrip("/")
 
-    @staticmethod
-    def _should_fallback_dashscope_gateway(exc: Exception) -> bool:
-        """Only switch gateways for quota, network, and server-side failures."""
-        message = str(exc).lower()
-        markers = (
-            "status 429",
-            "too many requests",
-            "status 401",
-            "status 403",
-            "status 500",
-            "status 502",
-            "status 503",
-            "status 504",
-            "timeout",
-            "timed out",
-            "connection",
-            "remotedisconnected",
-            "could not resolve host",
-            "name or service not known",
-            "ssl",
-            "proxy",
-        )
-        return any(marker in message for marker in markers)
-
-    def _get_dashscope_fallback_target(self, model_name: str):
-        base_url = self._normalize_openai_base_url(
-            os.environ.get("DASHSCOPE_FALLBACK_BASE_URL", "")
-        )
-        api_key = os.environ.get("DASHSCOPE_FALLBACK_API_KEY", "").strip()
-        if not base_url or not api_key:
-            return None
-        fallback_model = (
-            os.environ.get("DASHSCOPE_FALLBACK_MODEL", "").strip() or model_name
-        )
-        return base_url, api_key, fallback_model
-
     def __init__(self, api_key: Optional[str] = None, provider: Optional[LLMProvider] = None):
         self.api_keys = {
             LLMProvider.GEMINI: api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"),
@@ -405,12 +369,27 @@ class LLMClient:
         self._vertex_configured = False
         self._vertex_current_location = None
 
-    def generate_content_with_provider(self, prompt: str, provider: LLMProvider, model_name: str = "gemini-3.1-flash-preview", fallback: bool = True, disable_thinking: bool = False) -> tuple[bool, str]:
+    def generate_content_with_provider(
+        self,
+        prompt: str,
+        provider: LLMProvider,
+        model_name: str = "gemini-3.1-flash-preview",
+        fallback: bool = True,
+        disable_thinking: bool = False,
+        request_timeout: Optional[int] = None,
+    ) -> tuple[bool, str]:
         """Generate content using specific provider and model. Returns (success, content/error)."""
         errors = []
         try:
             api_key = self.api_keys.get(provider)
-            res = self._execute_provider_call(provider, model_name, prompt, api_key, disable_thinking=disable_thinking)  # type: ignore
+            res = self._execute_provider_call(
+                provider,
+                model_name,
+                prompt,
+                api_key,
+                disable_thinking=disable_thinking,
+                request_timeout=request_timeout,
+            )  # type: ignore
             if res: return True, res
             errors.append(f"{provider.value}: No response")
         except Exception as e:
@@ -420,7 +399,14 @@ class LLMClient:
             for p, k, m in self.ordered_configs:
                 if p == provider: continue
                 try:
-                    res = self._execute_provider_call(p, m, prompt, k, disable_thinking=disable_thinking)
+                    res = self._execute_provider_call(
+                        p,
+                        m,
+                        prompt,
+                        k,
+                        disable_thinking=disable_thinking,
+                        request_timeout=request_timeout,
+                    )
                     if res: return True, res
                 except Exception as e:
                     errors.append(f"{p.value}: {str(e)}")
@@ -500,7 +486,15 @@ class LLMClient:
                 return LLMProvider.VERTEX
         return LLMProvider.GEMINI
 
-    def _call_openai_compatible(self, model_name: str, prompt: Union[str, List], base_url: str, api_key: str, disable_thinking: bool = False) -> Optional[str]:
+    def _call_openai_compatible(
+        self,
+        model_name: str,
+        prompt: Union[str, List],
+        base_url: str,
+        api_key: str,
+        disable_thinking: bool = False,
+        request_timeout: Optional[int] = None,
+    ) -> Optional[str]:
         if not api_key:
             print(f"❌ Error: API Key for {model_name} not found.")
             return None
@@ -592,6 +586,8 @@ class LLMClient:
             # The connect timeout of 10s ensures fast failure on unreachable proxies.
             _is_thinking = is_reasoning and not _disable_thinking
             _http_timeout = (10, 300) if _is_thinking else (10, 90)
+            if request_timeout is not None:
+                _http_timeout = (10, request_timeout)
             response = _post(f"{base_url}/chat/completions", headers=headers, json=data, timeout=_http_timeout)
             if response.status_code != 200:
                 try:
@@ -738,53 +734,39 @@ class LLMClient:
             print(f"❌ Vertex API error: {e}")
             raise Exception(f"Vertex API Error: {e}")
 
-    def _execute_provider_call(self, provider: LLMProvider, model_name: str, content: Union[str, List], api_key: str, disable_thinking: bool = False) -> Optional[str]:
+    def _execute_provider_call(
+        self,
+        provider: LLMProvider,
+        model_name: str,
+        content: Union[str, List],
+        api_key: str,
+        disable_thinking: bool = False,
+        request_timeout: Optional[int] = None,
+    ) -> Optional[str]:
         if provider == LLMProvider.GEMINI:
             return self._call_gemini(model_name, content, api_key)
         elif provider == LLMProvider.OPENAI:
             base_url = os.environ.get("OPENAI_API_BASE") or "https://api.openai.com/v1"
             if base_url.endswith("/v1/"): base_url = base_url[:-1]
-            return self._call_openai_compatible(model_name, content, base_url, api_key, disable_thinking=disable_thinking)
+            return self._call_openai_compatible(
+                model_name,
+                content,
+                base_url,
+                api_key,
+                disable_thinking=disable_thinking,
+                request_timeout=request_timeout,
+            )
         elif provider == LLMProvider.MOONSHOT:
             return self._call_openai_compatible(model_name, content, "https://api.moonshot.cn/v1", api_key, disable_thinking=disable_thinking)
         elif provider == LLMProvider.DASHSCOPE:
-            primary_base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-            try:
-                return self._call_openai_compatible(
-                    model_name,
-                    content,
-                    primary_base_url,
-                    api_key,
-                    disable_thinking=disable_thinking,
-                )
-            except Exception as primary_exc:
-                fallback_target = self._get_dashscope_fallback_target(model_name)
-                if fallback_target is None:
-                    raise
-                if not self._should_fallback_dashscope_gateway(primary_exc):
-                    raise
-
-                fallback_base_url, fallback_key, fallback_model = fallback_target
-                print(
-                    "🔄 DashScope gateway fallback: "
-                    f"{model_name} -> {fallback_model} via {fallback_base_url}"
-                )
-                try:
-                    result = self._call_openai_compatible(
-                        fallback_model,
-                        content,
-                        fallback_base_url,
-                        fallback_key,
-                        disable_thinking=disable_thinking,
-                    )
-                    if result:
-                        return result
-                    raise Exception("DashScope fallback gateway returned no content")
-                except Exception as fallback_exc:
-                    raise Exception(
-                        f"DashScope primary gateway failed: {primary_exc}; "
-                        f"fallback gateway failed: {fallback_exc}"
-                    ) from fallback_exc
+            return self._call_openai_compatible(
+                model_name,
+                content,
+                "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                api_key,
+                disable_thinking=disable_thinking,
+                request_timeout=request_timeout,
+            )
         elif provider == LLMProvider.ZHIPU:
             return self._call_openai_compatible(model_name, content, "https://open.bigmodel.cn/api/paas/v4", api_key, disable_thinking=disable_thinking)
         elif provider == LLMProvider.DEEPSEEK:
@@ -797,7 +779,15 @@ class LLMClient:
             return self._call_openai_compatible(model_name, content, "https://api.minimaxi.com/v1", api_key, disable_thinking=disable_thinking)
         return None
 
-    def generate_content(self, content: Union[str, List], model_name: Optional[str] = None, fallback: bool = False, provider: Optional[LLMProvider] = None, disable_thinking: bool = False) -> Optional[str]:
+    def generate_content(
+        self,
+        content: Union[str, List],
+        model_name: Optional[str] = None,
+        fallback: bool = False,
+        provider: Optional[LLMProvider] = None,
+        disable_thinking: bool = False,
+        request_timeout: Optional[int] = None,
+    ) -> Optional[str]:
         if model_name and "::" in model_name:
             vendor_str, model_name = model_name.split("::", 1)
             try:
@@ -898,7 +888,14 @@ class LLMClient:
             attempt = 0
             while True:
                 try:
-                    result = self._execute_provider_call(provider, m_name, content, api_key, disable_thinking=disable_thinking)
+                    result = self._execute_provider_call(
+                        provider,
+                        m_name,
+                        content,
+                        api_key,
+                        disable_thinking=disable_thinking,
+                        request_timeout=request_timeout,
+                    )
                     if result:
                         self.last_provider = provider
                         self.limiter.notify_success()

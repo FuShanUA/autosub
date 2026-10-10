@@ -472,7 +472,7 @@ def parse_indices(input_str, total_count):
         return {i for i in range(1, total_count + 1) if i not in selected}
 
 # --- 数据模型 ---
-STAGE_ORDER = ("DL", "TR", "TL", "MR", "BR", "GD", "BI", "WX")
+STAGE_ORDER = ("DL", "TR", "TL", "MR", "BR", "GD", "MG", "BI", "WX")
 STAGE_MARKERS = {
     "BR": ".burn_complete",
     "GD": ".synced",
@@ -489,7 +489,10 @@ class SubTask:
     title: str = "加载中..."
     duration: str = "未知"
     status: str = "排队中"  # QUEUED, ACTIVE (STAGE), DONE, FAILED, PAUSED
-    pcts: Dict[str, float] = field(default_factory=lambda: {"DL": 0.0, "TR": 0.0, "TL": 0.0, "MR": 0.0, "BR": 0.0, "GD": 0.0, "BI": 0.0, "WX": 0.0})
+    pcts: Dict[str, float] = field(default_factory=lambda: {
+        "DL": 0.0, "TR": 0.0, "TL": 0.0, "MR": 0.0, "BR": 0.0,
+        "GD": 0.0, "MG": 0.0, "BI": 0.0, "WX": 0.0,
+    })
     workdir: Optional[str] = None
     error: Optional[str] = None
     pid: Optional[int] = None
@@ -509,6 +512,14 @@ class SubTask:
         data = {k: v for k, v in d.items() if k in cls.__dataclass_fields__}
         if isinstance(data.get("pcts"), dict):
             data["pcts"].setdefault("WX", 0.0)
+            if "MG" not in data["pcts"]:
+                # Old states did not track metadata generation separately. If a
+                # platform upload already finished, metadata necessarily finished.
+                data["pcts"]["MG"] = 100.0 if (
+                    data.get("status") == "完成"
+                    or data["pcts"].get("BI", 0.0) >= 100.0
+                    or data["pcts"].get("WX", 0.0) >= 100.0
+                ) else 0.0
         if (not data.get('vid_id')) and data.get('url'):
             data['vid_id'] = extract_vid(data['url'])
         # 强制清洗路径
@@ -1070,6 +1081,8 @@ class BatchEngine:
     def _stage_is_complete(self, task: SubTask, stage: str) -> bool:
         if stage == "GD" and not self.do_gdsync:
             return True
+        if stage == "MG" and not self.do_bili and not self.do_wechat:
+            return True
         if stage == "BI" and not self.do_bili:
             return True
         if stage == "WX" and not self.do_wechat:
@@ -1243,7 +1256,7 @@ class BatchEngine:
 
                     # 彻底自愈：不再解析可能损坏的 status 字符串，而是根据 pcts 数据重新推导
                     current_stage = "DL"
-                    for s in ["DL", "TR", "TL", "MR", "BR", "GD", "BI", "WX"]:
+                    for s in STAGE_ORDER:
                         if t.pcts.get(s, 0.0) < 100.0:
                             current_stage = s
                             break
@@ -1516,16 +1529,19 @@ class BatchEngine:
                 pending_upload_stages = []
                 if need_gd:
                     pending_upload_stages.append("GD")
-                if need_bi:
-                    pending_upload_stages.append("BI")
-                if need_wx:
-                    pending_upload_stages.append("WX")
+                if need_bi or need_wx:
+                    pending_upload_stages.append("MG")
                 if pending_upload_stages:
                     task.status = f"排队中 ({'/'.join(pending_upload_stages)})"
                     _gd_pct = 100.0 if not need_gd else 0.0
                     _bi_pct = 100.0 if not need_bi else 0.0
                     _wx_pct = 100.0 if not need_wx else 0.0
-                    task.pcts.update({"DL": 100, "TR": 100, "TL": 100, "MR": 100, "BR": 100, "GD": _gd_pct, "BI": _bi_pct, "WX": _wx_pct})
+                    _mg_pct = 100.0 if not (need_bi or need_wx) else 0.0
+                    task.pcts.update({
+                        "DL": 100, "TR": 100, "TL": 100, "MR": 100,
+                        "BR": 100, "GD": _gd_pct, "MG": _mg_pct,
+                        "BI": _bi_pct, "WX": _wx_pct,
+                    })
                 else:
                     task.status = "完成"
                     for k in task.pcts: task.pcts[k] = 100.0
@@ -1932,7 +1948,7 @@ class BatchEngine:
                         start_pct = 2.0
                         end_pct = 100.0
                     else: continue
-                elif any(upload_stage in task.status for upload_stage in ("GD", "BI", "WX")):
+                elif any(upload_stage in task.status for upload_stage in ("GD", "MG", "BI", "WX")):
                     stage = "GD"
                     need_gd = self.do_gdsync and not os.path.exists(os.path.join(workdir, ".synced"))
                     need_bi = self.do_bili and not os.path.exists(os.path.join(workdir, ".bili_uploaded"))
@@ -1980,39 +1996,10 @@ class BatchEngine:
                             self.save_state()
                             break
                         cmd = []
-                    elif active == 1:
+                    elif active == 1 and not (need_bi or need_wx):
                         # Single upload — use the shared run_process block below
                         if need_gd:
                             cmd = [PYTHON_EXE, SYNC_SCRIPT, "--local-dir", workdir, "--remote-id", self.gdsync_id, "--wrap-folder", "--headless"]
-                        elif need_bi:
-                            stage = "BI"
-                            cmd = self._build_bili_cmd(
-                                workdir,
-                                llm_model=upload_llm_model,
-                                llm_provider=upload_llm_provider,
-                            )
-                            if not cmd:
-                                task.status = "失败 (BI)"
-                                task.error = "B站上传命令构建失败，未开始上传"
-                                self.save_state()
-                                break
-                        elif need_wx:
-                            stage = "WX"
-                            wx_skip_reason = get_wechat_upload_skip_reason(workdir)
-                            cmd = self._build_wechat_cmd(
-                                workdir,
-                                llm_model=upload_llm_model,
-                                llm_provider=upload_llm_provider,
-                            )
-                            if not cmd:
-                                task.status = (
-                                    "超限 (WX)"
-                                    if is_wechat_over_limit_reason(wx_skip_reason)
-                                    else "失败 (WX)"
-                                )
-                                task.error = wx_skip_reason or "视频号上传命令构建失败，未开始上传"
-                                self.save_state()
-                                break
                     else:
                         # === OVERLAPPING UPLOAD PIPELINE ===
                         # GD sync starts immediately. Bilibili metadata is
@@ -2025,11 +2012,16 @@ class BatchEngine:
                         if need_gd:
                             initial_upload_stages.append("GD")
                         if need_bi or need_wx:
-                            initial_upload_stages.append("MetaGen")
+                            initial_upload_stages.append("MG")
                         upload_status_label = "/".join(initial_upload_stages)
                         if upload_status_label:
                             with self.lock:
                                 task.status = f"运行中 ({upload_status_label})"
+                                if need_bi or need_wx:
+                                    task.pcts["MG"] = max(
+                                        task.pcts.get("MG", 0.0),
+                                        1.0,
+                                    )
                                 self.save_state()
 
                         # Phase 1: kick off GD sync + Bilibili metadata concurrently
@@ -2066,15 +2058,23 @@ class BatchEngine:
 
                         bili_cmd = None
                         if need_bi:
+                            def _bili_metadata_log(message):
+                                self._advance_mg_progress(task, message)
+                                logger.info(f"Task {task.uid} | MG | {message}")
+
                             bili_metadata = prepare_bili_upload_metadata(
                                 workdir,
                                 llm_model=upload_llm_model,
                                 llm_provider=upload_llm_provider,
-                                on_log=lambda msg: logger.info(
-                                    f"Task {task.uid} | MetaGen | {msg}"
-                                ),
+                                on_log=_bili_metadata_log,
                             )
                         if need_bi and bili_metadata:
+                            with self.lock:
+                                task.pcts["MG"] = max(
+                                    task.pcts.get("MG", 0.0),
+                                    100.0 if not need_wx else 60.0,
+                                )
+                                self.save_state()
                             bili_cmd = build_bili_cmd(
                                 workdir,
                                 title=bili_metadata.get("title"),
@@ -2095,7 +2095,7 @@ class BatchEngine:
                                 need_bi = False
                         elif need_bi:
                             logger.error(
-                                f"Task {task.uid} | MetaGen | Bilibili metadata "
+                                f"Task {task.uid} | MG | Bilibili metadata "
                                 "incomplete; BI upload stopped"
                             )
                             metadata_failed = True
@@ -2116,18 +2116,20 @@ class BatchEngine:
 
                         wechat_cmd = None
                         if need_wx:
+                            def _wechat_metadata_log(message):
+                                self._advance_mg_progress(task, message)
+                                logger.info(f"Task {task.uid} | MG | {message}")
+
                             wechat_metadata = prepare_wechat_upload_metadata(
                                 workdir,
                                 llm_model=upload_llm_model,
                                 llm_provider=upload_llm_provider,
-                                on_log=lambda msg: logger.info(
-                                    f"Task {task.uid} | MetaGen | {msg}"
-                                ),
+                                on_log=_wechat_metadata_log,
                             )
                             wx_skip_reason = get_wechat_upload_skip_reason(workdir)
                         if need_wx and not wechat_metadata:
                             logger.error(
-                                f"Task {task.uid} | MetaGen | WeChat metadata "
+                                f"Task {task.uid} | MG | WeChat metadata "
                                 "incomplete; WX upload stopped"
                             )
                             metadata_failed = True
@@ -2136,6 +2138,9 @@ class BatchEngine:
                             )
                             need_wx = False
                         elif need_wx:
+                            with self.lock:
+                                task.pcts["MG"] = 100.0
+                                self.save_state()
                             wechat_cmd = build_wechat_cmd(
                                 workdir,
                                 title=wechat_metadata.get("wechat_title"),
@@ -2213,7 +2218,7 @@ class BatchEngine:
                         permanent_upload_failure = permanent_upload_failure or any(
                             "登录态失效" in reason
                             for reason in upload_failure_reasons
-                        )
+                        ) or metadata_failed
 
                         all_ok = (
                             not metadata_failed
@@ -2356,7 +2361,7 @@ class BatchEngine:
             workdir,
             llm_model=llm_model,
             llm_provider=llm_provider,
-            on_log=lambda msg: logger.info(f"MetaGen | {msg}"),
+            on_log=lambda msg: logger.info(f"MG | {msg}"),
         )
         if not meta:
             return None
@@ -2376,6 +2381,27 @@ class BatchEngine:
             )
         return cmd
 
+    def _advance_mg_progress(self, task: SubTask, message: str):
+        """Map metadata-generation log milestones to the MG progress bar."""
+        value = str(message or "")
+        if ">>> [MetaGen] 简介" in value:
+            pct = 15.0
+        elif ">>> [MetaGen] B站标题" in value:
+            pct = 35.0
+        elif ">>> [MetaGen] 封面标题" in value:
+            pct = 50.0
+        elif ">>> [MetaGen] 视频号标题" in value:
+            pct = 70.0
+        else:
+            return
+        should_save = False
+        with self.lock:
+            if pct > task.pcts.get("MG", 0.0):
+                task.pcts["MG"] = pct
+                should_save = True
+        if should_save:
+            self.save_state()
+
     def _build_wechat_cmd(self, workdir, llm_model=None, llm_provider=None):
         """Build WeChat Channels upload command via the canonical autosub API.
 
@@ -2386,7 +2412,7 @@ class BatchEngine:
             workdir,
             llm_model=llm_model,
             llm_provider=llm_provider,
-            on_log=lambda msg: logger.info(f"MetaGen | {msg}"),
+            on_log=lambda msg: logger.info(f"MG | {msg}"),
         )
         if not meta:
             return None
@@ -2598,12 +2624,26 @@ class Dashboard:
             table.add_column("Status", width=8, justify="center", vertical="middle")
 
             stages = ["DL", "TR", "TL", "MR", "BR", "GD"]
+            if self.engine.do_bili or self.engine.do_wechat:
+                stages.append("MG")
             if self.engine.do_bili: stages.append("BI")
             if self.engine.do_wechat: stages.append("WX")
             for s in stages:
                 table.add_column(s, width=10, justify="center", vertical="middle")
             active_stages = list(stages)
-            _title_w = max(20, term_width - 107 - (10 * (int(self.engine.do_bili) + int(self.engine.do_wechat))))
+            _metadata_stage_count = int(
+                self.engine.do_bili or self.engine.do_wechat
+            )
+            _title_w = max(
+                20,
+                term_width - 107 - (
+                    10 * (
+                        _metadata_stage_count
+                        + int(self.engine.do_bili)
+                        + int(self.engine.do_wechat)
+                    )
+                ),
+            )
 
         elif term_width >= 105:
             # 2. Medium Mode: Show all columns but optimize progress stages to be extremely compact (width=6)
@@ -2613,12 +2653,26 @@ class Dashboard:
             table.add_column("Status", width=8, justify="center", vertical="middle")
 
             stages = ["DL", "TR", "TL", "MR", "BR", "GD"]
+            if self.engine.do_bili or self.engine.do_wechat:
+                stages.append("MG")
             if self.engine.do_bili: stages.append("BI")
             if self.engine.do_wechat: stages.append("WX")
             for s in stages:
                 table.add_column(s, width=6, justify="center", vertical="middle")
             active_stages = list(stages)
-            _title_w = max(20, term_width - 83 - (6 * (int(self.engine.do_bili) + int(self.engine.do_wechat))))
+            _metadata_stage_count = int(
+                self.engine.do_bili or self.engine.do_wechat
+            )
+            _title_w = max(
+                20,
+                term_width - 83 - (
+                    6 * (
+                        _metadata_stage_count
+                        + int(self.engine.do_bili)
+                        + int(self.engine.do_wechat)
+                    )
+                ),
+            )
             
         else:
             # 3. Narrow Mode: Completely hide stage progress columns to prioritize Title column

@@ -203,6 +203,14 @@ def check_all_completed(state_data: Any) -> bool:
             if status.startswith("超限"):
                 # A platform duration limit is terminal, but it is not success.
                 return False
+            metadata_needed = bool(
+                task_d.get("bili", state_data.get("bili", False))
+                or task_d.get("wechat", state_data.get("wechat", False))
+            )
+            mg_done = (
+                not metadata_needed
+                or (isinstance(pcts, dict) and pcts.get("MG", 100.0) >= 100.0)
+            )
             base_done = (status == "完成") or (
                 isinstance(pcts, dict) and 
                 pcts.get("BR", 0.0) >= 100.0 and 
@@ -213,7 +221,7 @@ def check_all_completed(state_data: Any) -> bool:
             is_done = base_done and (
                 not wechat_enabled
                 or (isinstance(pcts, dict) and pcts.get("WX", 0.0) >= 100.0)
-            )
+            ) and mg_done
             if not is_done:
                 return False
         # Only return True if we found at least one actual task entry
@@ -947,13 +955,14 @@ def build_local_video_tasks(folder_path: str, videos: List[str]) -> Dict[str, An
             "title": safe_title,
             "duration": "未知",
             "status": "排队中 (TR)",
-            "pcts": {
+                "pcts": {
                 "DL": 100.0,
                 "TR": 0.0,
                 "TL": 0.0,
                 "MR": 0.0,
                 "BR": 0.0,
                 "GD": 0.0,
+                "MG": 0.0,
                 "BI": 0.0,
                 "WX": 0.0,
             },
@@ -1159,7 +1168,7 @@ def process_folder_mode(folder_path: str):
                 "title": meta.get("title", entry),
                 "duration": meta.get("duration", "未知"),
                 "status": "等待中",
-                "pcts": {"DL": 0.0, "TR": 0.0, "TL": 0.0, "MR": 0.0, "BR": 0.0, "GD": 0.0, "BI": 0.0, "WX": 0.0},
+                "pcts": {"DL": 0.0, "TR": 0.0, "TL": 0.0, "MR": 0.0, "BR": 0.0, "GD": 0.0, "MG": 0.0, "BI": 0.0, "WX": 0.0},
                 "workdir": sub_path,
                 "error": None,
                 "is_paused": False,
@@ -1586,7 +1595,7 @@ def main():
                     "title": title, "vid_id": vid_id, "uid": idx, "workdir": workdir,
                     "duration": format_duration(entry.get('duration')),
                     "status": "等待中", "error": None, "is_paused": False,
-                    "pcts": {"DL": 0.0, "TR": 0.0, "TL": 0.0, "MR": 0.0, "BR": 0.0, "GD": 0.0, "BI": 0.0, "WX": 0.0},
+                    "pcts": {"DL": 0.0, "TR": 0.0, "TL": 0.0, "MR": 0.0, "BR": 0.0, "GD": 0.0, "MG": 0.0, "BI": 0.0, "WX": 0.0},
                     "queued_stages": ["DL"]
                 }
 

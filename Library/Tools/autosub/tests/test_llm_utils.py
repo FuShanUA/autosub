@@ -72,14 +72,10 @@ class TestDashscopeGatewayFallback(unittest.TestCase):
         client.limiter = MagicMock()
         return client
 
-    def test_429_uses_configured_gateway_and_key(self):
+    def test_429_ignores_retired_gateway_configuration(self):
         client = self._make_client()
-        client._call_openai_compatible = MagicMock(
-            side_effect=[
-                Exception("API Error (Status 429): Too Many Requests"),
-                "fallback-ok",
-            ]
-        )
+        primary_error = Exception("API Error (Status 429): Too Many Requests")
+        client._call_openai_compatible = MagicMock(side_effect=primary_error)
         env = {
             "DASHSCOPE_FALLBACK_BASE_URL": (
                 "http://ai-gateway.example.net.cn/aliyun-bailian/v1/chat/completions"
@@ -89,27 +85,21 @@ class TestDashscopeGatewayFallback(unittest.TestCase):
         }
 
         with patch.dict(os.environ, env, clear=False):
-            result = client._execute_provider_call(
-                LLMProvider.DASHSCOPE,
-                "glm-5.3",
-                "hello",
-                "primary-key",
-            )
+            with self.assertRaises(Exception) as ctx:
+                client._execute_provider_call(
+                    LLMProvider.DASHSCOPE,
+                    "glm-5.3",
+                    "hello",
+                    "primary-key",
+                )
 
-        self.assertEqual(result, "fallback-ok")
-        self.assertEqual(client._call_openai_compatible.call_count, 2)
+        self.assertIn("Status 429", str(ctx.exception))
+        self.assertEqual(client._call_openai_compatible.call_count, 1)
         first_call = client._call_openai_compatible.call_args_list[0]
-        second_call = client._call_openai_compatible.call_args_list[1]
         self.assertEqual(
             first_call.args[2],
             "https://dashscope.aliyuncs.com/compatible-mode/v1",
         )
-        self.assertEqual(
-            second_call.args[2],
-            "http://ai-gateway.example.net.cn/aliyun-bailian/v1",
-        )
-        self.assertEqual(second_call.args[0], "glm-5.3")
-        self.assertEqual(second_call.args[3], "fallback-key")
 
     def test_gateway_is_not_used_without_configuration(self):
         client = self._make_client()
