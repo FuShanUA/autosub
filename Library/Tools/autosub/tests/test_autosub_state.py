@@ -2173,11 +2173,27 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         )
         self.assertEqual(
             bili_title,
-            "54岁的大本谈中年心态、每天上班与人生素材库",
+            "大本访谈：好莱坞一线男星的中年感悟",
         )
         self.assertEqual(
             autosub._fallback_wechat_title_from_bili_title(bili_title, 16),
-            "大本：人生成素材库",
+            "大本：人到中年的感悟",
+        )
+        self.assertFalse(
+            autosub._metadata_title_has_quality_issue(
+                bili_title,
+                source_title,
+                True,
+                description,
+            )
+        )
+        self.assertFalse(
+            autosub._metadata_title_has_quality_issue(
+                "大本：人到中年的感悟",
+                source_title,
+                True,
+                description,
+            )
         )
         self.assertEqual(
             autosub._fallback_interview_cover_title_from_description(
@@ -2226,7 +2242,16 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
                 max_chars=16,
                 form_title=form_title,
             ),
-            "大本：人生到第三节",
+            "大本：人到中年没杏生活",
+        )
+        self.assertEqual(
+            autosub._fallback_cover_title_from_subtitle(
+                subtitle_text,
+                form_title=form_title,
+                source_title="Ben Affleck interview",
+                description="54岁的Ben Affleck敞开谈中年心态。",
+            ),
+            "大本访谈：人一到50，就没性生活了",
         )
         self.assertEqual(
             autosub._anchor_cover_hook_with_context(
@@ -2284,11 +2309,14 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         self.assertIn("不要套用企业产品标题模板", title_prompt)
         self.assertIn("Ben Affleck 用「大本」", title_prompt)
         self.assertIn("至少 3 个候选使用原话钩子", title_prompt)
+        self.assertIn("顿号并列关键词不是自然编辑标题", title_prompt)
+        self.assertIn("频道或栏目名是可选信号", title_prompt)
         self.assertIn("优先 20-40 个字符", title_prompt)
         self.assertIn("人物访谈", cover_prompt)
         self.assertIn("人生阶段、通勤上班、素材库", cover_prompt)
         self.assertIn("单一谣言或八卦事件", cover_prompt)
         self.assertIn("例如「大本」", cover_prompt)
+        self.assertIn("人一到50，就没性生活了", cover_prompt)
 
     def test_wechat_hook_fallback_derives_short_title_from_bili_title(self):
         """The Palantir title can yield a 16-character WeChat hook offline."""

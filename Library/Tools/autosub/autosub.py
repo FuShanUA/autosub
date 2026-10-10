@@ -904,7 +904,7 @@ _INTERVIEW_TITLE_MARKERS = (
     "访谈", "专访", "对话", "受访", "敞开谈", "interview",
 )
 _INTERVIEW_LIFE_STAGE_MARKERS = (
-    "中年", "50岁", "54岁", "人生", "第三节", "苦短",
+    "中年", "50岁", "54岁", "人生", "第三节", "苦短", "人一到50",
 )
 _INTERVIEW_REPRESENTATIVE_HOOK_MARKERS = (
     "上班", "素材库", "遗憾", "无所谓", "性生活", "杏生活", "第三节", "苦短",
@@ -939,6 +939,14 @@ _PROPER_NOUN_TITLE_ALIASES = {
     "San Francisco": ("旧金山",),
 }
 
+_INTERVIEW_PUBLIC_IDENTITY_LABELS = {
+    "Ben Affleck": "好莱坞一线男星",
+    "Alex Karp": "Palantir CEO",
+    "Peter Thiel": "硅谷投资人",
+    "Marc Andreessen": "硅谷投资人",
+    "Andrej Karpathy": "AI研究员",
+}
+
 
 def _is_interview_title_context(*contexts):
     """Detect a person interview instead of a product or business explainer."""
@@ -959,6 +967,15 @@ def _is_interview_title_context(*contexts):
     )
     has_person = (
         any(person.casefold() in text for person in _INTERVIEW_KNOWN_PEOPLE)
+        or any(
+            alias in text
+            for targets in _PROPER_NOUN_TITLE_ALIASES.values()
+            for alias in targets
+        )
+        or any(
+            label in text
+            for label in _INTERVIEW_PUBLIC_IDENTITY_LABELS.values()
+        )
         or any(marker in text for marker in _INTERVIEW_PERSON_ROLE_MARKERS)
     )
     return (
@@ -1426,6 +1443,30 @@ def _title_scoring_tokens(value):
             compact[index:index + 2]
             for index in range(len(compact) - 1)
         )
+    # A Chinese public nickname must count as coverage of the English name in
+    # the source description. Otherwise good titles such as "大本" are rejected
+    # for having no lexical overlap with "Ben Affleck".
+    for source, targets in _PROPER_NOUN_TITLE_ALIASES.items():
+        source_value = str(source or "").strip().casefold()
+        if not source_value or source_value not in normalized:
+            continue
+        for target in targets or ():
+            target_runs = re.findall(
+                r"[\u3400-\u9fff]+",
+                str(target or ""),
+            )
+            for run in target_runs:
+                compact = "".join(
+                    char
+                    for char in run
+                    if char not in _TITLE_CJK_FUNCTION_CHARS
+                )
+                if len(compact) == 1:
+                    tokens.add(compact)
+                tokens.update(
+                    compact[index:index + 2]
+                    for index in range(len(compact) - 1)
+                )
     return tokens
 
 
@@ -1543,6 +1584,15 @@ def _metadata_title_lacks_mainline_coverage(title, description):
     ]
     if len(sentences) < 2:
         return False
+    if _is_interview_title_context(title, description):
+        # Editorial interview titles compress a whole-person arc into a short
+        # judgment. Requiring 55% token coverage pushes them toward keyword
+        # concatenation instead of a readable sentence.
+        coverage = _title_reference_coverage(title, description)
+        return not (
+            coverage >= 0.12
+            and _interview_title_quality_score(title) >= 8.0
+        )
     strongest_sentence_coverage = max(
         _title_reference_coverage(title, sentence)
         for sentence in sentences
@@ -1757,12 +1807,18 @@ def _generate_title_from_description(
             "本视频是人物访谈或人物特写，不要套用企业产品标题模板。"
             "先给人物一个公众可识别的中文称呼，优先用通行译名或熟知绰号，"
             "例如 Ben Affleck 用「大本」；无法确认时才保留英文全名。"
-            "标题优先写成「栏目/访谈+人物：人生阶段或处境+代表性判断」，"
+            "标题优先写成「人物/访谈：公众身份或人生阶段+代表性判断」，"
             "后半句可以来自全片最有代表性的原话或最小复述。"
             "表单标题仍要概括全片：选择贯穿访谈的中年处境、家庭、职业选择"
             "和情绪主线，不要把父母离世、谣言或单一新闻事件放到主位。"
             "至少 3 个候选使用原话钩子，至少 3 个候选用编辑总结；"
             "反复比较哪一句最能代表整场访谈，直到你对候选感到骄傲。"
+            "只学下面结构，不复制事实："
+            "「大本访谈：好莱坞一线男星的中年感悟」；"
+            "「大本访谈：人生苦短，每天上班的感觉好极了」。"
+            "反例是「54岁的大本谈中年心态、每天上班与人生素材库」，"
+            "这种顿号并列关键词不是自然编辑标题。"
+            "频道或栏目名是可选信号：有公众辨识度才写，没有就不硬凑。"
             "人物访谈不适用上文的核心业务、产品和受益者优先级；"
             "完整人物身份、人生阶段和代表性金句就是实质信息点。"
         )
@@ -1955,6 +2011,8 @@ def _generate_structured_title_from_description(
             "beneficiary 可为空；object 可写人生、中年、家庭或职业选择；"
             "second_claim 优先用全片代表性原话或最小复述。"
             "不要强行套用企业客户、核心业务或产品对象。"
+            "候选必须是自然短句，不得用顿号并列「中年、上班、素材库」"
+            "这类关键词。"
         )
     base_prompt = (
         "把视频简介和完整中文字幕概括成B站表单标题。"
@@ -2409,6 +2467,7 @@ def _derive_wechat_title_from_bili_title(
             "例如「大本」，不要保留英文全名。"
             "16 字内优先写「人物+人生阶段+代表性金句」，"
             "例如「大本：人生到第三节」这类结构。"
+            "也可以用「大本：人到中年没杏生活」这类完整短句。"
             "不要把单一八卦事件、父母离世或谣言当成视频号标题主体；"
             "这些只能作为次要信息，且通常放不下。"
         )
@@ -2615,6 +2674,10 @@ def _generate_cover_title_from_full_subtitle(
             "钩子必须锚定人物，优先用公众熟知绰号，例如「大本」。"
             "先比较 8-12 个原话，再判断哪一句最能代表整场访谈，"
             "不要只按猎奇程度选择。"
+            "只学结构，不复制事实："
+            "「大本访谈：人一到50，就没性生活了」优于"
+            "「大本访谈：活得够久，人生成了素材库」，"
+            "因为前者是具体、可传播且贴住中年主线的原话。"
         )
 
     base_prompt = (
@@ -3193,6 +3256,8 @@ def _subtitle_hook_score(value):
         marker in value
         for marker in _SUBTITLE_HOOK_MARKERS
     )
+    if any(marker in value for marker in ("性生活", "杏生活")):
+        score += 55.0
     score += 4.0 * sum(marker in value for marker in ("被", "没了", "断了"))
     score -= 10.0 * sum(marker in value for marker in _GENERIC_TITLE_MARKERS)
     if re.search(r"[?？]$", value):
@@ -3307,6 +3372,8 @@ def _fallback_interview_wechat_title_from_subtitle(
             continue
         if "第三节" in cleaned:
             hook = "人生到第三节"
+        elif "性生活" in cleaned or "杏生活" in cleaned:
+            hook = "人到中年没杏生活"
         elif "快到头" in cleaned:
             hook = "人生快到头"
         elif "上班" in cleaned:
@@ -3325,6 +3392,8 @@ def _fallback_interview_wechat_title_from_subtitle(
         )
         if "第三节" in hook:
             hook_score += 8.0
+        if "杏生活" in hook or "性生活" in hook:
+            hook_score += 20.0
         if "素材库" in hook:
             hook_score += 6.0
         if "快到头" in hook:
@@ -3476,7 +3545,11 @@ def _fallback_cover_title_from_subtitle(
         description_hook,
         form_title,
     ):
-        candidates.append((140.0, description_hook))
+        # A saved summary hook is one candidate, not an override. A direct
+        # transcript quote can be more specific and easier to spread.
+        candidates.append(
+            (_subtitle_hook_score(description_hook) + 12.0, description_hook)
+        )
     consequence_cover = _fallback_consequence_cover_title(subtitle_text)
     if consequence_cover and not _cover_title_repeats_form_title(
         consequence_cover,
@@ -3685,8 +3758,25 @@ def _description_fallback_subject(description, prefer_company=False):
     return ""
 
 
+def _interview_public_identity_label(subject, description):
+    """Use a stable public identity when the audience knows the person."""
+    subject_value = str(subject or "").strip().casefold()
+    description_value = str(description or "").casefold()
+    for person, label in _INTERVIEW_PUBLIC_IDENTITY_LABELS.items():
+        person_value = str(person or "").strip().casefold()
+        if (
+            person_value == subject_value
+            or (
+                person_value in description_value
+                and subject_value in person_value
+            )
+        ):
+            return label
+    return ""
+
+
 def _fallback_interview_bili_title_from_description(description, max_chars):
-    """Summarize a person interview without promoting one news event."""
+    """Write a readable person-interview summary, not a keyword list."""
     value = re.sub(r"\s+", " ", str(description or "")).strip()
     if not value or not _is_interview_title_context(value):
         return ""
@@ -3709,32 +3799,32 @@ def _fallback_interview_bili_title_from_description(description, max_chars):
         )
         if dialog_match:
             subject = dialog_match.group(1).strip()
+    raw_subject = subject
     subject = _apply_preferred_title_aliases(subject, max_chars)
     if not subject:
         return ""
 
-    claims = []
     compact_value = re.sub(r"\s+", "", value)
+    judgment = ""
     if "中年" in compact_value:
-        claims.append("中年心态")
-    if "上班" in compact_value:
-        claims.append("每天上班")
-    if "素材库" in compact_value:
-        claims.append("人生素材库")
-    if "孩子" in compact_value and len(claims) < 3:
-        claims.append("陪孩子")
-    if len(claims) < 2:
+        judgment = "中年感悟"
+    elif "人生" in compact_value:
+        judgment = "人生感悟"
+    elif "复杂的一年" in compact_value:
+        judgment = "复杂一年"
+    if not judgment:
         return ""
 
-    prefix = f"{age}的{subject}谈" if age else f"{subject}谈"
-    body = "、".join(claims[:3])
-    if len(claims) > 1:
-        body = claims[0] + "、" + "与".join(claims[1:3])
-    candidate = normalize_bili_upload_title(
-        f"{prefix}{body}",
-        max_chars=max_chars,
-    )
-    return candidate
+    identity = _interview_public_identity_label(raw_subject, value)
+    if identity:
+        candidate = f"{subject}访谈：{identity}的{judgment}"
+    else:
+        candidate = f"{subject}访谈：{judgment}"
+        if len(candidate) < 12 and age:
+            candidate = f"{subject}访谈：{age}的{judgment}"
+        elif len(candidate) < 12 and "复杂的一年" in compact_value:
+            candidate = f"{subject}访谈：复杂一年的{judgment}"
+    return normalize_bili_upload_title(candidate, max_chars=max_chars)
 
 
 def _description_cover_subject(source_title, description):
@@ -4015,8 +4105,10 @@ def _fallback_wechat_title_from_bili_title(bili_title, max_chars):
         hook = ""
         if "素材库" in compact_value:
             hook = "人生成素材库"
+        elif "人生感悟" in compact_value:
+            hook = "人到中年的感悟"
         elif "中年" in compact_value:
-            hook = "人到中年"
+            hook = "人到中年的感悟" if "感悟" in compact_value else "人到中年"
         elif "上班" in compact_value:
             hook = "每天上班"
         if subject and hook:
