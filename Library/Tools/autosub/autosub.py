@@ -265,10 +265,15 @@ BILI_COOKIES = os.path.join(
     os.path.dirname(os.path.dirname(BILI_SCRIPT)), "assets", "cookies.json"
 )
 BILI_VIDEO_EXTS = ('.mp4', '.mkv', '.webm', '.mov', '.ts')
-WECHAT_SCRIPT = os.path.expanduser("~/.codex/skills/wechat-channel-uploader/scripts/wechat_upload.py")
-WECHAT_BROWSER_DATA_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(WECHAT_SCRIPT)), "assets", "browser_data"
+WECHAT_SCRIPT = os.path.join(
+    CURRENT_DIR, "wechat-channel-uploader", "scripts", "wechat_upload.py"
 )
+# Keep the existing logged-in profile when the uploader moves into this repo.
+WECHAT_BROWSER_DATA_DIR = os.environ.get(
+    "WECHAT_BROWSER_DATA_DIR",
+    os.path.expanduser("~/.codex/skills/wechat-channel-uploader/assets/browser_data"),
+)
+os.environ["WECHAT_BROWSER_DATA_DIR"] = WECHAT_BROWSER_DATA_DIR
 SHARED_UPLOAD_TITLE_MAX_CHARS = 16
 BILI_UPLOAD_TITLE_MAX_CHARS = 48
 BILI_UPLOAD_TITLE_HARD_MAX_CHARS = 80
