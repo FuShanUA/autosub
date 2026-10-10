@@ -66,6 +66,7 @@ _COVER_TITLE = (255, 255, 255)
 _COVER_SHADOW = (255, 255, 255)
 _TITLE_CENTER_Y_RATIO = 0.62
 _MIN_FRAME_BRIGHTNESS = 40.0
+_MIN_FALLBACK_FRAME_BRIGHTNESS = 8.0
 _SAMPLE_FRAME_COUNT = 16
 
 
@@ -191,11 +192,22 @@ def _image_brightness(image: Image.Image) -> float:
 
 
 def _frame_is_usable(path: str) -> bool:
-    """Reject tiny files and dark frames before they can become black covers."""
+    """Whether a frame is bright enough to be preferred for a cover."""
+    try:
+        return (
+            _frame_is_valid(path)
+            and _frame_brightness(path) >= _MIN_FRAME_BRIGHTNESS
+        )
+    except Exception:
+        return False
+
+
+def _frame_is_valid(path: str) -> bool:
+    """Reject corrupt, tiny, and near-black frames before cover generation."""
     try:
         if not os.path.isfile(path) or os.path.getsize(path) < 3000:
             return False
-        return _frame_brightness(path) >= _MIN_FRAME_BRIGHTNESS
+        return _frame_brightness(path) >= _MIN_FALLBACK_FRAME_BRIGHTNESS
     except Exception:
         return False
 
@@ -348,8 +360,8 @@ def _sample_video_frames(
     """Sample a bounded set of timestamps instead of scanning the whole video.
 
     A whole-video low-fps scan can exceed its timeout on long files. Seeking a
-    fixed number of timestamps keeps runtime bounded and avoids the fallback
-    path that previously produced a black cover.
+    fixed number of timestamps keeps runtime bounded. Dim but visible frames
+    are retained so dark videos can still get a subject-aware cover.
     """
     if duration and duration > 0:
         start = duration * 0.05
@@ -390,7 +402,7 @@ def _sample_video_frames(
             )
         except Exception:
             continue
-        if _frame_is_usable(candidate):
+        if _frame_is_valid(candidate):
             frames.append((max(0.0, timestamp), candidate))
     return frames
 
@@ -444,7 +456,7 @@ def extract_best_frame(video_path: str, output_path: str) -> str:
                     timeout=25,
                     check=False,
                 )
-                extracted = _frame_is_usable(full_frame)
+                extracted = _frame_is_valid(full_frame)
             except Exception:
                 extracted = False
 
@@ -911,7 +923,7 @@ def _choose_source_frame(
         return source_path
 
     existing = find_existing_frame(video_path)
-    if existing and not _frame_is_usable(existing):
+    if existing and not _frame_is_valid(existing):
         existing = None
     extract_best_frame(video_path, temporary_path)
     if existing:
@@ -1047,7 +1059,7 @@ def generate_cover(
         return output_path
 
     source = _load_source_frame(video_path, source_path)
-    if _image_brightness(source) < _MIN_FRAME_BRIGHTNESS:
+    if _image_brightness(source) < _MIN_FALLBACK_FRAME_BRIGHTNESS:
         raise RuntimeError("cover source frame is too dark")
     centering = _centering_for_faces(source.size, size, _face_bboxes(source))
     cover = ImageOps.fit(

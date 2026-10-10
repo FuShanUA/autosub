@@ -16,6 +16,7 @@ from PIL import Image, ImageFont
 
 from cover_utils import (
     _COVER_STYLE_VERSION,
+    _frame_brightness,
     _frame_is_usable,
     _sample_video_frames,
     cover_output_path,
@@ -85,20 +86,42 @@ class TestCoverUtils(unittest.TestCase):
             self.assertNotIn("-i", args[: args.index("-ss")])
             self.assertNotIn("fps=", args)
 
-    def test_extract_best_frame_fails_when_all_candidates_are_dark(self):
-        dark = os.path.join(self.temp_dir, "dark.jpg")
-        Image.new("RGB", (2000, 2000), (0, 0, 0)).save(dark, "JPEG")
+    def test_extract_best_frame_fails_when_all_candidates_are_black(self):
+        black = os.path.join(self.temp_dir, "black.jpg")
+        Image.new("RGB", (2000, 2000), (0, 0, 0)).save(black, "JPEG")
         output = os.path.join(self.temp_dir, "best.jpg")
 
         with patch.object(cover_utils, "_find_ffmpeg", return_value="ffmpeg"), patch.object(
             cover_utils, "_video_duration_seconds", return_value=100.0
         ), patch.object(
-            cover_utils, "_sample_video_frames", return_value=[(10.0, dark)]
+            cover_utils, "_sample_video_frames", return_value=[(10.0, black)]
         ):
             with self.assertRaisesRegex(RuntimeError, "bright enough"):
                 cover_utils.extract_best_frame("/tmp/video.mp4", output)
 
-    def test_generate_cover_rejects_dark_explicit_source(self):
+    def test_extract_best_frame_uses_dim_candidate_when_no_bright_frames(self):
+        dim = os.path.join(self.temp_dir, "dim.jpg")
+        Image.new("RGB", (2000, 2000), (20, 20, 20)).save(dim, "JPEG")
+        output = os.path.join(self.temp_dir, "best.jpg")
+        completed = type("CompletedProcess", (), {"returncode": 0})()
+
+        def fake_run(args, **kwargs):
+            shutil.copyfile(dim, args[9])
+            return completed
+
+        with patch.object(cover_utils, "_find_ffmpeg", return_value="ffmpeg"), patch.object(
+            cover_utils, "_video_duration_seconds", return_value=100.0
+        ), patch.object(
+            cover_utils, "_sample_video_frames", return_value=[(10.0, dim)]
+        ), patch.object(cover_utils, "subprocess") as subprocess_mock:
+            subprocess_mock.run.side_effect = fake_run
+            result = cover_utils.extract_best_frame("/tmp/video.mp4", output)
+
+        self.assertEqual(result, output)
+        self.assertGreaterEqual(_frame_brightness(output), 8.0)
+        self.assertLess(_frame_brightness(output), 40.0)
+
+    def test_generate_cover_rejects_black_explicit_source(self):
         dark = os.path.join(self.temp_dir, "dark-source.jpg")
         Image.new("RGB", (2000, 2000), (0, 0, 0)).save(dark, "JPEG")
         output = os.path.join(self.temp_dir, "cover.jpg")
@@ -110,6 +133,21 @@ class TestCoverUtils(unittest.TestCase):
                 "Palantir FDE",
                 source_path=dark,
             )
+
+    def test_generate_cover_accepts_dim_explicit_source(self):
+        dim = os.path.join(self.temp_dir, "dim-source.jpg")
+        Image.new("RGB", (2000, 2000), (20, 20, 20)).save(dim, "JPEG")
+        output = os.path.join(self.temp_dir, "cover.jpg")
+
+        result = generate_cover(
+            "/tmp/does-not-exist.mp4",
+            output,
+            "Palantir数据层",
+            source_path=dim,
+        )
+
+        self.assertEqual(result, output)
+        self.assertGreaterEqual(_frame_brightness(output), 8.0)
 
     def test_more_faces_win_even_when_each_face_is_smaller(self):
         one_large_face = [(760, 240, 400, 400)]
