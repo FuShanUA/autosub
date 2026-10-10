@@ -42,7 +42,7 @@ _PLATFORM_ALIASES = {
     "wx": "wechat",
 }
 
-_COVER_STYLE_VERSION = "kaiti-alliance-hard-shadow-lower-card-v11"
+_COVER_STYLE_VERSION = "kaiti-alliance-hard-shadow-lower-card-v12"
 _FONT_FALLBACKS = (
     os.path.join(os.path.dirname(__file__), "fonts", "LXGWWenKai-Medium.ttf"),
     "/Users/shanfu/Library/Fonts/LXGWWenKai-Medium.ttf",
