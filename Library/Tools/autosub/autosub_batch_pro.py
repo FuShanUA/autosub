@@ -1044,6 +1044,32 @@ class BatchEngine:
         except Exception as e:
             logger.error(f"Error during child cleanup: {e}")
 
+    def shutdown(self):
+        """Stop children, normalize active task state, then persist it.
+
+        Saving before killing children used to leave "running" statuses behind
+        when the Launcher was closed manually. Those statuses then looked live
+        after restart even though no process existed.
+        """
+        self.abort = True
+        self.kill_children()
+
+        deadline = time.time() + 2.0
+        while self.active_workers and time.time() < deadline:
+            time.sleep(0.05)
+
+        with self.lock:
+            for task in self.task_map.values():
+                if not task.status.startswith("运行中"):
+                    continue
+                stage = task.status[3:].strip()
+                if stage.startswith("(") and stage.endswith(")"):
+                    stage = stage[1:-1]
+                task.status = f"排队中 ({stage})" if stage else "排队中"
+                task.pid = None
+                task.error = None
+        self.save_state()
+
     def save_state(self):
         with self.lock:
             # 兼容 Launcher 格式：如果是 dict 形式的 map
@@ -2832,8 +2858,9 @@ def main():
             engine.task_map = filtered_map
             logger.info(f"Final task count: {len(engine.task_map)}")
 
-    atexit.register(engine.save_state) # 确保异常或正常退出时保存状态
-    atexit.register(engine.kill_children) # 退出时杀掉所有子进程，防止孤儿进程
+    # One shutdown hook must kill children before saving; otherwise active task
+    # statuses are persisted as "running" after a manual Launcher exit.
+    atexit.register(engine.shutdown)
 
     # 2. 物理真相全量同步 (启动瞬间完成)
     engine.full_physical_sync()

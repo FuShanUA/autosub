@@ -124,6 +124,7 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
 
         gui = autosub_gui.AutoSubGUI.__new__(autosub_gui.AutoSubGUI)
         gui.root = SimpleNamespace(after=lambda _delay, callback: callback())
+        gui._upload_abort = threading.Event()
         gui.notebook = SimpleNamespace(select=lambda: None)
         gui.start_btn = SimpleNamespace(config=lambda **_kwargs: None)
         gui.upload_btn = SimpleNamespace(config=lambda **_kwargs: None)
@@ -4278,6 +4279,45 @@ class TestUploadWatchdogAndProcessTree(unittest.TestCase):
                 **kwargs,
             )
         return ok, logs, pcts, killed
+
+    def test_upload_runner_reports_process_lifecycle(self):
+        """GUI can register canonical uploader children for stop and pause."""
+        started, ended = [], []
+        ok = autosub._run_upload_cmd(
+            [sys.executable, "-u", "-c", "print('上传进度: 100%', flush=True)"],
+            "WeChat",
+            r'(?:Progress|上传进度):\s*([\d.]+)%',
+            on_process_start=started.append,
+            on_process_end=ended.append,
+        )
+        self.assertTrue(ok)
+        self.assertEqual(len(started), 1)
+        self.assertEqual(ended, started)
+
+    def test_shutdown_requeues_running_tasks_after_manual_exit(self):
+        """Closing the Launcher must not persist phantom running tasks."""
+        task = SubTask(
+            uid=11,
+            url="http://test.com",
+            title="Video 11",
+            status="运行中 (MG)",
+            pcts={
+                "DL": 100.0, "TR": 100.0, "TL": 100.0, "MR": 100.0,
+                "BR": 100.0, "GD": 100.0, "MG": 50.0, "BI": 0.0, "WX": 0.0,
+            },
+        )
+        engine = self._engine()
+        engine.task_map[task.uid] = task
+
+        with patch.object(BatchEngine, "kill_children", lambda self: None):
+            engine.shutdown()
+
+        self.assertEqual(task.status, "排队中 (MG)")
+        self.assertIsNone(task.pid)
+        self.assertIsNone(task.error)
+        with open(engine.state_file, "r", encoding="utf-8") as handle:
+            state = json.load(handle)
+        self.assertEqual(state["11"]["status"], "排队中 (MG)")
 
     # --- autosub._run_upload_cmd watchdog ---
 

@@ -594,6 +594,8 @@ def _run_upload_cmd(
     on_progress=None,
     on_log=None,
     abort_flag=None,
+    on_process_start=None,
+    on_process_end=None,
     stall_timeout=UPLOAD_STALL_TIMEOUT,
     silence_timeout=UPLOAD_SILENCE_TIMEOUT,
 ):
@@ -615,100 +617,115 @@ def _run_upload_cmd(
             on_log(f"❌ Failed to start {label} upload: {e}")
         return False
 
-    if p.stdout:
-        import queue as _queue
-        import threading as _threading
-        _line_q: _queue.Queue = _queue.Queue()
-        _reader_stop = _threading.Event()
+    if on_process_start:
+        try:
+            on_process_start(p)
+        except Exception as e:
+            if on_log:
+                on_log(f"⚠️ Failed to register {label} process: {e}")
 
-        def _stdout_reader():
-            try:
-                for line in p.stdout:
-                    if _reader_stop.is_set(): break
-                    _line_q.put(line)
-            except Exception:
-                pass
-            finally:
-                _line_q.put(None)
+    try:
+        if p.stdout:
+            import queue as _queue
+            import threading as _threading
+            _line_q: _queue.Queue = _queue.Queue()
+            _reader_stop = _threading.Event()
 
-        _rt = _threading.Thread(target=_stdout_reader, daemon=True)
-        _rt.start()
+            def _stdout_reader():
+                try:
+                    for line in p.stdout:
+                        if _reader_stop.is_set(): break
+                        _line_q.put(line)
+                except Exception:
+                    pass
+                finally:
+                    _line_q.put(None)
 
-        started = time.time()
-        state = {"output": started, "advance": started, "pct": -1.0}
+            _rt = _threading.Thread(target=_stdout_reader, daemon=True)
+            _rt.start()
 
-        def _handle(line):
-            state["output"] = time.time()
-            stripped = line.strip()
-            if stripped and on_log:
-                on_log(stripped)
-            m = re.search(progress_pattern, line)
-            if not m:
-                return
-            pct = float(m.group(1))
-            if pct > state["pct"]:
-                state["pct"] = pct
-                state["advance"] = time.time()
-            if on_progress:
-                on_progress(pct)
+            started = time.time()
+            state = {"output": started, "advance": started, "pct": -1.0}
 
-        def _stall_reason():
-            now = time.time()
-            if silence_timeout and now - state["output"] > silence_timeout:
-                return f"no output for {int(now - state['output'])}s"
-            if stall_timeout and now - state["advance"] > stall_timeout:
-                return f"stuck at {max(state['pct'], 0.0):.1f}% for {int(now - state['advance'])}s"
-            return None
+            def _handle(line):
+                state["output"] = time.time()
+                stripped = line.strip()
+                if stripped and on_log:
+                    on_log(stripped)
+                m = re.search(progress_pattern, line)
+                if not m:
+                    return
+                pct = float(m.group(1))
+                if pct > state["pct"]:
+                    state["pct"] = pct
+                    state["advance"] = time.time()
+                if on_progress:
+                    on_progress(pct)
 
-        while True:
-            if abort_flag and abort_flag():
-                kill_proc_tree(p)
-                _reader_stop.set()
-                break
-            # Checked every iteration, not only when the queue runs dry: the
-            # WeChat uploader can print a polling line continuously while the
-            # percentage never moves, and a queue-timeout-only check would then
-            # never fire.
-            if p.poll() is None:
-                reason = _stall_reason()
-                if reason:
-                    if on_log:
-                        on_log(f"⏱️ Watchdog: {label} upload {reason}; killing process tree and retrying")
+            def _stall_reason():
+                now = time.time()
+                if silence_timeout and now - state["output"] > silence_timeout:
+                    return f"no output for {int(now - state['output'])}s"
+                if stall_timeout and now - state["advance"] > stall_timeout:
+                    return f"stuck at {max(state['pct'], 0.0):.1f}% for {int(now - state['advance'])}s"
+                return None
+
+            while True:
+                if abort_flag and abort_flag():
                     kill_proc_tree(p)
                     _reader_stop.set()
                     break
-            try:
-                line = _line_q.get(timeout=1.0)
-            except Exception:
-                if p.poll() is not None:
-                    while True:
-                        try:
-                            line = _line_q.get(timeout=0.5)
-                        except Exception:
-                            break
-                        if line is None: break
-                        _handle(line)
-                    break
-                continue
-            if line is None: break
-            _handle(line)
+                # Checked every iteration, not only when the queue runs dry: the
+                # WeChat uploader can print a polling line continuously while the
+                # percentage never moves, and a queue-timeout-only check would then
+                # never fire.
+                if p.poll() is None:
+                    reason = _stall_reason()
+                    if reason:
+                        if on_log:
+                            on_log(f"⏱️ Watchdog: {label} upload {reason}; killing process tree and retrying")
+                        kill_proc_tree(p)
+                        _reader_stop.set()
+                        break
+                try:
+                    line = _line_q.get(timeout=1.0)
+                except Exception:
+                    if p.poll() is not None:
+                        while True:
+                            try:
+                                line = _line_q.get(timeout=0.5)
+                            except Exception:
+                                break
+                            if line is None: break
+                            _handle(line)
+                        break
+                    continue
+                if line is None: break
+                _handle(line)
 
-        # Reap first so the reader thread reaches EOF on its own, then release
-        # the pipe. Leaving it open leaks one descriptor per upload for the
-        # whole life of the engine.
-        p.wait()
-        _reader_stop.set()
-        _rt.join(timeout=2)
-        try:
-            p.stdout.close()
-        except Exception:
-            pass
-    else:
-        p.wait()
-    return p.returncode == 0
+            # Reap first so the reader thread reaches EOF on its own, then release
+            # the pipe. Leaving it open leaks one descriptor per upload for the
+            # whole life of the engine.
+            p.wait()
+            _reader_stop.set()
+            _rt.join(timeout=2)
+            try:
+                p.stdout.close()
+            except Exception:
+                pass
+        else:
+            p.wait()
+        return p.returncode == 0
+    finally:
+        if on_process_end:
+            try:
+                on_process_end(p)
+            except Exception:
+                pass
 
 
 def run_bili_cmd(cmd, on_progress=None, on_log=None, abort_flag=None,
+                 on_process_start=None, on_process_end=None,
                  stall_timeout=UPLOAD_STALL_TIMEOUT,
                  silence_timeout=UPLOAD_SILENCE_TIMEOUT):
     """Run a pre-built Bilibili upload command. Returns True on success.
@@ -721,6 +738,8 @@ def run_bili_cmd(cmd, on_progress=None, on_log=None, abort_flag=None,
         on_progress=on_progress,
         on_log=on_log,
         abort_flag=abort_flag,
+        on_process_start=on_process_start,
+        on_process_end=on_process_end,
         stall_timeout=stall_timeout,
         silence_timeout=silence_timeout,
     )
@@ -4315,6 +4334,7 @@ def build_wechat_cmd(
     return cmd
 
 def run_wechat_cmd(cmd, on_progress=None, on_log=None, abort_flag=None,
+                   on_process_start=None, on_process_end=None,
                    stall_timeout=UPLOAD_STALL_TIMEOUT,
                    silence_timeout=UPLOAD_SILENCE_TIMEOUT):
     """Run a pre-built WeChat Channels upload command. Returns True on success."""
@@ -4325,6 +4345,8 @@ def run_wechat_cmd(cmd, on_progress=None, on_log=None, abort_flag=None,
         on_progress=on_progress,
         on_log=on_log,
         abort_flag=abort_flag,
+        on_process_start=on_process_start,
+        on_process_end=on_process_end,
         stall_timeout=stall_timeout,
         silence_timeout=silence_timeout,
     )

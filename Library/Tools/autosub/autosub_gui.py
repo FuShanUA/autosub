@@ -356,6 +356,7 @@ class AutoSubGUI:
         self.key_editor_env_key = self.vendor_env_keys.get(self.key_editor_vendor, "VERTEX_SA_KEY_PATH")
         self.current_processes = []
         self._process_lock = threading.Lock()
+        self._upload_abort = threading.Event()
         self.last_was_progress = False
         self.is_paused = False
         self.task_history = []
@@ -1027,6 +1028,7 @@ class AutoSubGUI:
         for proc in self._running_processes():
             try: ProcessTree.kill(proc.pid)
             except Exception: pass
+        self._upload_abort.clear()
 
         # Robust Mapping for Localized Values
         trans_mode_map = {"平衡模式 (Balanced)": "balanced", "意译模式 (Paraphrase)": "paraphrase", "balanced": "balanced", "paraphrase": "paraphrase"}
@@ -1082,6 +1084,7 @@ class AutoSubGUI:
         self.progress_var.set(0)
         self.status_label.config(text="📤 正在准备上传...")
         self.log_text.config(state="normal"); self.log_text.delete(1.0, tk.END); self.log_text.config(state="disabled")
+        self._upload_abort.clear()
 
         py_exe = sys.executable
         venv_py = os.path.join(CURRENT_DIR, ".venv", "bin", "python" if sys.platform != "win32" else "python.exe")
@@ -1231,33 +1234,77 @@ class AutoSubGUI:
 
                 upload_results = {}
                 upload_threads = []
+                upload_results_lock = threading.Lock()
 
                 def run_upload(label, ucmd, marker):
                     _persist(f"{label} 开始上传...")
                     proc = None
                     upload_ok = False
                     output_lines = []
-                    try:
-                        proc = subprocess.Popen(
-                            ucmd,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT,
-                            text=True,
-                            encoding="utf-8",
-                            errors="replace",
-                            bufsize=1,
+
+                    def on_log(line):
+                        stripped = str(line).strip()
+                        if not stripped:
+                            return
+                        output_lines.append(stripped)
+                        if len(output_lines) > 300:
+                            output_lines.pop(0)
+                        _persist(f"{label} {stripped}")
+
+                    def on_progress(pct):
+                        self.root.after(
+                            0,
+                            lambda p=pct: self.status_label.config(
+                                text=f"📤 {label} {p:.0f}%"
+                            ),
                         )
-                        self._register_process(proc)
-                        if proc.stdout:
-                            for line in proc.stdout:
-                                output_lines.append(line.strip())
-                                if len(output_lines) > 300:
-                                    output_lines.pop(0)
-                                _persist(f"{label} {line.strip()}")
-                        proc.wait()
-                        upload_ok = proc.returncode == 0
+
+                    def register_upload_process(child):
+                        nonlocal proc
+                        proc = child
+                        self._register_process(child)
+
+                    try:
+                        if marker == ".bili_uploaded":
+                            from autosub import run_bili_cmd
+                            upload_ok = run_bili_cmd(
+                                ucmd,
+                                on_progress=on_progress,
+                                on_log=on_log,
+                                abort_flag=self._upload_abort.is_set,
+                                on_process_start=register_upload_process,
+                                on_process_end=self._unregister_process,
+                            )
+                        elif marker == ".wechat_uploaded":
+                            from autosub import run_wechat_cmd
+                            upload_ok = run_wechat_cmd(
+                                ucmd,
+                                on_progress=on_progress,
+                                on_log=on_log,
+                                abort_flag=self._upload_abort.is_set,
+                                on_process_start=register_upload_process,
+                                on_process_end=self._unregister_process,
+                            )
+                        else:
+                            proc = subprocess.Popen(
+                                ucmd,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT,
+                                text=True,
+                                encoding="utf-8",
+                                errors="replace",
+                                bufsize=1,
+                            )
+                            self._register_process(proc)
+                            if proc.stdout:
+                                for line in proc.stdout:
+                                    on_log(line)
+                            proc.wait()
+                            upload_ok = proc.returncode == 0
+
+                        exit_code = proc.returncode if proc is not None else (0 if upload_ok else 1)
                         mark = "✅" if upload_ok else "⚠️"
-                        _persist(f"{label} {mark} 上传结束 (code={proc.returncode})")
+                        _persist(f"{label} {mark} 上传结束 (code={exit_code})")
                         if not upload_ok:
                             from autosub import get_upload_login_failure_hint
                             login_hint = get_upload_login_failure_hint(
@@ -1278,13 +1325,14 @@ class AutoSubGUI:
                     finally:
                         if proc is not None:
                             self._unregister_process(proc)
-                    upload_results[label] = upload_ok
+                    with upload_results_lock:
+                        upload_results[label] = upload_ok
                     return upload_ok
 
                 def start_upload_job(label, ucmd, marker):
                     self.root.after(
                         0,
-                        lambda: self.status_label.config(text="📤 正在上传..."),
+                        lambda: self.status_label.config(text=f"📤 {label} 上传中..."),
                     )
                     thread = threading.Thread(
                         target=run_upload,
@@ -1494,6 +1542,7 @@ class AutoSubGUI:
             self.root.after(0, lambda: self.pause_btn.config(state="disabled", text="暂停 (Pause)"))
             self.root.after(0, self.refresh_history)
             self.root.after(0, lambda: self._update_input_after_run(input_video))
+            self._upload_abort.clear()
             self.is_paused = False
 
     def toggle_pause(self):
@@ -1529,6 +1578,7 @@ class AutoSubGUI:
                 self.root.after(0, self.log, "⚠️ 暂停失败，进程可能已结束")
 
     def stop_process(self):
+        self._upload_abort.set()
         processes = self._running_processes()
         if processes:
             try:
