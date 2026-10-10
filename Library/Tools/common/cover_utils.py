@@ -68,6 +68,7 @@ _TITLE_CENTER_Y_RATIO = 0.62
 _MIN_FRAME_BRIGHTNESS = 40.0
 _MIN_FALLBACK_FRAME_BRIGHTNESS = 8.0
 _SAMPLE_FRAME_COUNT = 16
+_DENSE_SAMPLE_FRAME_COUNT = 64
 
 
 def _normalize_orientation(orientation: str) -> Tuple[str, Tuple[int, int]]:
@@ -281,34 +282,45 @@ def _face_bboxes(image: Image.Image):
         array = np.asarray(candidate_image)
         frame = cv2.cvtColor(array, cv2.COLOR_RGB2BGR)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        flipped_gray = cv2.flip(gray, 1)
+        gray_variants = [gray]
+        if float(np.mean(gray)) < 80.0:
+            clahe = cv2.createCLAHE(
+                clipLimit=2.5, tileGridSize=(8, 8)
+            )
+            gray_variants.append(clahe.apply(gray))
+
         min_size = (
             max(24, int(candidate_image.width * 0.025)),
             max(24, int(candidate_image.height * 0.025)),
         )
 
-        for cascade, detect_flipped_profile in cascades:
-            target_gray = flipped_gray if detect_flipped_profile else gray
-            faces = cascade.detectMultiScale(
-                target_gray,
-                scaleFactor=1.1,
-                minNeighbors=5,
-                minSize=min_size,
-            )
-            if faces is None or len(faces) == 0:
-                continue
-            for face in np.asarray(faces).reshape(-1, 4):
-                x, y, width, height = map(int, face)
-                if detect_flipped_profile:
-                    x = candidate_image.width - x - width
-                detections.append(
-                    (
-                        int(x * scale),
-                        int(y * scale),
-                        int(width * scale),
-                        int(height * scale),
-                    )
+        for detection_gray in gray_variants:
+            for cascade, detect_flipped_profile in cascades:
+                target_gray = (
+                    cv2.flip(detection_gray, 1)
+                    if detect_flipped_profile
+                    else detection_gray
                 )
+                faces = cascade.detectMultiScale(
+                    target_gray,
+                    scaleFactor=1.1,
+                    minNeighbors=5,
+                    minSize=min_size,
+                )
+                if faces is None or len(faces) == 0:
+                    continue
+                for face in np.asarray(faces).reshape(-1, 4):
+                    x, y, width, height = map(int, face)
+                    if detect_flipped_profile:
+                        x = candidate_image.width - x - width
+                    detections.append(
+                        (
+                            int(x * scale),
+                            int(y * scale),
+                            int(width * scale),
+                            int(height * scale),
+                        )
+                    )
 
     return _deduplicate_faces(detections)
 
@@ -318,37 +330,55 @@ def _largest_face_bbox(image: Image.Image):
     return max(faces, key=lambda face: face[2] * face[3]) if faces else None
 
 
+def _face_score(
+    image: Image.Image,
+    faces: Sequence[Tuple[int, int, int, int]],
+    brightness: float,
+) -> float:
+    """Score a frame after face detection has already been run."""
+    if cv2 is None or np is None or not faces:
+        return 2.0 * brightness
+
+    gray = cv2.cvtColor(
+        cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2BGR), cv2.COLOR_BGR2GRAY
+    )
+    sharpness = min(1.0, cv2.Laplacian(gray, cv2.CV_64F).var() / 300.0)
+    image_area = max(1, image.width * image.height)
+    face_areas = [
+        (width * height) / image_area for _, _, width, height in faces
+    ]
+    total_face_area_ratio = min(1.0, sum(face_areas))
+    largest_face_area_ratio = max(face_areas)
+    center_distances = [
+        abs((x + width / 2) / image.width - 0.5)
+        for x, _, width, _ in faces
+    ]
+
+    score = 35.0 * len(faces)
+    score += 25.0 * total_face_area_ratio
+    score += 10.0 * largest_face_area_ratio
+    score += 4.0 * sharpness
+    score += 2.0 * brightness
+    score -= 1.5 * sum(center_distances) / len(center_distances)
+    return score
+
+
 def _frame_face_score(path: str) -> float:
     """Prefer the most people, then total face area, sharpness, and brightness."""
     with Image.open(path) as image:
         rgb = image.convert("RGB")
         brightness = _frame_brightness(path) / 255.0
         faces = _face_bboxes(rgb)
-        if cv2 is None or np is None or not faces:
-            return 2.0 * brightness
+        return _face_score(rgb, faces, brightness)
 
-        gray = cv2.cvtColor(
-            cv2.cvtColor(np.asarray(rgb), cv2.COLOR_RGB2BGR), cv2.COLOR_BGR2GRAY
-        )
-        sharpness = min(1.0, cv2.Laplacian(gray, cv2.CV_64F).var() / 300.0)
-        image_area = max(1, image.width * image.height)
-        face_areas = [
-            (width * height) / image_area for _, _, width, height in faces
-        ]
-        total_face_area_ratio = min(1.0, sum(face_areas))
-        largest_face_area_ratio = max(face_areas)
-        center_distances = [
-            abs((x + width / 2) / image.width - 0.5)
-            for x, _, width, _ in faces
-        ]
 
-        score = 35.0 * len(faces)
-        score += 25.0 * total_face_area_ratio
-        score += 10.0 * largest_face_area_ratio
-        score += 4.0 * sharpness
-        score += 2.0 * brightness
-        score -= 1.5 * sum(center_distances) / len(center_distances)
-        return score
+def _frame_face_rank(path: str) -> Tuple[int, float]:
+    """Return face count first, then the subject score for cover ranking."""
+    with Image.open(path) as image:
+        rgb = image.convert("RGB")
+        faces = _face_bboxes(rgb)
+        brightness = _frame_brightness(path) / 255.0
+        return len(faces), _face_score(rgb, faces, brightness)
 
 
 def _sample_video_frames(
@@ -356,6 +386,7 @@ def _sample_video_frames(
     temp_dir: str,
     ffmpeg: str,
     duration: Optional[float],
+    frame_count: Optional[int] = None,
 ) -> list[Tuple[float, str]]:
     """Sample a bounded set of timestamps instead of scanning the whole video.
 
@@ -363,15 +394,25 @@ def _sample_video_frames(
     fixed number of timestamps keeps runtime bounded. Dim but visible frames
     are retained so dark videos can still get a subject-aware cover.
     """
+    sample_count = max(2, int(frame_count or _SAMPLE_FRAME_COUNT))
     if duration and duration > 0:
         start = duration * 0.05
         end = duration * 0.95
         timestamps = [
-            start + (end - start) * index / (_SAMPLE_FRAME_COUNT - 1)
-            for index in range(_SAMPLE_FRAME_COUNT)
+            start + (end - start) * index / (sample_count - 1)
+            for index in range(sample_count)
         ]
     else:
-        timestamps = [1.0, 5.0, 10.0, 20.0, 30.0, 45.0, 60.0, 90.0]
+        timestamps = [
+            1.0,
+            5.0,
+            10.0,
+            20.0,
+            30.0,
+            45.0,
+            60.0,
+            90.0,
+        ][:sample_count]
 
     frames = []
     for index, timestamp in enumerate(timestamps, start=1):
@@ -421,17 +462,39 @@ def extract_best_frame(video_path: str, output_path: str) -> str:
             video_path, temp_dir, ffmpeg, duration
         )
         for timestamp, frame in sampled_frames:
-            candidates.append((_frame_face_score(frame), frame, timestamp))
+            face_count, score = _frame_face_rank(frame)
+            candidates.append((score, face_count, frame, timestamp))
+
+        # A single face is an acceptable fallback, but it is also weak evidence
+        # that a multi-person interview was missed by sparse sampling.
+        if candidates and max(item[1] for item in candidates) <= 1:
+            dense_frames = _sample_video_frames(
+                video_path,
+                temp_dir,
+                ffmpeg,
+                duration,
+                frame_count=_DENSE_SAMPLE_FRAME_COUNT,
+            )
+            existing_timestamps = {item[3] for item in candidates}
+            for timestamp, frame in dense_frames:
+                if timestamp in existing_timestamps:
+                    continue
+                face_count, score = _frame_face_rank(frame)
+                candidates.append((score, face_count, frame, timestamp))
 
         if not candidates:
             raise RuntimeError(
                 "ffmpeg could not extract a bright enough cover frame"
             )
 
-        ranked = sorted(candidates, key=lambda item: item[0], reverse=True)
+        ranked = sorted(
+            candidates, key=lambda item: (item[1], item[0]), reverse=True
+        )
         validated = []
         selected = None
-        for rank, (sample_score, sample_path, timestamp) in enumerate(ranked[:8], start=1):
+        for rank, (sample_score, sample_face_count, sample_path, timestamp) in enumerate(
+            ranked[:8], start=1
+        ):
             full_frame = os.path.join(temp_dir, f"validated-{rank}.jpg")
             extracted = False
             try:
@@ -462,22 +525,28 @@ def extract_best_frame(video_path: str, output_path: str) -> str:
 
             if not extracted:
                 continue
-            full_score = _frame_face_score(full_frame)
-            validated.append((full_score, full_frame, timestamp))
+            full_face_count, full_score = _frame_face_rank(full_frame)
+            validated.append((full_score, full_face_count, full_frame, timestamp))
             # A real subject should keep most of its score after returning to
             # full resolution; low-resolution Haar false positives often do not.
-            if full_score >= max(5.0, sample_score * 0.6):
-                selected = (full_score, full_frame, timestamp)
+            if (
+                full_face_count >= sample_face_count
+                and full_score >= max(5.0, sample_score * 0.6)
+            ):
+                selected = (full_score, full_face_count, full_frame, timestamp)
                 break
 
         if selected is None and validated:
-            selected = max(validated, key=lambda item: item[0])
+            selected = max(validated, key=lambda item: (item[1], item[0]))
         if selected is None:
             raise RuntimeError("ffmpeg could not extract a bright enough cover frame")
 
-        best_score, best, timestamp = selected
+        best_score, best_face_count, best, timestamp = selected
         shutil.copy2(best, output_path)
-        print(f">>> 封面选帧: {timestamp:.2f}s (主体评分: {best_score:.2f})")
+        print(
+            f">>> 封面选帧: {timestamp:.2f}s "
+            f"(人脸: {best_face_count}, 主体评分: {best_score:.2f})"
+        )
     return output_path
 
 
@@ -927,9 +996,9 @@ def _choose_source_frame(
         existing = None
     extract_best_frame(video_path, temporary_path)
     if existing:
-        existing_score = _frame_face_score(existing)
-        extracted_score = _frame_face_score(temporary_path)
-        if existing_score >= extracted_score:
+        existing_rank = _frame_face_rank(existing)
+        extracted_rank = _frame_face_rank(temporary_path)
+        if existing_rank >= extracted_rank:
             return existing
     return temporary_path
 

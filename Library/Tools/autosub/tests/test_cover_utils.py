@@ -15,9 +15,11 @@ import cover_utils
 from PIL import Image, ImageFont
 
 from cover_utils import (
+    _DENSE_SAMPLE_FRAME_COUNT,
     _COVER_STYLE_VERSION,
     _frame_brightness,
     _frame_is_usable,
+    _frame_face_rank,
     _sample_video_frames,
     cover_output_path,
     generate_cover,
@@ -120,6 +122,123 @@ class TestCoverUtils(unittest.TestCase):
         self.assertEqual(result, output)
         self.assertGreaterEqual(_frame_brightness(output), 8.0)
         self.assertLess(_frame_brightness(output), 40.0)
+
+    def test_extract_best_frame_prefers_more_faces_over_higher_subject_score(self):
+        no_face = os.path.join(self.temp_dir, "no-face.jpg")
+        one_face = os.path.join(self.temp_dir, "one-face.jpg")
+        two_faces = os.path.join(self.temp_dir, "two-faces.jpg")
+        for path in (no_face, one_face, two_faces):
+            Image.new("RGB", (1920, 1080), (42, 82, 126)).save(path, "JPEG")
+        output = os.path.join(self.temp_dir, "best.jpg")
+        completed = type("CompletedProcess", (), {"returncode": 0})()
+        ranks = {
+            no_face: (0, 100.0),
+            one_face: (1, 80.0),
+            two_faces: (2, 80.0),
+        }
+
+        def fake_run(args, **kwargs):
+            source = two_faces if "validated-1" in args[9] else one_face
+            shutil.copyfile(source, args[9])
+            return completed
+
+        with patch.object(cover_utils, "_find_ffmpeg", return_value="ffmpeg"), patch.object(
+            cover_utils, "_video_duration_seconds", return_value=100.0
+        ), patch.object(
+            cover_utils,
+            "_sample_video_frames",
+            return_value=[(10.0, no_face), (20.0, one_face), (30.0, two_faces)],
+        ), patch.object(
+            cover_utils,
+            "_frame_face_rank",
+            side_effect=lambda path: ranks.get(
+                path,
+                ranks[two_faces if "validated-1" in path else one_face],
+            ),
+        ) as rank_mock, patch.object(cover_utils, "subprocess") as subprocess_mock:
+            subprocess_mock.run.side_effect = fake_run
+            result = cover_utils.extract_best_frame("/tmp/video.mp4", output)
+            self.assertEqual(rank_mock.call_count, 4)
+
+        self.assertEqual(result, output)
+
+    def test_extract_best_frame_dense_samples_when_first_pass_has_no_faces(self):
+        no_face = os.path.join(self.temp_dir, "sparse-no-face.jpg")
+        one_face = os.path.join(self.temp_dir, "dense-one-face.jpg")
+        Image.new("RGB", (1920, 1080), (42, 82, 126)).save(no_face, "JPEG")
+        Image.new("RGB", (1920, 1080), (72, 112, 156)).save(one_face, "JPEG")
+        output = os.path.join(self.temp_dir, "best.jpg")
+        completed = type("CompletedProcess", (), {"returncode": 0})()
+        ranks = {no_face: (0, 100.0), one_face: (1, 80.0)}
+        sample_calls = []
+
+        def fake_sample(video, temp_dir, ffmpeg, duration, frame_count=None):
+            sample_calls.append(frame_count)
+            if frame_count == _DENSE_SAMPLE_FRAME_COUNT:
+                return [(25.0, one_face)]
+            return [(10.0, no_face)]
+
+        def fake_run(args, **kwargs):
+            source = one_face if "validated-1" in args[9] else no_face
+            shutil.copyfile(source, args[9])
+            return completed
+
+        with patch.object(cover_utils, "_find_ffmpeg", return_value="ffmpeg"), patch.object(
+            cover_utils, "_video_duration_seconds", return_value=100.0
+        ), patch.object(
+            cover_utils, "_sample_video_frames", side_effect=fake_sample
+        ), patch.object(
+            cover_utils,
+            "_frame_face_rank",
+            side_effect=lambda path: ranks.get(
+                path,
+                ranks[one_face if "validated-1" in path else no_face],
+            ),
+        ), patch.object(cover_utils, "subprocess") as subprocess_mock:
+            subprocess_mock.run.side_effect = fake_run
+            result = cover_utils.extract_best_frame("/tmp/video.mp4", output)
+
+        self.assertEqual(result, output)
+        self.assertEqual(sample_calls, [None, _DENSE_SAMPLE_FRAME_COUNT])
+
+    def test_extract_best_frame_dense_samples_for_multi_face_after_one_face(self):
+        one_face = os.path.join(self.temp_dir, "sparse-one-face.jpg")
+        two_faces = os.path.join(self.temp_dir, "dense-two-faces.jpg")
+        Image.new("RGB", (1920, 1080), (42, 82, 126)).save(one_face, "JPEG")
+        Image.new("RGB", (1920, 1080), (72, 112, 156)).save(two_faces, "JPEG")
+        output = os.path.join(self.temp_dir, "best.jpg")
+        completed = type("CompletedProcess", (), {"returncode": 0})()
+        ranks = {one_face: (1, 100.0), two_faces: (2, 80.0)}
+        sample_calls = []
+
+        def fake_sample(video, temp_dir, ffmpeg, duration, frame_count=None):
+            sample_calls.append(frame_count)
+            if frame_count == _DENSE_SAMPLE_FRAME_COUNT:
+                return [(25.0, two_faces)]
+            return [(10.0, one_face)]
+
+        def fake_run(args, **kwargs):
+            source = two_faces if "validated-1" in args[9] else one_face
+            shutil.copyfile(source, args[9])
+            return completed
+
+        with patch.object(cover_utils, "_find_ffmpeg", return_value="ffmpeg"), patch.object(
+            cover_utils, "_video_duration_seconds", return_value=100.0
+        ), patch.object(
+            cover_utils, "_sample_video_frames", side_effect=fake_sample
+        ), patch.object(
+            cover_utils,
+            "_frame_face_rank",
+            side_effect=lambda path: ranks.get(
+                path,
+                ranks[two_faces if "validated-1" in path else one_face],
+            ),
+        ), patch.object(cover_utils, "subprocess") as subprocess_mock:
+            subprocess_mock.run.side_effect = fake_run
+            result = cover_utils.extract_best_frame("/tmp/video.mp4", output)
+
+        self.assertEqual(result, output)
+        self.assertEqual(sample_calls, [None, _DENSE_SAMPLE_FRAME_COUNT])
 
     def test_generate_cover_rejects_black_explicit_source(self):
         dark = os.path.join(self.temp_dir, "dark-source.jpg")
