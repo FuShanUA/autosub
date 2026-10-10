@@ -2156,8 +2156,8 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
             form_title=title,
         )
 
-        self.assertEqual(title, "Andrej Karpathy讲透ChatGPT这类LLM应用")
-        self.assertEqual(wechat_title, "Karpathy讲透LLM应用")
+        self.assertEqual(title, "卡帕西讲透ChatGPT这类LLM应用")
+        self.assertEqual(wechat_title, "卡帕西讲透LLM应用")
         self.assertEqual(cover_title, "Andrej Karpathy用1TB压缩包讲模型")
         self.assertTrue(autosub.normalize_bili_upload_title(title))
         self.assertTrue(autosub.normalize_shared_upload_title(wechat_title))
@@ -2507,7 +2507,7 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
             metadata = autosub.generate_upload_metadata(workdir)
 
         self.assertEqual(metadata.get("title", ""), "")
-        self.assertEqual(metadata.get("wechat_title", ""), "Peter Thiel谈AI")
+        self.assertEqual(metadata.get("wechat_title", ""), "蒂尔谈AI")
         self.assertEqual(
             metadata.get("cover_title", ""),
             "Peter：通谕是在帮中共的忙",
@@ -3109,7 +3109,7 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         self.assertIn("不得另起主题", prompt)
         self.assertIn("B站表单标题：\nPalantir为企业整合数据，不做服务，打造产品", prompt)
         self.assertIn("中文最多还能放 8 个字", prompt)
-        self.assertIn("必须优先原样保留B站标题开头的主体", prompt)
+        self.assertIn("必须优先保留B站标题开头的主体，可用其中文通行名或公众熟知简称", prompt)
         self.assertIn("优先保留主体和最有力的后果或立场", prompt)
         self.assertIn("主体+具体后果/反差", prompt)
         self.assertIn("不得以「就」「光是」开头", prompt)
@@ -3191,6 +3191,69 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
             )
 
         self.assertEqual(title, "Palantir押注长期问题")
+
+    def test_proper_noun_aliases_are_parsed_and_grounded(self):
+        """Chinese public names validate against their subtitle source."""
+        raw = (
+            '{"central_claim":"...","subject_aliases":'
+            '{"Ben Affleck":["本·阿弗莱克","大本"]},'
+            '"candidates":[]}'
+        )
+        self.assertEqual(
+            autosub._parse_llm_title_aliases(raw),
+            {"Ben Affleck": ("本·阿弗莱克", "大本")},
+        )
+
+        def validator(title, subtitle_text, evidence, min_chars, max_chars):
+            if "Ben Affleck" not in title:
+                raise ValueError("canonical subject missing")
+            if "推掉新戏" not in title:
+                raise ValueError("claim missing")
+            return evidence
+
+        evidence = ("Ben Affleck推掉新戏陪孩子。",)
+        self.assertEqual(
+            autosub._validate_title_with_proper_noun_aliases(
+                "大本推掉新戏陪孩子",
+                "Ben Affleck推掉新戏陪孩子。",
+                evidence,
+                min_chars=8,
+                max_chars=16,
+                aliases={"Ben Affleck": ("大本",)},
+                validator=validator,
+                error_class=ValueError,
+            ),
+            evidence,
+        )
+
+        with self.assertRaises(ValueError):
+            autosub._validate_title_with_proper_noun_aliases(
+                "大本推掉新戏陪孩子",
+                "字幕里没有这个英文原名。",
+                evidence,
+                min_chars=8,
+                max_chars=16,
+                aliases={"Ben Affleck": ("大本",)},
+                validator=validator,
+                error_class=ValueError,
+            )
+
+    def test_local_wechat_fallback_uses_short_public_nicknames(self):
+        """A known nickname preserves the subject inside the 16-char budget."""
+        self.assertEqual(
+            autosub._compress_bili_title_for_wechat(
+                "Ben Affleck推掉新戏陪孩子",
+                16,
+            ),
+            "大本推掉新戏陪孩子",
+        )
+        self.assertEqual(
+            autosub._fallback_wechat_hook_from_bili_title(
+                "Ben Affleck推掉新戏陪孩子",
+                16,
+            ),
+            "大本推掉新戏陪孩子",
+        )
 
     def test_structured_title_fallback_assembles_a_budgeted_sentence(self):
         """The structured fallback avoids model miscounts of full titles."""

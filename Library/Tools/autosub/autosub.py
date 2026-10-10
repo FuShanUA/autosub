@@ -861,12 +861,12 @@ _SHARED_TITLE_ACTION_MARKERS = (
     "谈", "讲", "靠", "用", "做", "让", "成为", "押", "是", "培养",
     "招", "卖", "买", "建立", "打造", "解决", "守住", "聚焦", "变成", "保护",
     "整合", "引领", "炮轰", "反对", "支持", "梳理", "展示", "迭代", "改造",
-    "收购", "讨论",
+    "收购", "讨论", "推掉", "陪", "失去", "离世", "拒绝", "直面", "守",
     "被裁", "烂掉",
 )
 _SHARED_TITLE_CONTEXT_MARKERS = (
     "访谈", "对话", "谈", "讲", "为", "帮", "给", "客户", "企业", "主题",
-    "人才", "名校",
+    "人才", "名校", "父母", "孩子", "新戏", "小报", "传言",
     "问题", "不做", "不是", "不招", "押注", "才是", "隐私", "一半",
     "被裁", "烂掉",
 )
@@ -876,8 +876,138 @@ _PUBLIC_TITLE_STYLE_EXAMPLES = (
     "Alex Karp早年访谈：Palantir不做服务公司，为企业打造解决数据问题的产品",
 )
 _SHARED_TITLE_STANCE_MARKERS = (
-    "不做", "不是", "没有", "拒绝", "不招", "不卖", "才是",
+    "不做", "不是", "没有", "拒绝", "不招", "不卖", "才是", "推掉",
 )
+
+_PROPER_NOUN_TITLE_ALIASES = {
+    "Ben Affleck": ("本·阿弗莱克", "本阿弗莱克", "大本"),
+    "Matt Damon": ("马特·达蒙", "马特达蒙"),
+    "Alex Karp": ("卡普",),
+    "Peter Thiel": ("彼得·蒂尔", "蒂尔"),
+    "Andrej Karpathy": ("卡帕西",),
+    "Elon Musk": ("马斯克",),
+    "Los Angeles": ("洛杉矶",),
+    "New York": ("纽约",),
+    "San Francisco": ("旧金山",),
+}
+
+
+def _parse_llm_title_aliases(raw):
+    """Parse established Chinese aliases returned with title candidates."""
+    if raw is None:
+        return {}
+    if isinstance(raw, dict):
+        payload = raw
+    else:
+        text = str(raw).strip()
+        text = re.sub(
+            r"^```(?:json)?\s*|\s*```$",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        ).strip()
+        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        if not match:
+            return {}
+        try:
+            payload = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return {}
+    if not isinstance(payload, dict):
+        return {}
+
+    raw_aliases = payload.get("subject_aliases", payload.get("aliases", {}))
+    if not isinstance(raw_aliases, dict):
+        return {}
+
+    aliases = {}
+    for source, targets in raw_aliases.items():
+        source_value = re.sub(r"\s+", " ", str(source or "")).strip()
+        if not re.fullmatch(
+            r"[A-Za-z][A-Za-z0-9'_-]*(?: [A-Za-z][A-Za-z0-9'_-]*)*",
+            source_value,
+        ):
+            continue
+        if isinstance(targets, str):
+            targets = [targets]
+        elif not isinstance(targets, (list, tuple)):
+            continue
+        values = tuple(
+            re.sub(r"\s+", " ", str(target or "")).strip()
+            for target in targets
+            if re.sub(r"\s+", " ", str(target or "")).strip()
+            and re.search(r"[\u3400-\u9fff]", str(target or ""))
+        )
+        if values:
+            aliases[source_value] = values
+    return aliases
+
+
+def _canonicalize_title_proper_nouns(title, subtitle_text, aliases):
+    """Map Chinese aliases back to the spelling used in the subtitle."""
+    value = re.sub(r"\s+", " ", str(title or "")).strip()
+    if not aliases:
+        return value
+    normalized_subtitle = re.sub(r"\s+", " ", str(subtitle_text or "")).strip()
+    subtitle_lower = normalized_subtitle.casefold()
+
+    for source, targets in aliases.items():
+        source_value = re.sub(r"\s+", " ", str(source or "")).strip()
+        if not source_value or source_value.casefold() not in subtitle_lower:
+            continue
+        if isinstance(targets, str):
+            targets = (targets,)
+        for target in sorted(
+            (re.sub(r"\s+", " ", str(target or "")).strip() for target in targets),
+            key=len,
+            reverse=True,
+        ):
+            if target and target != source_value and target in value:
+                value = value.replace(target, source_value)
+                break
+    return value
+
+
+def _validate_title_with_proper_noun_aliases(
+    title,
+    subtitle_text,
+    evidence,
+    min_chars,
+    max_chars,
+    aliases,
+    validator,
+    error_class,
+):
+    """Ground aliases without letting their length bypass the real budget."""
+    normalized_title = re.sub(r"\s+", " ", str(title or "")).strip()
+    if len(normalized_title) < min_chars or len(normalized_title) > max_chars:
+        raise error_class(f"标题长度必须在 {min_chars}-{max_chars} 个字符之间")
+
+    canonical_title = _canonicalize_title_proper_nouns(
+        normalized_title,
+        subtitle_text,
+        aliases,
+    )
+    if canonical_title == normalized_title:
+        return validator(
+            canonical_title,
+            subtitle_text,
+            evidence,
+            min_chars=min_chars,
+            max_chars=max_chars,
+        )
+
+    # The displayed title is budgeted above. Validation checks the canonical
+    # English spelling, so its temporary expansion must not fail the length gate.
+    return validator(
+        canonical_title,
+        subtitle_text,
+        evidence,
+        min_chars=1,
+        max_chars=max(max_chars, len(canonical_title)),
+    )
+
+
 _SHARED_TITLE_CONCRETE_OBJECTS = (
     "数据", "应用", "平台", "工具", "模型", "算法", "本体",
 )
@@ -1530,6 +1660,10 @@ def _generate_title_from_description(
         "不要输出名词短语拼接，不要机械堆关键词，也不要只抽一个短语。"
         "不要为了凑长度新增字幕没有的连接短语。"
         "如果信息过多，优先保留主体、主线对象、核心做法和结论，删除修饰词。"
+        "英文人名、地名可用中文通行译名或公众熟知的简称、绰号，"
+        "只要能节省字符且不造成歧义；公司名和产品名通常保留公众拼写。"
+        "不得生造译名或绰号，无法确认时保留英文原名。"
+        "把使用的映射写入 subject_aliases，来源拼写必须逐字出现在字幕中。"
         "不要把全片主体缩小成单一客户群体；若同时服务企业和政府，"
         "用「客户」或自然的并列表达，不要用「大型企业」这类限定词缩窄范围。"
         "不要把动词硬放在核心对象前面造成翻译腔。"
@@ -1542,7 +1676,8 @@ def _generate_title_from_description(
         "生成 10 个候选，按编辑质量从高到低排列。"
         "每个候选给出 1-2 条 evidence，必须逐字复制字幕原文，不得改写或加省略号。"
         "只输出 JSON："
-        '{"central_claim":"...","candidates":['
+        '{"central_claim":"...","subject_aliases":'
+        '{"Ben Affleck":["本·阿弗莱克","大本"]},"candidates":['
         '{"title":"...","evidence":["..."]}]}\n\n'
         f"{source_title_reference}"
         f"视频简介：\n{description}\n\n"
@@ -1550,6 +1685,7 @@ def _generate_title_from_description(
     )
     last_error = None
     validation_feedback = ""
+    subject_aliases = dict(_PROPER_NOUN_TITLE_ALIASES)
     for _ in range(2):
         prompt = base_prompt
         if validation_feedback:
@@ -1565,6 +1701,10 @@ def _generate_title_from_description(
                 provider=provider,
             )
             _central_claim, candidates = parse_llm_title_candidates(raw)
+            subject_aliases = _merge_proper_noun_aliases(
+                _PROPER_NOUN_TITLE_ALIASES,
+                _parse_llm_title_aliases(raw),
+            )
             candidate_errors = []
             valid_candidates = []
             for title, evidence in candidates:
@@ -1579,12 +1719,15 @@ def _generate_title_from_description(
                     candidate_errors.append(f"{title}: 标题不是自然完整短句")
                     continue
                 try:
-                    validate_title_from_subtitle(
+                    _validate_title_with_proper_noun_aliases(
                         title,
                         subtitle_text,
                         evidence,
                         min_chars=min_chars,
                         max_chars=max_chars,
+                        aliases=subject_aliases,
+                        validator=validate_title_from_subtitle,
+                        error_class=SubtitleTitleError,
                     )
                     valid_candidates.append((title, evidence))
                 except SubtitleTitleError as exc:
@@ -1630,7 +1773,10 @@ def _generate_structured_title_from_description(
     source_title=None,
 ):
     """Build a budgeted Bilibili title from semantic fields."""
-    from subtitle_title import SubtitleTitleError, validate_title_from_subtitle
+    from subtitle_title import (
+        SubtitleTitleError,
+        validate_title_from_subtitle,
+    )
 
     if not description or not subtitle_text or llm_client is None:
         return None
@@ -1648,6 +1794,9 @@ def _generate_structured_title_from_description(
         "输出5个结构化候选，按全片概括强度排序。"
         "字段：subject、beneficiary、action、object、second_claim、evidence。"
         "subject 来自字幕或简介；beneficiary 尽量2字；action 2字；object 2-4字。"
+        "英文人名、地名的 subject 可用中文通行译名或公众熟知的简称、绰号；"
+        "公司名和产品名通常保留公众拼写，不得生造译名或绰号。"
+        "若使用中文主体，必须在顶层 subject_aliases 写明来源英文拼写。"
         "second_claim 是可选的明确立场或结果，尽量4-8字；"
         "只有字幕能支撑时才填写。"
         "只要字幕或简介能识别受益者，beneficiary 不得为空；"
@@ -1667,7 +1816,8 @@ def _generate_structured_title_from_description(
         "参考公开B站标题的结构，只学句式，不复制事实。"
         "每个候选给1-2条 evidence，必须逐字复制中文字幕原文。"
         "只输出 JSON："
-        '{"candidates":[{"subject":"...","beneficiary":"...",'
+        '{"subject_aliases":{"Ben Affleck":["大本"]},'
+        '"candidates":[{"subject":"...","beneficiary":"...",'
         '"action":"...","object":"...","second_claim":"...",'
         '"evidence":["..."]}]}\n\n'
         f"{source_title_reference}"
@@ -1676,6 +1826,7 @@ def _generate_structured_title_from_description(
     )
 
     validation_feedback = ""
+    subject_aliases = dict(_PROPER_NOUN_TITLE_ALIASES)
     for _ in range(2):
         prompt = base_prompt
         if validation_feedback:
@@ -1706,6 +1857,10 @@ def _generate_structured_title_from_description(
                 raise SubtitleTitleError("结构化标题 JSON 解析失败") from exc
             if not isinstance(payload, dict):
                 raise SubtitleTitleError("结构化标题 JSON 结构不正确")
+            subject_aliases = _merge_proper_noun_aliases(
+                _PROPER_NOUN_TITLE_ALIASES,
+                _parse_llm_title_aliases(payload),
+            )
 
             raw_candidates = payload.get("candidates")
             if not isinstance(raw_candidates, list) or not raw_candidates:
@@ -1759,12 +1914,15 @@ def _generate_structured_title_from_description(
                     candidate_errors.append(f"{title}: 标题不是自然完整短句")
                     continue
                 try:
-                    validate_title_from_subtitle(
+                    _validate_title_with_proper_noun_aliases(
                         title,
                         subtitle_text,
                         evidence,
                         min_chars=min_chars,
                         max_chars=max_chars,
+                        aliases=subject_aliases,
+                        validator=validate_title_from_subtitle,
+                        error_class=SubtitleTitleError,
                     )
                     valid_candidates.append(title)
                 except SubtitleTitleError as exc:
@@ -1815,18 +1973,114 @@ def _extract_bili_title_subject(bili_title):
     return subject
 
 
-def _wechat_title_preserves_bili_subject(title, bili_title, max_chars):
+def _merge_proper_noun_aliases(*alias_maps):
+    """Combine built-in and model-provided aliases without losing either."""
+    merged = {}
+    for alias_map in alias_maps:
+        if not isinstance(alias_map, dict):
+            continue
+        for source, targets in alias_map.items():
+            source_value = str(source or "").strip()
+            if not source_value:
+                continue
+            if isinstance(targets, str):
+                targets = (targets,)
+            values = tuple(
+                str(target or "").strip()
+                for target in targets or ()
+                if str(target or "").strip()
+            )
+            if not values:
+                continue
+            merged.setdefault(source_value, tuple())
+            existing = merged[source_value]
+            merged[source_value] = tuple(dict.fromkeys(existing + values))
+    return merged
+
+
+def _preferred_title_subject(subject, max_chars, aliases=None):
+    """Return the shortest unambiguous public spelling for a title subject."""
+    value = str(subject or "").strip()
+    if not value:
+        return value
+    candidates = [value]
+    for source, targets in (aliases or {}).items():
+        if source.strip().casefold() != value.casefold():
+            continue
+        candidates.extend(str(target or "").strip() for target in targets)
+    valid = [
+        candidate
+        for candidate in candidates
+        if candidate and len(candidate) <= max_chars
+    ]
+    return min(valid, key=len) if valid else value
+
+
+def _apply_preferred_title_aliases(value, max_chars, aliases=None):
+    """Use shorter public aliases for known English proper nouns."""
+    result = re.sub(r"\s+", " ", str(value or "")).strip()
+    alias_map = _merge_proper_noun_aliases(
+        _PROPER_NOUN_TITLE_ALIASES,
+        aliases,
+    )
+    for source, targets in alias_map.items():
+        source_value = str(source or "").strip()
+        if not source_value:
+            continue
+        preferred = _preferred_title_subject(
+            source_value,
+            max_chars,
+            alias_map,
+        )
+        if preferred == source_value:
+            continue
+        result = re.sub(
+            rf"(?<![A-Za-z0-9_-]){re.escape(source_value)}(?![A-Za-z0-9_-])",
+            preferred,
+            result,
+        )
+    return result
+
+
+def _wechat_title_preserves_bili_subject(
+    title,
+    bili_title,
+    max_chars,
+    subject_aliases=None,
+):
     """Check whether a compressed title keeps the Bilibili title's subject."""
     subject = _extract_bili_title_subject(bili_title)
     if not subject or len(subject) > max_chars - 4:
         return True
-    return subject in str(title or "")
+    value = str(title or "")
+    if subject in value:
+        return True
+    aliases = (subject_aliases or {}).get(subject, ())
+    return any(alias in value for alias in aliases)
 
 
-def _compress_bili_title_for_wechat(bili_title, max_chars, description=""):
+def _compress_bili_title_for_wechat(
+    bili_title,
+    max_chars,
+    description="",
+    subject_aliases=None,
+):
     """Locally shorten a validated Bilibili title when model counting fails."""
     value = re.sub(r"\s+", " ", str(bili_title or "")).strip()
+    value = _apply_preferred_title_aliases(
+        value,
+        max_chars,
+        subject_aliases,
+    )
     subject = _extract_bili_title_subject(value)
+    subject = _preferred_title_subject(
+        subject,
+        max_chars,
+        _merge_proper_noun_aliases(
+            _PROPER_NOUN_TITLE_ALIASES,
+            subject_aliases,
+        ),
+    )
     clauses = [clause.strip() for clause in re.split(r"[，,；;。]", value) if clause.strip()]
 
     source_text = value + "\n" + str(description or "")
@@ -1859,7 +2113,12 @@ def _compress_bili_title_for_wechat(bili_title, max_chars, description=""):
         if (
             len(combined) <= max_chars
             and not _shared_title_has_quality_issue(combined)
-            and _wechat_title_preserves_bili_subject(combined, value, max_chars)
+            and _wechat_title_preserves_bili_subject(
+                combined,
+                value,
+                max_chars,
+                subject_aliases=subject_aliases,
+            )
         ):
             return combined
 
@@ -1911,6 +2170,7 @@ def _compress_bili_title_for_wechat(bili_title, max_chars, description=""):
                     candidate,
                     value,
                     max_chars,
+                    subject_aliases=subject_aliases,
                 )
             ):
                 candidates.append(candidate)
@@ -1969,9 +2229,15 @@ def _derive_wechat_title_from_bili_title(
         "B站标题只确定主题边界和必须保留的主体，不是逐字压缩模板。"
         "优先通读字幕，找出同一主线里最具体的冲突、后果、反差或人物立场；"
         "可以选字幕钩子，不得另起主题，也不得换成字幕外的概括。"
+        "英文人名、地名如果节省字符且不造成歧义，优先使用中文通行译名"
+        "或公众熟知的简称、绰号；公司名和产品名通常保留公众拼写。"
+        "不得生造译名或绰号，无法确认时保留英文。"
+        "例如 Ben Affleck 可用「本·阿弗莱克」「本阿弗莱克」或「大本」，"
+        "并在 subject_aliases 里写明来源拼写。"
         f"标题长度必须为 {min_chars}-{max_chars} 个字符，英文字母逐字符计数。"
         "例如 Palantir 为 8 字符，中文最多还能放 8 个字。"
-        "必须优先原样保留B站标题开头的主体，例如 Palantir、卡普或 OpenAI研究员；"
+        "必须优先保留B站标题开头的主体，可用其中文通行名或公众熟知简称；"
+        "例如 Palantir、卡普、OpenAI研究员或大本。"
         "只有主体过长导致无法保留核心谓语时才允许省略。"
         "先计算主体字符数，再用标题上限减去主体字符数得到剩余额度；"
         "每个候选的其余文字都必须落在这个额度内，超限候选直接作废。"
@@ -1989,7 +2255,9 @@ def _derive_wechat_title_from_bili_title(
         "生成 10 个候选，按编辑质量从高到低排列。"
         "每个候选给出 1-2 条 evidence，必须逐字复制中文字幕原文。"
         "只输出 JSON："
-        '{"central_claim":"...","candidates":['
+        '{"central_claim":"...","subject_aliases":'
+        '{"Ben Affleck":["本·阿弗莱克","大本"]},'
+        '"candidates":['
         '{"title":"...","evidence":["..."]}]}\n\n'
         f"{source_title_reference}"
         f"B站表单标题：\n{bili_title}\n\n"
@@ -1999,6 +2267,7 @@ def _derive_wechat_title_from_bili_title(
 
     last_error = None
     validation_feedback = ""
+    subject_aliases = dict(_PROPER_NOUN_TITLE_ALIASES)
     for _ in range(2):
         prompt = base_prompt
         if validation_feedback:
@@ -2014,6 +2283,10 @@ def _derive_wechat_title_from_bili_title(
                 provider=provider,
             )
             _central_claim, candidates = parse_llm_title_candidates(raw)
+            subject_aliases = _merge_proper_noun_aliases(
+                _PROPER_NOUN_TITLE_ALIASES,
+                _parse_llm_title_aliases(raw),
+            )
             candidate_errors = []
             valid_candidates = []
             for title, evidence in candidates:
@@ -2034,29 +2307,41 @@ def _derive_wechat_title_from_bili_title(
                     title,
                     bili_title,
                     max_chars,
+                    subject_aliases=subject_aliases,
                 ):
                     candidate_errors.append(
                         f"{title}: 未保留B站标题主体 {_extract_bili_title_subject(bili_title)}"
                     )
                     continue
                 try:
-                    validate_title_from_subtitle(
+                    _validate_title_with_proper_noun_aliases(
                         title,
                         subtitle_text,
                         evidence,
                         min_chars=min_chars,
                         max_chars=max_chars,
+                        aliases=subject_aliases,
+                        validator=validate_title_from_subtitle,
+                        error_class=SubtitleTitleError,
                     )
                     valid_candidates.append((title, evidence))
                 except SubtitleTitleError as exc:
                     candidate_errors.append(f"{title}: {exc}")
             if valid_candidates:
                 subject = _extract_bili_title_subject(bili_title)
+                aliases = subject_aliases.get(subject, ())
                 return max(
                     valid_candidates,
                     key=lambda item: (
                         _shared_title_score(item[0], max_chars)
-                        + (6.0 if subject and subject in item[0] else 0.0)
+                        + (
+                            6.0
+                            if subject
+                            and (subject in item[0] or any(
+                                alias in item[0] for alias in aliases
+                            ))
+                            else 0.0
+                        )
                         + 8.0 * _title_reference_coverage(item[0], bili_title)
                         + 1.5 * _title_reference_coverage(item[0], source_title)
                     ),
@@ -2072,6 +2357,7 @@ def _derive_wechat_title_from_bili_title(
             bili_title,
             max_chars,
             description=description,
+            subject_aliases=subject_aliases,
         )
         if fallback_title:
             return fallback_title
@@ -2080,6 +2366,7 @@ def _derive_wechat_title_from_bili_title(
         bili_title,
         max_chars,
         description=description,
+        subject_aliases=subject_aliases,
     )
     if fallback_title:
         return fallback_title
@@ -2176,10 +2463,15 @@ def _generate_cover_title_from_full_subtitle(
         "为什么值得点开；看不出就作废。"
         "复述要保留原句的具体对象和语气，不得引入字幕外事实，"
         "不得使用市井口语、夸张营销或AI套话。"
+        "英文人名、地名可用中文通行译名或公众熟知的简称、绰号，"
+        "只要不造成歧义且让钩子更自然；公司名和产品名通常保留公众拼写。"
+        "不得生造译名或绰号，无法确认时保留英文原名。"
+        "把使用的映射写入 subject_aliases，来源拼写必须逐字出现在字幕中。"
         "标题长度 12-48 个字符，优先 18-32 个字符。"
         "每个候选给出 1-2 条 evidence，必须逐字复制字幕原文。"
         "只输出 JSON："
-        '{"central_claim":"...","candidates":['
+        '{"central_claim":"...","subject_aliases":'
+        '{"Ben Affleck":["本·阿弗莱克","大本"]},"candidates":['
         '{"title":"...","evidence":["..."]}]}'
         f"\n{title_context}"
         f"\n\n完整字幕：\n{full_subtitle_text}"
@@ -2187,6 +2479,7 @@ def _generate_cover_title_from_full_subtitle(
 
     last_error = None
     validation_feedback = ""
+    subject_aliases = dict(_PROPER_NOUN_TITLE_ALIASES)
     for _ in range(2):
         prompt = base_prompt
         if validation_feedback:
@@ -2202,6 +2495,10 @@ def _generate_cover_title_from_full_subtitle(
                 provider=provider,
             )
             _central_claim, candidates = parse_llm_title_candidates(raw)
+            subject_aliases = _merge_proper_noun_aliases(
+                _PROPER_NOUN_TITLE_ALIASES,
+                _parse_llm_title_aliases(raw),
+            )
             valid_candidates = []
             candidate_errors = []
             for title, evidence in candidates:
@@ -2211,12 +2508,15 @@ def _generate_cover_title_from_full_subtitle(
                         raise SubtitleTitleError("封面标题不是完整短句")
                     if _cover_title_repeats_form_title(title, form_title):
                         raise SubtitleTitleError("封面标题复写表单标题")
-                    validate_title_from_subtitle(
+                    _validate_title_with_proper_noun_aliases(
                         title,
                         full_subtitle_text,
                         evidence,
                         min_chars=min_chars,
                         max_chars=max_chars,
+                        aliases=subject_aliases,
+                        validator=validate_title_from_subtitle,
+                        error_class=SubtitleTitleError,
                     )
                     valid_candidates.append((title, evidence))
                 except SubtitleTitleError as exc:
@@ -2387,6 +2687,7 @@ def _extract_source_title(video_path):
 def _fallback_bili_title_from_source_title(source_title, max_chars):
     """Use the publisher title when model and subtitle titles both fail."""
     value = re.sub(r"\s+", " ", str(source_title or "")).strip()
+    value = _apply_preferred_title_aliases(value, max_chars)
     if not value:
         return ""
     if len(value) > max_chars:
@@ -2402,7 +2703,7 @@ def _fallback_wechat_title_from_source_title(source_title, max_chars):
     value = _fallback_bili_title_from_source_title(source_title, max_chars)
     # Interview-style publisher titles often contain a usable subject and topic
     # even when the transcript has no strong local hook.
-    raw = re.sub(r"\s+", " ", str(source_title or "")).strip()
+    raw = _apply_preferred_title_aliases(source_title, max_chars)
     subject_match = re.match(r"^(.{2,48}?)\s*(?:[-:：]\s)", raw)
     topic_match = re.search(
         r"\b(AI|GPT|Europe|America|China|OpenAI|Google|Meta|Palantir|AfD)\b",
@@ -2615,6 +2916,11 @@ def _compress_subtitle_hook_for_wechat(line, max_chars):
 def _fallback_consequence_wechat_title(subtitle_text, form_title, max_chars):
     """Turn a transcript cause and consequence into a short form title."""
     subject = _extract_bili_title_subject(form_title)
+    subject = _preferred_title_subject(
+        subject,
+        max_chars,
+        _PROPER_NOUN_TITLE_ALIASES,
+    )
     compact_text = re.sub(r"\s+", "", str(subtitle_text or ""))
     if not subject:
         return ""
@@ -2973,6 +3279,7 @@ def _fallback_bili_title_from_subtitle(
 def _fallback_bili_title_from_description(description, max_chars):
     """Build a conservative shared title when title-model calls time out."""
     value = re.sub(r"\s+", " ", str(description or "")).strip()
+    value = _apply_preferred_title_aliases(value, max_chars)
     if not value:
         return ""
     if not _contains_chinese_text(value, 8):
@@ -3091,6 +3398,7 @@ def _fallback_bili_title_from_description(description, max_chars):
 def _fallback_wechat_title_from_description(description, max_chars):
     """Build a natural short Panel title from the saved Chinese summary."""
     value = re.sub(r"\s+", " ", str(description or "")).strip()
+    value = _apply_preferred_title_aliases(value, max_chars)
     if not value or not _contains_chinese_text(value, 8):
         return ""
 
@@ -3159,6 +3467,7 @@ def _fallback_wechat_title_from_description(description, max_chars):
 def _fallback_wechat_title_from_bili_title(bili_title, max_chars):
     """Compress the local Bilibili fallback without another model call."""
     value = re.sub(r"\s+", " ", str(bili_title or "")).strip()
+    value = _apply_preferred_title_aliases(value, max_chars)
     compact_value = re.sub(r"\s+", "", value)
     generic_candidates = []
     if "全程负责" in compact_value:
@@ -3226,17 +3535,26 @@ def _fallback_wechat_title_from_bili_title(bili_title, max_chars):
 
 def _fallback_wechat_hook_from_bili_title(bili_title, max_chars):
     """Build a short hook from the subject and stance in a Bilibili title."""
-    compact = re.sub(r"\s+", "", str(bili_title or "")).strip()
+    value = _apply_preferred_title_aliases(
+        re.sub(r"\s+", " ", str(bili_title or "")).strip(),
+        max_chars,
+    )
+    compact = re.sub(r"\s+", "", value).strip()
     if not compact:
         return ""
 
     subject_match = re.search(
-        r"(?<![A-Za-z0-9_-])([A-Z][A-Za-z0-9_-]{2,})(?![A-Za-z0-9_-])",
-        compact,
+        r"(?<![A-Za-z0-9_-])("
+        r"[A-Z][A-Za-z0-9_-]{2,}(?:\s+[A-Z][A-Za-z0-9_-]{2,})*"
+        r")(?![A-Za-z0-9_-])",
+        value,
     )
-    if not subject_match:
+    if subject_match:
+        subject = subject_match.group(1)
+    else:
+        subject = _extract_bili_title_subject(compact)
+    if not subject:
         return ""
-    subject = subject_match.group(1)
 
     clauses = re.split(r"[，,。.；;：:、]", compact)
     anchor_clause = next((clause for clause in clauses if subject in clause), "")
