@@ -1887,7 +1887,7 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
             "视频简介：\n共享简介：卡普谈Palantir数据整合，不做服务；客户没有销售团队也大规模采用。",
             llm_client.generate_content.call_args_list[1].args[0],
         )
-        self.assertIn("优先 24-40 个字符", llm_client.generate_content.call_args_list[1].args[0])
+        self.assertIn("优先 20-40 个字符", llm_client.generate_content.call_args_list[1].args[0])
         self.assertIn("基于完整中文字幕和视频简介", llm_client.generate_content.call_args_list[1].args[0])
         self.assertIn("列出全片 5-8 个主要内容", llm_client.generate_content.call_args_list[1].args[0])
         self.assertIn("生成 10 个候选", llm_client.generate_content.call_args_list[1].args[0])
@@ -2117,6 +2117,178 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         self.assertEqual(wechat_title, "安德森谈旧的制造业岗位回不来")
         self.assertLessEqual(len(wechat_title), 16)
         self.assertTrue(autosub.normalize_shared_upload_title(wechat_title, 16))
+
+    def test_person_interview_title_algorithm_prefers_mainline_hooks(self):
+        """A person interview title must not collapse into one news event."""
+        source_title = (
+            "Ben Affleck s Turbulent Year - Navigating Grief "
+            "The Art of Not Caring"
+        )
+        description = (
+            "54岁的Ben Affleck敞开谈他“挺复杂的一年”：父母在两个月内相继离世，"
+            "让他直面人生的转瞬即逝，也更笃定要把时间花在孩子身上。"
+            "他推掉了本要执导的新戏，守在洛杉矶天天去Artists Equity上班。"
+            "聊起小报疯传他家被烧、遭FBI突袭的假消息，他已练就"
+            "“中年老爸该有的心态”。他还谈到与Matt Damon多年搭档的默契："
+            "活得够久，人生本身就成了最丰富的素材库。"
+        )
+        grief_event_title = (
+            "54岁的Ben Affleck敞开谈他挺复杂的一年"
+            "父母在两个月内相继离世"
+        )
+        editorial_summary_title = "GQ访谈大本：好莱坞一线男星的中年感悟"
+        spoken_hook_title = "GQ访谈大本：人生苦短，每天上班的感觉好极了"
+
+        grief_score = autosub._title_candidate_score(
+            grief_event_title,
+            80,
+            central_claim=description,
+            description=description,
+            source_title=source_title,
+        )
+        self.assertGreater(
+            autosub._title_candidate_score(
+                editorial_summary_title,
+                80,
+                central_claim=description,
+                description=description,
+                source_title=source_title,
+            ),
+            grief_score,
+        )
+        self.assertGreater(
+            autosub._title_candidate_score(
+                spoken_hook_title,
+                80,
+                central_claim=description,
+                description=description,
+                source_title=source_title,
+            ),
+            grief_score,
+        )
+
+        bili_title = autosub._fallback_bili_title_from_description(
+            description,
+            48,
+        )
+        self.assertEqual(
+            bili_title,
+            "54岁的大本谈中年心态、每天上班与人生素材库",
+        )
+        self.assertEqual(
+            autosub._fallback_wechat_title_from_bili_title(bili_title, 16),
+            "大本：人生成素材库",
+        )
+        self.assertEqual(
+            autosub._fallback_interview_cover_title_from_description(
+                description,
+                form_title=bili_title,
+                source_title=source_title,
+                max_chars=48,
+            ),
+            "大本访谈：活得够久，人生成了素材库",
+        )
+
+        cached_meta = {
+            "title": (
+                "54岁的Ben Affleck敞开谈他挺复杂的一年"
+                "父母在两个月内相继离世"
+            ),
+            "wechat_title": "54岁的大本敞开谈他挺复杂的一年",
+            "cover_title": (
+                "Ben：同时传言说FBI突袭了我家，又说我家烧没了"
+            ),
+            "description": description,
+        }
+        invalid_fields = autosub._invalidate_cached_upload_metadata(
+            cached_meta,
+            source_title,
+            "54岁的Ben Affleck谈中年、上班和人生素材库。",
+        )
+        self.assertEqual(invalid_fields, ["title", "wechat_title", "cover_title"])
+        self.assertEqual(cached_meta["title"], "")
+        self.assertEqual(cached_meta["wechat_title"], "")
+        self.assertEqual(cached_meta["cover_title"], "")
+
+    def test_person_interview_subtitle_fallback_uses_representative_hook(self):
+        """The short WeChat hook should choose the strongest life-stage line."""
+        subtitle_text = (
+            "人一到50，那肯定就没性生活了。\n"
+            "人生都快到头了。我20岁的时候，觉得50岁的人跟我毫不相干。\n"
+            "然后40岁、50岁，你会说，等等，怎么突然就打到人生第三节了。\n"
+            "同时传言说FBI突袭了我家，又说我家烧没了。\n"
+        )
+        form_title = "GQ访谈大本：好莱坞一线男星的中年感悟"
+
+        self.assertEqual(
+            autosub._fallback_wechat_title_from_subtitle(
+                subtitle_text,
+                max_chars=16,
+                form_title=form_title,
+            ),
+            "大本：人生到第三节",
+        )
+        self.assertEqual(
+            autosub._anchor_cover_hook_with_context(
+                "40岁、50岁，突然打到人生第三节",
+                form_title=form_title,
+                source_title="Ben Affleck interview",
+                description="54岁的Ben Affleck敞开谈中年心态。",
+            ),
+            "大本访谈：40岁、50岁，突然打到人生第三节",
+        )
+
+    def test_person_interview_prompts_use_separate_editorial_rules(self):
+        """Person interviews need their own prompt guidance and length gate."""
+        llm_client = MagicMock()
+        subtitle_title = MagicMock()
+        subtitle_title.SubtitleTitleError = ValueError
+        subtitle_title.parse_llm_title_candidates.return_value = (
+            "GQ访谈大本：人生苦短，每天上班的感觉好极了",
+            (
+                (
+                    "GQ访谈大本：人生苦短，每天上班的感觉好极了",
+                    ("人生都快到头了。我每天都来上班。",),
+                ),
+            ),
+        )
+        subtitle_title.validate_title_from_subtitle.return_value = (
+            "人生都快到头了。我每天都来上班。"
+        )
+        description = "54岁的Ben Affleck敞开谈中年心态、上班与人生素材库。"
+        subtitle_text = "54岁的Ben Affleck谈中年、上班和人生素材库。"
+
+        with patch.dict(sys.modules, {"subtitle_title": subtitle_title}):
+            title = autosub._generate_title_from_description(
+                description,
+                subtitle_text,
+                subtitle_text,
+                llm_client,
+                "glm-5.2",
+                48,
+                source_title="Ben Affleck interview",
+            )
+            with self.assertRaises(ValueError):
+                autosub._generate_cover_title_from_full_subtitle(
+                    subtitle_text,
+                    llm_client,
+                    "glm-5.2",
+                    form_title=title,
+                    source_title="Ben Affleck interview",
+                    description=description,
+                )
+
+        title_prompt = llm_client.generate_content.call_args_list[0].args[0]
+        cover_prompt = llm_client.generate_content.call_args_list[-1].args[0]
+        self.assertIn("人物访谈或人物特写", title_prompt)
+        self.assertIn("不要套用企业产品标题模板", title_prompt)
+        self.assertIn("Ben Affleck 用「大本」", title_prompt)
+        self.assertIn("至少 3 个候选使用原话钩子", title_prompt)
+        self.assertIn("优先 20-40 个字符", title_prompt)
+        self.assertIn("人物访谈", cover_prompt)
+        self.assertIn("人生阶段、通勤上班、素材库", cover_prompt)
+        self.assertIn("单一谣言或八卦事件", cover_prompt)
+        self.assertIn("例如「大本」", cover_prompt)
 
     def test_wechat_hook_fallback_derives_short_title_from_bili_title(self):
         """The Palantir title can yield a 16-character WeChat hook offline."""
@@ -3037,7 +3209,7 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         prompt = llm_client.generate_content.call_args.args[0]
         self.assertIn("完整中文字幕", prompt)
         self.assertIn("列出全片 5-8 个主要内容", prompt)
-        self.assertIn("优先 24-40 个字符", prompt)
+        self.assertIn("优先 20-40 个字符", prompt)
         self.assertIn("通常覆盖 3 个实质信息点", prompt)
         self.assertIn("参考下面公开B站标题的结构", prompt)
         self.assertIn("B站标题没有微信的 16 字限制", prompt)
@@ -3055,7 +3227,7 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
             "卡普谈Palantir数据整合，不做服务并坚持工程为本",
             "卡普谈Palantir把数据整合做成产品。",
             ("卡普谈Palantir数据整合",),
-            min_chars=24,
+            min_chars=18,
             max_chars=48,
         )
 
@@ -3322,7 +3494,7 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
             "Palantir为企业整合数据，不做服务，坚持工程为本",
             "我们干的，基本上就是整合数据。我们为企业整合数据。",
             ("我们干的，基本上就是整合数据。",),
-            min_chars=24,
+            min_chars=18,
             max_chars=48,
         )
 

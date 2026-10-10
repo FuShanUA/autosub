@@ -272,7 +272,7 @@ WECHAT_BROWSER_DATA_DIR = os.path.join(
 SHARED_UPLOAD_TITLE_MAX_CHARS = 16
 BILI_UPLOAD_TITLE_MAX_CHARS = 48
 BILI_UPLOAD_TITLE_HARD_MAX_CHARS = 80
-BILI_UPLOAD_TITLE_TARGET_MIN_CHARS = 24
+BILI_UPLOAD_TITLE_TARGET_MIN_CHARS = 18
 _wechat_venv_python = os.path.join(
     CURRENT_DIR,
     ".venv",
@@ -882,12 +882,14 @@ _SHARED_TITLE_ACTION_MARKERS = (
     "整合", "引领", "炮轰", "反对", "支持", "梳理", "展示", "迭代", "改造",
     "收购", "讨论", "推掉", "陪", "失去", "离世", "拒绝", "直面", "守",
     "被裁", "烂掉", "回忆",
+    "到", "成", "感觉", "上班",
 )
 _SHARED_TITLE_CONTEXT_MARKERS = (
     "访谈", "对话", "谈", "讲", "为", "帮", "给", "客户", "企业", "主题",
     "人才", "名校", "父母", "孩子", "新戏", "小报", "传言",
     "问题", "不做", "不是", "不招", "押注", "才是", "隐私", "一半",
     "被裁", "烂掉",
+    "人生", "中年", "上班", "素材库",
 )
 _PUBLIC_TITLE_STYLE_EXAMPLES = (
     "Palantir才是引领应用层的公司，客户从没见过这种阵势",
@@ -896,6 +898,30 @@ _PUBLIC_TITLE_STYLE_EXAMPLES = (
 )
 _SHARED_TITLE_STANCE_MARKERS = (
     "不做", "不是", "没有", "拒绝", "不招", "不卖", "才是", "推掉",
+)
+
+_INTERVIEW_TITLE_MARKERS = (
+    "访谈", "专访", "对话", "受访", "敞开谈", "interview",
+)
+_INTERVIEW_LIFE_STAGE_MARKERS = (
+    "中年", "50岁", "54岁", "人生", "第三节", "苦短",
+)
+_INTERVIEW_REPRESENTATIVE_HOOK_MARKERS = (
+    "上班", "素材库", "遗憾", "无所谓", "性生活", "杏生活", "第三节", "苦短",
+)
+_INTERVIEW_RUMOR_MARKERS = (
+    "小报", "传言", "谣言", "FBI", "突袭", "烧没了",
+)
+_INTERVIEW_EPISODIC_GRIEF_MARKERS = (
+    "父母", "离世", "相继", "丧亲",
+)
+_INTERVIEW_PERSON_ROLE_MARKERS = (
+    "创始人", "联合创始人", "CEO", "研究员", "演员", "导演", "作者", "嘉宾",
+)
+_INTERVIEW_KNOWN_PEOPLE = (
+    "Ben Affleck", "Matt Damon", "Alex Karp", "Peter Thiel",
+    "Marc Andreessen", "René Girard", "Rene Girard",
+    "Andrej Karpathy", "Elon Musk",
 )
 
 _PROPER_NOUN_TITLE_ALIASES = {
@@ -912,6 +938,67 @@ _PROPER_NOUN_TITLE_ALIASES = {
     "New York": ("纽约",),
     "San Francisco": ("旧金山",),
 }
+
+
+def _is_interview_title_context(*contexts):
+    """Detect a person interview instead of a product or business explainer."""
+    text = " ".join(str(context or "") for context in contexts).casefold()
+    if not text:
+        return False
+    has_interview_form = any(
+        marker.casefold() in text
+        for marker in _INTERVIEW_TITLE_MARKERS
+    )
+    life_stage_count = sum(
+        marker in text
+        for marker in _INTERVIEW_LIFE_STAGE_MARKERS
+    )
+    hook_count = sum(
+        marker in text
+        for marker in _INTERVIEW_REPRESENTATIVE_HOOK_MARKERS
+    )
+    has_person = (
+        any(person.casefold() in text for person in _INTERVIEW_KNOWN_PEOPLE)
+        or any(marker in text for marker in _INTERVIEW_PERSON_ROLE_MARKERS)
+    )
+    return (
+        (has_interview_form and has_person)
+        or life_stage_count + hook_count >= 2
+    )
+
+
+def _interview_title_quality_score(title):
+    """Prefer a person, life stage, and a representative spoken hook."""
+    value = re.sub(r"\s+", " ", str(title or "")).strip()
+    if not value:
+        return 0.0
+    score = 0.0
+    if any(marker in value for marker in ("访谈", "专访", "对话")):
+        score += 8.0
+    if re.search(r"^[^：:]{1,18}[：:]", value):
+        score += 3.0
+    score += 5.0 * sum(
+        marker in value
+        for marker in _INTERVIEW_LIFE_STAGE_MARKERS
+    )
+    score += 6.0 * sum(
+        marker in value
+        for marker in _INTERVIEW_REPRESENTATIVE_HOOK_MARKERS
+    )
+    if any(marker in value for marker in _INTERVIEW_RUMOR_MARKERS) and not any(
+        marker in value
+        for marker in (
+            _INTERVIEW_LIFE_STAGE_MARKERS
+            + _INTERVIEW_REPRESENTATIVE_HOOK_MARKERS
+        )
+    ):
+        score -= 8.0
+    if any(marker in value for marker in _INTERVIEW_EPISODIC_GRIEF_MARKERS) and not any(
+        marker in value
+        for marker in _INTERVIEW_REPRESENTATIVE_HOOK_MARKERS
+    ):
+        score -= 10.0
+    return score
 
 
 def _parse_llm_title_aliases(raw):
@@ -1060,6 +1147,7 @@ _COVER_TITLE_SUBJECT_MARKERS = (
     "医院", "病人", "医生", "警局", "警察", "新人", "员工", "团队",
     "公司", "客户", "企业", "工程师", "学生", "学校", "军队", "前线",
     "数据治理", "网络攻击", "透析", "脓毒症", "癌症", "战争", "武器",
+    "中年", "50岁", "54岁", "人生", "第三节", "素材库", "性生活", "杏生活",
 )
 _COVER_TITLE_CONFLICT_MARKERS = (
     "被", "没有", "不", "无法", "做不了", "停摆", "攻击", "裁",
@@ -1078,6 +1166,7 @@ _COVER_TITLE_THESIS_ACTION_MARKERS = (
     "用", "整合", "识别", "救治", "优化", "合作", "布局",
     "推进", "建立", "采用", "穿针引线",
     "解决", "放大", "谈",
+    "到", "成", "感觉", "觉得", "以为", "认识",
     "收购",
 )
 _COVER_TITLE_TRANSLATION_TERMS = (
@@ -1140,7 +1229,13 @@ def _cover_title_information_units(title):
         + _cover_title_has_thesis_action(value)
         + any(marker in value for marker in _COVER_TITLE_CONFLICT_MARKERS)
         + any(marker in value for marker in _COVER_TITLE_CONSEQUENCE_MARKERS)
-        + bool(re.search(r"(?:[0-9一二三四五六七八九十]+(?:周|年|次|倍)|第[0-9一二三四五六七八九十]+|一半)", value))
+        + bool(
+            re.search(
+                r"(?:[0-9一二三四五六七八九十]+(?:周|年|次|倍|岁)"
+                r"|第[0-9一二三四五六七八九十]+|一半)",
+                value,
+            )
+        )
     )
 
 
@@ -1354,6 +1449,12 @@ def _title_candidate_score(
 ):
     """Combine editorial structure with semantic alignment to the video."""
     score = _shared_title_score(title, max_chars=max_chars)
+    if _is_interview_title_context(
+        central_claim,
+        description,
+        source_title,
+    ):
+        score += _interview_title_quality_score(title)
     if central_claim:
         score += 6.0 * _title_reference_coverage(title, central_claim)
     if description:
@@ -1473,6 +1574,11 @@ def _metadata_title_has_quality_issue(
         description=description,
     ):
         return True
+    if (
+        _is_interview_title_context(value, description, source_title)
+        and _interview_title_quality_score(value) < 0
+    ):
+        return True
     return bool(_shared_title_has_quality_issue(value))
 
 
@@ -1502,6 +1608,11 @@ def _metadata_cover_title_has_quality_issue(
         return True
     if _cover_title_repeats_form_title(value, form_title):
         return True
+    if (
+        _is_interview_title_context(value, description, source_title)
+        and _interview_title_quality_score(value) < 0
+    ):
+        return True
     return bool(_cover_title_has_quality_issue(value))
 
 
@@ -1519,6 +1630,8 @@ def _invalidate_cached_upload_metadata(meta, source_title, chinese_subtitle):
     if title_invalid:
         if meta.get("title"):
             invalid_fields.append("title")
+        if meta.get("wechat_title"):
+            invalid_fields.append("wechat_title")
     if _metadata_title_has_quality_issue(
         meta.get("wechat_title"),
         source_title,
@@ -1634,13 +1747,32 @@ def _generate_title_from_description(
             "不要逐字翻译原标题，也不要只抽原标题里的一个词。"
             f"\n视频原标题：\n{source_title}\n\n"
         )
+    interview_guidance = ""
+    if _is_interview_title_context(
+        source_title,
+        description,
+        subtitle_text,
+    ):
+        interview_guidance = (
+            "本视频是人物访谈或人物特写，不要套用企业产品标题模板。"
+            "先给人物一个公众可识别的中文称呼，优先用通行译名或熟知绰号，"
+            "例如 Ben Affleck 用「大本」；无法确认时才保留英文全名。"
+            "标题优先写成「栏目/访谈+人物：人生阶段或处境+代表性判断」，"
+            "后半句可以来自全片最有代表性的原话或最小复述。"
+            "表单标题仍要概括全片：选择贯穿访谈的中年处境、家庭、职业选择"
+            "和情绪主线，不要把父母离世、谣言或单一新闻事件放到主位。"
+            "至少 3 个候选使用原话钩子，至少 3 个候选用编辑总结；"
+            "反复比较哪一句最能代表整场访谈，直到你对候选感到骄傲。"
+            "人物访谈不适用上文的核心业务、产品和受益者优先级；"
+            "完整人物身份、人生阶段和代表性金句就是实质信息点。"
+        )
     base_prompt = (
         "基于完整中文字幕和视频简介，生成B站表单标题。"
         "这不是普通摘要任务。请像准备首页推荐的资深编辑一样处理："
         "先通读全片，找出贯穿首尾的主线，再用大量思考反复改写候选，"
         "淘汰第一版和平庸版本，直到你对结果感到骄傲才输出。"
         f"标题长度必须为 {min_chars}-{max_chars} 个字符，英文字母逐字符计数。"
-        "优先 24-40 个字符，只有信息不足时才低于 24 个字符。"
+        "优先 20-40 个字符，只有信息不足时才低于 20 个字符。"
         "输出前必须逐字重数一遍；超过上限的候选直接作废。"
         "输出前再按中文编辑标准默读一遍：标题必须是现代汉语自然短句，"
         "不得有翻译腔、口语填充、机械拼接或AI套话。"
@@ -1705,6 +1837,7 @@ def _generate_title_from_description(
         f"视频简介：\n{description}\n\n"
         f"完整中文字幕：\n{subtitle_text}"
     )
+    base_prompt = interview_guidance + base_prompt
     last_error = None
     validation_feedback = ""
     subject_aliases = dict(_PROPER_NOUN_TITLE_ALIASES)
@@ -1811,6 +1944,18 @@ def _generate_structured_title_from_description(
             "若字幕主线与原标题侧重点不同，以字幕主线为主。"
             f"\n视频原标题：\n{source_title}\n\n"
         )
+    interview_guidance = ""
+    if _is_interview_title_context(
+        source_title,
+        description,
+        subtitle_text,
+    ):
+        interview_guidance = (
+            "本视频是人物访谈。subject 写人物通行中文名或熟知绰号，"
+            "beneficiary 可为空；object 可写人生、中年、家庭或职业选择；"
+            "second_claim 优先用全片代表性原话或最小复述。"
+            "不要强行套用企业客户、核心业务或产品对象。"
+        )
     base_prompt = (
         "把视频简介和完整中文字幕概括成B站表单标题。"
         "输出5个结构化候选，按全片概括强度排序。"
@@ -1846,6 +1991,7 @@ def _generate_structured_title_from_description(
         f"视频简介：\n{description}\n\n"
         f"完整中文字幕：\n{subtitle_text}"
     )
+    base_prompt = interview_guidance + base_prompt
 
     validation_feedback = ""
     subject_aliases = dict(_PROPER_NOUN_TITLE_ALIASES)
@@ -1974,6 +2120,14 @@ def _extract_bili_title_subject(bili_title):
     value = re.sub(r"\s+", " ", str(bili_title or "")).strip()
     if not value:
         return ""
+
+    if "：" in value or ":" in value:
+        prefix = re.split(r"[：:]", value, maxsplit=1)[0].strip()
+        if "访谈" in prefix:
+            before, after = prefix.split("访谈", 1)
+            subject = after.strip() or before.strip()
+            if subject:
+                return subject
 
     markers = (
         _SHARED_TITLE_ACTION_MARKERS
@@ -2243,6 +2397,21 @@ def _derive_wechat_title_from_bili_title(
             "视频原标题只用于校验题材和场景，不得取代B站标题的中心主张。"
             f"\n视频原标题：\n{source_title}\n\n"
         )
+    interview_guidance = ""
+    if _is_interview_title_context(
+        bili_title,
+        description,
+        subtitle_text,
+        source_title,
+    ):
+        interview_guidance = (
+            "本视频是人物访谈。必须保留人物主体，优先使用公众熟知绰号，"
+            "例如「大本」，不要保留英文全名。"
+            "16 字内优先写「人物+人生阶段+代表性金句」，"
+            "例如「大本：人生到第三节」这类结构。"
+            "不要把单一八卦事件、父母离世或谣言当成视频号标题主体；"
+            "这些只能作为次要信息，且通常放不下。"
+        )
     base_prompt = (
         "为视频号生成更有吸引力的表单标题。"
         "请像资深短视频编辑一样处理：先确认B站标题的主题边界，"
@@ -2286,6 +2455,7 @@ def _derive_wechat_title_from_bili_title(
         f"视频简介：\n{description}\n\n"
         f"完整中文字幕：\n{subtitle_text}"
     )
+    base_prompt = interview_guidance + base_prompt
 
     last_error = None
     validation_feedback = ""
@@ -2433,6 +2603,19 @@ def _generate_cover_title_from_full_subtitle(
         if description:
             title_context += f"\n视频简介（全片主线参考）：\n{description}\n"
         title_context += "\n"
+    if _is_interview_title_context(
+        form_title,
+        source_title,
+        description,
+    ):
+        title_context += (
+            "本视频是人物访谈。封面标题优先选人物亲口说出、"
+            "且能代表全片情绪主线的金句；人生阶段、通勤上班、"
+            "素材库、遗憾这类句子通常比单一谣言或八卦事件更强。"
+            "钩子必须锚定人物，优先用公众熟知绰号，例如「大本」。"
+            "先比较 8-12 个原话，再判断哪一句最能代表整场访谈，"
+            "不要只按猎奇程度选择。"
+        )
 
     base_prompt = (
         "你是资深中文科技内容编辑。请通读下面的完整中文字幕，"
@@ -2550,6 +2733,12 @@ def _generate_cover_title_from_full_subtitle(
                     title = item[0]
                     compact_title = re.sub(r"\s+", "", title)
                     score = 0.0
+                    if _is_interview_title_context(
+                        form_title,
+                        source_title,
+                        description,
+                    ):
+                        score += _interview_title_quality_score(title)
                     score += 2.0 * _cover_title_information_units(title)
                     score += 2.0 * _cover_title_context_anchor_count(
                         title,
@@ -2789,7 +2978,13 @@ def _clean_subtitle_hook_line(line):
     """Turn one subtitle line into a headline-shaped local fallback."""
     value = re.sub(r"\s+", " ", str(line or "")).strip()
     value = value.strip("“”\"' 　")
+    value = re.sub(r"^\[[^\]]+\]\s*", "", value)
     value = re.sub(r"^(?:嗯|哦|对|就是)[，,：: ]+", "", value)
+    value = re.sub(
+        r"^(?:哎呀|唉|然后|当然|说明一下|我是说|我是想说)[，,：: ]+",
+        "",
+        value,
+    )
     value = re.sub(
         r"^(?:当然可以|没问题|好的|好|可以)[。.!！?？\s]+",
         "",
@@ -2802,6 +2997,26 @@ def _clarify_cover_hook_line(line):
     """Make a grounded fallback hook readable without adding new facts."""
     value = _clean_subtitle_hook_line(line)
     replacements = (
+        (
+            "人一到50，那肯定就没性生活了",
+            "人一到50，就没性生活了",
+        ),
+        (
+            "人生都快到头了。我20岁的时候，觉得50岁的人跟我毫不相干",
+            "人生快到头，50岁的人毫不相干",
+        ),
+        (
+            "然后40岁、50岁，你会说，等等，怎么突然就打到人生第三节了",
+            "40岁、50岁，突然打到人生第三节",
+        ),
+        (
+            "我觉得大家要是知道你每天都来上班，会非常吃惊",
+            "大家知道他每天都来上班，会非常吃惊",
+        ),
+        (
+            "活得够久，人生本身就成了最丰富的素材库",
+            "活得够久，人生成了素材库",
+        ),
         ("医院被攻击，就有人做不了透析", "医院被攻击，透析先受影响"),
         ("医院被攻击，有人做不了透析", "医院被攻击，透析先受影响"),
         ("数据治理有一半的工作是在当穿针引线的人", "数据治理一半工作是在穿针引线"),
@@ -2836,14 +3051,47 @@ def _anchor_cover_hook_with_context(
         return value
 
     subject = ""
-    for context in contexts:
-        match = re.search(
-            r"\b([A-Za-z][A-Za-z0-9_-]{2,})\s*(?:现场)?访谈",
-            str(context or ""),
-        )
-        if match:
-            subject = match.group(1)
+    context_text = " ".join(str(context or "") for context in contexts)
+    for known_subject in _PROPER_NOUN_TITLE_ALIASES:
+        if re.search(
+            rf"(?<![A-Za-z0-9_-]){re.escape(known_subject)}(?![A-Za-z0-9_-])",
+            context_text,
+        ):
+            subject = known_subject
             break
+    if not subject:
+        for context in contexts:
+            for token in (
+                token
+                for token in re.findall(
+                    r"\b[A-Za-z][A-Za-z0-9_-]{2,}\b",
+                    str(context or ""),
+                )
+                if token.lower() not in _TITLE_LATIN_STOPWORDS
+            ):
+                if token:
+                    subject = token
+                    break
+            if subject:
+                break
+        if not subject:
+            for context in contexts:
+                context_text = str(context or "")
+                match = re.search(
+                    r"\b([A-Z][A-Za-z0-9_-]{2,}"
+                    r"(?:\s+[A-Z][A-Za-z0-9_-]{2,})+)\b",
+                    context_text,
+                )
+                if match:
+                    subject = match.group(1)
+                    break
+                match = re.search(
+                    r"\b([A-Za-z][A-Za-z0-9_-]{2,})\s*(?:现场)?访谈",
+                    context_text,
+                )
+                if match:
+                    subject = match.group(1)
+                    break
     if not subject:
         for context in contexts:
             tokens = re.findall(
@@ -2854,6 +3102,7 @@ def _anchor_cover_hook_with_context(
                 subject = tokens[0]
                 break
     subject = str(subject or "").strip(" ：:，,。.！!？?；;")
+    subject = _apply_preferred_title_aliases(subject, max_chars)
     if (
         not subject
         or subject.casefold() in value.casefold()
@@ -2862,7 +3111,10 @@ def _anchor_cover_hook_with_context(
 
     context_text = " ".join(str(context or "") for context in contexts)
     if (
-        "访谈" in context_text
+        any(
+            marker in context_text
+            for marker in ("访谈", "专访", "对话", "敞开谈")
+        )
         and "访谈" not in subject
         and "访谈" not in value
     ):
@@ -2917,6 +3169,22 @@ def _subtitle_sentence_candidates(subtitle_text):
 def _subtitle_hook_score(value):
     """Prefer concrete images and consequences over generic value claims."""
     score = 0.0
+    score += 12.0 * sum(
+        marker in value
+        for marker in _INTERVIEW_LIFE_STAGE_MARKERS
+    )
+    score += 14.0 * sum(
+        marker in value
+        for marker in _INTERVIEW_REPRESENTATIVE_HOOK_MARKERS
+    )
+    if any(marker in value for marker in _INTERVIEW_RUMOR_MARKERS) and not any(
+        marker in value
+        for marker in (
+            _INTERVIEW_LIFE_STAGE_MARKERS
+            + _INTERVIEW_REPRESENTATIVE_HOOK_MARKERS
+        )
+    ):
+        score -= 16.0
     score += 16.0 * sum(
         marker in value
         for marker in ("结缔组织", "筋膜", "马戏团", "正中央", "深水区")
@@ -3003,6 +3271,80 @@ def _fallback_consequence_cover_title(subtitle_text):
     return ""
 
 
+def _fallback_interview_wechat_title_from_subtitle(
+    subtitle_text,
+    form_title=None,
+    max_chars=16,
+):
+    """Turn a representative interview quote into a short WeChat hook."""
+    value = re.sub(r"\s+", " ", str(form_title or "")).strip()
+    subject = _extract_bili_title_subject(value)
+    full_name = re.search(
+        r"\b[A-Z][A-Za-z0-9_-]{2,}(?:\s+[A-Z][A-Za-z0-9_-]{2,})+\b",
+        value,
+    )
+    if full_name:
+        subject = full_name.group(0)
+    subject = re.sub(r"^[0-9]{2}岁的", "", subject)
+    subject = _preferred_title_subject(
+        subject,
+        max_chars,
+        _PROPER_NOUN_TITLE_ALIASES,
+    )
+    if not subject:
+        return ""
+
+    hook_candidates = []
+    for cleaned in _subtitle_sentence_candidates(subtitle_text):
+        cleaned = _clarify_cover_hook_line(cleaned)
+        if not any(
+            marker in cleaned
+            for marker in (
+                _INTERVIEW_LIFE_STAGE_MARKERS
+                + _INTERVIEW_REPRESENTATIVE_HOOK_MARKERS
+            )
+        ):
+            continue
+        if "第三节" in cleaned:
+            hook = "人生到第三节"
+        elif "快到头" in cleaned:
+            hook = "人生快到头"
+        elif "上班" in cleaned:
+            hook = "每天上班"
+        elif "素材库" in cleaned:
+            hook = "人生成素材库"
+        else:
+            continue
+        hook_score = 5.0 * sum(
+            marker in hook
+            for marker in _INTERVIEW_LIFE_STAGE_MARKERS
+        )
+        hook_score += 6.0 * sum(
+            marker in hook
+            for marker in _INTERVIEW_REPRESENTATIVE_HOOK_MARKERS
+        )
+        if "第三节" in hook:
+            hook_score += 8.0
+        if "素材库" in hook:
+            hook_score += 6.0
+        if "快到头" in hook:
+            hook_score += 3.0
+        if "上班" in hook:
+            hook_score += 2.0
+        candidate = f"{subject}：{hook}"
+        if len(candidate) > max_chars:
+            continue
+        normalized = normalize_shared_upload_title(
+            candidate,
+            max_chars=max_chars,
+        )
+        if normalized and not _shared_title_has_quality_issue(normalized):
+            hook_candidates.append((hook_score, normalized))
+    if not hook_candidates:
+        return ""
+    return max(hook_candidates, key=lambda item: (item[0], len(item[1])))[1]
+
+
 def _fallback_wechat_title_from_subtitle(
     subtitle_text,
     max_chars=16,
@@ -3010,6 +3352,13 @@ def _fallback_wechat_title_from_subtitle(
 ):
     """Choose a concrete transcript hook when the title model times out."""
     candidates = []
+    interview_title = _fallback_interview_wechat_title_from_subtitle(
+        subtitle_text,
+        form_title=form_title,
+        max_chars=max_chars,
+    )
+    if interview_title:
+        candidates.append((120.0, interview_title))
     consequence_title = _fallback_consequence_wechat_title(
         subtitle_text,
         form_title,
@@ -3042,6 +3391,72 @@ def _fallback_wechat_title_from_subtitle(
     )[1]
 
 
+def _fallback_interview_cover_title_from_description(
+    description,
+    form_title="",
+    source_title="",
+    max_chars=48,
+):
+    """Use a saved interview summary's closing judgment as a cover hook."""
+    value = re.sub(r"\s+", " ", str(description or "")).strip()
+    if not value or not _is_interview_title_context(
+        form_title,
+        source_title,
+        value,
+    ):
+        return ""
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(r"[。！？\n]", value)
+        if sentence.strip()
+    ]
+    if not sentences:
+        return ""
+    closing_sentence = sentences[-1]
+    if "——" in closing_sentence:
+        closing_sentence = closing_sentence.rsplit("——", 1)[-1]
+    if "：" in closing_sentence:
+        closing_sentence = closing_sentence.rsplit("：", 1)[-1]
+    elif ":" in closing_sentence:
+        closing_sentence = closing_sentence.rsplit(":", 1)[-1]
+    candidate = _clarify_cover_hook_line(closing_sentence)
+    if not 12 <= len(candidate) <= max_chars:
+        return ""
+    if not any(
+        marker in candidate
+        for marker in (
+            _INTERVIEW_LIFE_STAGE_MARKERS
+            + _INTERVIEW_REPRESENTATIVE_HOOK_MARKERS
+        )
+    ):
+        return ""
+    candidate = _anchor_cover_hook_with_context(
+        candidate,
+        form_title=form_title,
+        source_title=source_title,
+        description=value,
+        max_chars=max_chars,
+    )
+    if (
+        _cover_title_has_quality_issue(candidate)
+        or _cover_title_has_engagement_issue(candidate)
+        or _cover_title_has_context_issue(
+            candidate,
+            form_title=form_title,
+            source_title=source_title,
+            description=value,
+        )
+        or _cover_title_has_thesis_issue(
+            candidate,
+            form_title=form_title,
+            source_title=source_title,
+            description=value,
+        )
+    ):
+        return ""
+    return candidate
+
+
 def _fallback_cover_title_from_subtitle(
     subtitle_text,
     form_title=None,
@@ -3051,6 +3466,17 @@ def _fallback_cover_title_from_subtitle(
 ):
     """Use any complete subtitle hook instead of repeating the form title."""
     candidates = []
+    description_hook = _fallback_interview_cover_title_from_description(
+        description,
+        form_title=form_title,
+        source_title=source_title,
+        max_chars=max_chars,
+    )
+    if description_hook and not _cover_title_repeats_form_title(
+        description_hook,
+        form_title,
+    ):
+        candidates.append((140.0, description_hook))
     consequence_cover = _fallback_consequence_cover_title(subtitle_text)
     if consequence_cover and not _cover_title_repeats_form_title(
         consequence_cover,
@@ -3062,10 +3488,12 @@ def _fallback_cover_title_from_subtitle(
         "医院", "病房", "临床", "透析", "脓毒症", "前线", "战争", "武器",
         "攻击", "袭击", "网络攻击", "欺诈", "警局", "大脑", "人脑",
         "马戏团", "帕罗奥图", "深水区", "工程师",
+        "50岁", "54岁", "人生", "第三节", "上班", "素材库",
     )
     conflict_markers = (
         "被", "没有", "不是", "不了", "头号", "杀手", "救", "烂掉",
         "断了", "没了", "永远", "必须", "标准",
+        "没", "突然", "快到头",
     )
     opening_markers = (
         "大家好", "欢迎", "谢谢", "接下来", "今天我们", "本期视频",
@@ -3257,6 +3685,58 @@ def _description_fallback_subject(description, prefer_company=False):
     return ""
 
 
+def _fallback_interview_bili_title_from_description(description, max_chars):
+    """Summarize a person interview without promoting one news event."""
+    value = re.sub(r"\s+", " ", str(description or "")).strip()
+    if not value or not _is_interview_title_context(value):
+        return ""
+
+    subject = ""
+    age = ""
+    age_subject_match = re.search(
+        r"([0-9]{2})岁的\s*([A-Za-z][A-Za-z0-9_-]*(?:\s+[A-Za-z][A-Za-z0-9_-]*)*)"
+        r"\s*(?:敞开谈|谈|聊|回忆)",
+        value,
+    )
+    if age_subject_match:
+        age = f"{age_subject_match.group(1)}岁"
+        subject = age_subject_match.group(2).strip()
+    else:
+        dialog_match = re.search(
+            r"(?:对话|专访|访谈)\s*"
+            r"([A-Za-z][A-Za-z0-9_-]*(?:\s+[A-Za-z][A-Za-z0-9_-]*)*)",
+            value,
+        )
+        if dialog_match:
+            subject = dialog_match.group(1).strip()
+    subject = _apply_preferred_title_aliases(subject, max_chars)
+    if not subject:
+        return ""
+
+    claims = []
+    compact_value = re.sub(r"\s+", "", value)
+    if "中年" in compact_value:
+        claims.append("中年心态")
+    if "上班" in compact_value:
+        claims.append("每天上班")
+    if "素材库" in compact_value:
+        claims.append("人生素材库")
+    if "孩子" in compact_value and len(claims) < 3:
+        claims.append("陪孩子")
+    if len(claims) < 2:
+        return ""
+
+    prefix = f"{age}的{subject}谈" if age else f"{subject}谈"
+    body = "、".join(claims[:3])
+    if len(claims) > 1:
+        body = claims[0] + "、" + "与".join(claims[1:3])
+    candidate = normalize_bili_upload_title(
+        f"{prefix}{body}",
+        max_chars=max_chars,
+    )
+    return candidate
+
+
 def _description_cover_subject(source_title, description):
     """Find a Latin subject shared by the publisher title and summary."""
     source_tokens = re.findall(
@@ -3330,12 +3810,19 @@ def _fallback_bili_title_from_subtitle(
 
 def _fallback_bili_title_from_description(description, max_chars):
     """Build a conservative shared title when title-model calls time out."""
-    value = re.sub(r"\s+", " ", str(description or "")).strip()
-    value = _apply_preferred_title_aliases(value, max_chars)
+    raw_value = re.sub(r"\s+", " ", str(description or "")).strip()
+    value = _apply_preferred_title_aliases(raw_value, max_chars)
     if not value:
         return ""
     if not _contains_chinese_text(value, 8):
         return ""
+
+    interview_title = _fallback_interview_bili_title_from_description(
+        raw_value,
+        max_chars,
+    )
+    if interview_title:
+        return interview_title
 
     fragments = _description_title_fragments(value)
     candidates = []
@@ -3522,6 +4009,24 @@ def _fallback_wechat_title_from_bili_title(bili_title, max_chars):
     value = _apply_preferred_title_aliases(value, max_chars)
     compact_value = re.sub(r"\s+", "", value)
 
+    if _is_interview_title_context(value):
+        subject = _extract_bili_title_subject(value)
+        subject = re.sub(r"^[0-9]{2}岁的", "", subject)
+        hook = ""
+        if "素材库" in compact_value:
+            hook = "人生成素材库"
+        elif "中年" in compact_value:
+            hook = "人到中年"
+        elif "上班" in compact_value:
+            hook = "每天上班"
+        if subject and hook:
+            normalized = normalize_shared_upload_title(
+                f"{subject}：{hook}",
+                max_chars=max_chars,
+            )
+            if normalized:
+                return normalized
+
     interview_match = re.match(
         r"^(.{2,32}?)"
         r"(?:在访谈中直言|在专访中直言|在访谈中说|在专访中说|在访谈中指出)"
@@ -3619,6 +4124,52 @@ def _fallback_wechat_hook_from_bili_title(bili_title, max_chars):
     if not compact:
         return ""
 
+    if "：" in value or ":" in value:
+        prefix, body = re.split(r"[：:]", value, maxsplit=1)
+        subject = _extract_bili_title_subject(value)
+        body = re.sub(r"\s+", "", body)
+        body = re.split(r"[，,。.；;]", body)[0]
+        if subject and body:
+            candidate = f"{subject}：{body}"
+            normalized = normalize_shared_upload_title(
+                candidate,
+                max_chars=max_chars,
+            )
+            if not normalized:
+                marker = next(
+                    (
+                        marker
+                        for marker in (
+                            _INTERVIEW_LIFE_STAGE_MARKERS
+                            + _INTERVIEW_REPRESENTATIVE_HOOK_MARKERS
+                        )
+                        if marker in body
+                    ),
+                    "",
+                )
+                if marker:
+                    if marker in ("中年", "50岁", "54岁"):
+                        compact_marker = "人到中年"
+                    elif marker in ("人生", "苦短"):
+                        compact_marker = (
+                            "人生苦短" if "苦短" in body else "谈人生"
+                        )
+                    elif marker == "第三节":
+                        compact_marker = "人生到第三节"
+                    elif marker == "素材库":
+                        compact_marker = "人生成素材库"
+                    elif marker == "上班":
+                        compact_marker = "每天上班"
+                    else:
+                        compact_marker = marker
+                    candidate = f"{subject}：{compact_marker}"
+                normalized = normalize_shared_upload_title(
+                    candidate,
+                    max_chars=max_chars,
+                )
+                if normalized:
+                    return normalized
+
     subject_match = re.search(
         r"(?<![A-Za-z0-9_-])("
         r"[A-Z][A-Za-z0-9_-]{2,}(?:\s+[A-Z][A-Za-z0-9_-]{2,})*"
@@ -3681,6 +4232,15 @@ def _fallback_cover_title_from_description(
     value = re.sub(r"\s+", " ", str(description or "")).strip()
     if not value or not _contains_chinese_text(value, 8):
         return ""
+
+    interview_hook = _fallback_interview_cover_title_from_description(
+        value,
+        form_title=form_title,
+        source_title=source_title,
+        max_chars=max_chars,
+    )
+    if interview_hook:
+        return interview_hook
 
     fragments = _description_title_fragments(value)
     if (
