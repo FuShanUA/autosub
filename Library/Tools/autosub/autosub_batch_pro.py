@@ -2093,6 +2093,7 @@ class BatchEngine:
                                 llm_model=upload_llm_model,
                                 llm_provider=upload_llm_provider,
                                 on_log=_bili_metadata_log,
+                                source_title=task.title,
                             )
                         if need_bi and bili_metadata:
                             with self.lock:
@@ -2151,6 +2152,7 @@ class BatchEngine:
                                 llm_model=upload_llm_model,
                                 llm_provider=upload_llm_provider,
                                 on_log=_wechat_metadata_log,
+                                source_title=task.title,
                             )
                             wx_skip_reason = get_wechat_upload_skip_reason(workdir)
                         if need_wx and not wechat_metadata:

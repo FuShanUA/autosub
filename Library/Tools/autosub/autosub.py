@@ -2957,10 +2957,96 @@ def _extract_source_title(video_path):
         base = re.sub(r"\s*\[[^\]]+\]\s*$", "", base).strip()
     base = base.replace("_", " ")
     value = re.sub(r"\s+", " ", base).strip()
-    normalized = value.casefold()
-    return "" if normalized in {
+    if _is_usable_source_title(value):
+        return value
+
+    # Some downloaded filenames collapse to a playlist label such as "ENG 1".
+    # Only then should the task folder, which preserves the publisher title,
+    # be used as the source-title fallback.
+    if re.fullmatch(
+        r"(?:eng|en|ep|episode|part|p|video)\s*\d+",
+        value.casefold(),
+    ):
+        folder_base = os.path.basename(os.path.normpath(directory))
+        folder_value = re.sub(r"\s+", " ", folder_base.replace("_", " ")).strip()
+        folder_value = re.sub(r"^\[\d+\]\s*-\s*", "", folder_value).strip()
+        for _ in range(2):
+            folder_value = re.sub(r"\s*\[[^\]]+\]\s*$", "", folder_value).strip()
+        if _is_usable_source_title(folder_value):
+            return folder_value
+    return ""
+
+
+_SOURCE_TITLE_TOPIC_TRANSLATIONS = (
+    ("ontology", "本体论"),
+    ("deep learning", "深度学习"),
+    ("artificial intelligence", "AI"),
+    ("machine learning", "机器学习"),
+    ("robots", "机器人"),
+)
+
+
+def _source_title_topic_fallback(source_title, max_chars, description=""):
+    """Turn a publisher topic into a readable Chinese last-resort title."""
+    value = re.sub(r"\s+", " ", str(source_title or "")).strip()
+    if not value:
+        return ""
+    value = re.sub(r"^\[[^]]+\]\s*-\s*", "", value).strip()
+    lower_value = value.casefold()
+    topics = [
+        chinese
+        for english, chinese in _SOURCE_TITLE_TOPIC_TRANSLATIONS
+        if english in lower_value
+    ]
+    if not topics:
+        return ""
+
+    subject = _description_cover_subject(value, description)
+    if not subject:
+        subject = next(
+            (
+                token
+                for token in re.findall(r"\b[A-Za-z][A-Za-z0-9_-]*\b", value)
+                if token.casefold() not in _TITLE_LATIN_STOPWORDS
+                and not re.fullmatch(
+                    r"(?:eng|en|ep|episode|part|p|video)\d*",
+                    token.casefold(),
+                )
+                and not any(
+                    token.casefold() in english
+                    for english, _ in _SOURCE_TITLE_TOPIC_TRANSLATIONS
+                )
+            ),
+            "",
+        )
+    subject = _apply_preferred_title_aliases(subject, max_chars)
+
+    primary_topic = topics[0]
+    if subject:
+        candidate = f"{subject}谈{primary_topic}"
+        if "深度学习" in topics and primary_topic != "深度学习":
+            candidate = f"{subject}谈{primary_topic}：深度学习新解读"
+    else:
+        candidate = f"用{'与'.join(topics[:2])}讲清主题"
+    if len(candidate) > max_chars:
+        candidate = f"{subject}谈{primary_topic}" if subject else candidate[:max_chars]
+    return candidate
+
+
+def _is_usable_source_title(value):
+    """Reject placeholders and sequence labels that carry no video topic."""
+    normalized = re.sub(r"\s+", " ", str(value or "")).strip().casefold()
+    if normalized in {
         "video", "hardsub", "video hardsub", "output", "untitled",
-    } else value
+        "unknown video", "loading", "noads",
+    }:
+        return False
+    if re.fullmatch(
+        r"(?:eng|en|ep|episode|part|p|video)\s*\d+",
+        normalized,
+    ):
+        return False
+    return len(re.sub(r"[^a-z0-9\u3400-\u9fff]", "", normalized)) >= 4
 
 
 def _fallback_bili_title_from_source_title(source_title, max_chars, description=""):
@@ -2969,6 +3055,18 @@ def _fallback_bili_title_from_source_title(source_title, max_chars, description=
     value = _apply_preferred_title_aliases(value, max_chars)
     if not value:
         return ""
+    topic_title = _source_title_topic_fallback(
+        source_title,
+        max_chars,
+        description=description,
+    )
+    if topic_title:
+        normalized_topic_title = normalize_bili_upload_title(
+            topic_title,
+            max_chars=max_chars,
+        )
+        if normalized_topic_title:
+            return normalized_topic_title
     interview_title = re.sub(
         r"^([^\s：:][^：:]{0,47}?)\s+on\s+(.+)$",
         r"\1谈\2",
@@ -3009,6 +3107,14 @@ def _fallback_bili_title_from_source_title(source_title, max_chars, description=
 
 def _fallback_wechat_title_from_source_title(source_title, max_chars):
     """Keep a word-boundary prefix of the publisher title for WeChat."""
+    topic_title = _source_title_topic_fallback(source_title, max_chars)
+    if topic_title:
+        normalized_topic_title = normalize_shared_upload_title(
+            topic_title,
+            max_chars=max_chars,
+        )
+        if normalized_topic_title:
+            return normalized_topic_title
     value = _fallback_bili_title_from_source_title(source_title, max_chars)
     # Interview-style publisher titles often contain a usable subject and topic
     # even when the transcript has no strong local hook.
@@ -3834,14 +3940,17 @@ def _fallback_interview_bili_title_from_description(description, max_chars):
 
 def _description_cover_subject(source_title, description):
     """Find a Latin subject shared by the publisher title and summary."""
+    latin_token_pattern = (
+        r"(?<![A-Za-z0-9_-])[A-Za-z][A-Za-z0-9_-]*(?![A-Za-z0-9_-])"
+    )
     source_tokens = re.findall(
-        r"\b[A-Za-z][A-Za-z0-9_-]*\b",
+        latin_token_pattern,
         str(source_title or ""),
     )
     description_tokens = {
         token.casefold()
         for token in re.findall(
-            r"\b[A-Za-z][A-Za-z0-9_-]*\b",
+            latin_token_pattern,
             str(description or ""),
         )
     }
@@ -4431,6 +4540,7 @@ def generate_upload_metadata(
     llm_model=None,
     llm_provider=None,
     include_wechat=True,
+    source_title=None,
 ):
     """Generate Bilibili/WeChat form titles and shared upload metadata.
 
@@ -4468,7 +4578,14 @@ def generate_upload_metadata(
     meta = _load_upload_metadata(workdir)
     sub_text = None
     full_sub_text = None
-    source_title = _extract_source_title(hardsub_path)
+    explicit_source_title = re.sub(
+        r"\s+",
+        " ",
+        str(source_title or ""),
+    ).strip()
+    if not _is_usable_source_title(explicit_source_title):
+        explicit_source_title = ""
+    source_title = explicit_source_title or _extract_source_title(hardsub_path)
     if source_title:
         meta["source_title"] = source_title
 
@@ -4790,6 +4907,7 @@ def prepare_shared_upload_metadata(
     llm_model=None,
     llm_provider=None,
     on_log=None,
+    source_title=None,
 ):
     """Generate and validate the metadata shared by Bilibili and WeChat."""
     _log = on_log or (lambda msg: print(msg, flush=True))
@@ -4800,6 +4918,7 @@ def prepare_shared_upload_metadata(
         llm_model=llm_model,
         llm_provider=llm_provider,
         on_log=on_log,
+        source_title=source_title,
     )
     if not meta:
         _log("❌ [MetaGen] shared metadata generation failed; BI/WX uploads stopped")
@@ -4838,6 +4957,7 @@ def prepare_bili_upload_metadata(
     llm_model=None,
     llm_provider=None,
     on_log=None,
+    source_title=None,
 ):
     """Generate only the metadata required to publish Bilibili."""
     _log = on_log or (lambda msg: print(msg, flush=True))
@@ -4848,6 +4968,7 @@ def prepare_bili_upload_metadata(
         llm_provider=llm_provider,
         on_log=on_log,
         include_wechat=False,
+        source_title=source_title,
     )
     if not meta:
         _log("❌ [MetaGen] Bilibili metadata generation failed; BI upload stopped")
@@ -4881,6 +5002,7 @@ def prepare_wechat_upload_metadata(
     llm_model=None,
     llm_provider=None,
     on_log=None,
+    source_title=None,
 ):
     """Derive and validate the shorter WeChat form title after Bilibili."""
     _log = on_log or (lambda msg: print(msg, flush=True))
@@ -4892,6 +5014,7 @@ def prepare_wechat_upload_metadata(
         llm_provider=llm_provider,
         on_log=on_log,
         include_wechat=True,
+        source_title=source_title,
     )
     if not meta:
         _log("❌ [MetaGen] WeChat metadata generation failed; WX upload stopped")

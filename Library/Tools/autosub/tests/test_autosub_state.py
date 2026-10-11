@@ -2774,6 +2774,140 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
             "",
         )
 
+    def test_extract_source_title_prefers_task_folder_over_sequence_filename(self):
+        """A playlist filename must not erase the publisher title."""
+        workdir = os.path.join(
+            self.temp_dir,
+            "[ENG] Palantir Ontology #1 - A groundbreaking interpretation "
+            "(deep learning) you [gAggqvsYODs]",
+        )
+        os.makedirs(workdir)
+        hardsub = os.path.join(workdir, "ENG_1 [gAggqvsYODs] [1080p]_hardsub.mp4")
+
+        self.assertEqual(
+            autosub._extract_source_title(hardsub),
+            "[ENG] Palantir Ontology #1 - A groundbreaking interpretation "
+            "(deep learning) you",
+        )
+
+    def test_source_title_topic_fallback_translates_common_topics(self):
+        """The last resort must remain a natural Chinese title."""
+        source_title = (
+            "[ENG] Palantir Ontology #1 - A groundbreaking interpretation "
+            "(deep learning) you [gAggqvsYODs]"
+        )
+
+        self.assertEqual(
+            autosub._fallback_bili_title_from_source_title(source_title, 80),
+            "Palantir谈本体论：深度学习新解读",
+        )
+        self.assertEqual(
+            autosub._fallback_wechat_title_from_source_title(source_title, 16),
+            "Palantir谈本体论",
+        )
+
+    def test_generate_upload_metadata_uses_explicit_source_title(self):
+        """Batch retries must override a useless cached filename title."""
+        workdir = os.path.join(self.temp_dir, "metadata_explicit_source")
+        os.makedirs(workdir)
+        hardsub = os.path.join(workdir, "ENG_1 [gAggqvsYODs] [1080p]_hardsub.mp4")
+        with open(hardsub, "w") as handle:
+            handle.write("video")
+        with open(os.path.join(workdir, "upload_metadata.json"), "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "source_title": "ENG 1",
+                    "description": "同时和A、B两人暧昧，比较只能在脑海里靠印象进行。",
+                    "cover_title": "我们把握的不是实体，而是自己构建的本体",
+                },
+                handle,
+                ensure_ascii=False,
+            )
+
+        subtitle_title = MagicMock()
+        subtitle_title.read_full_subtitle_text.return_value = (
+            "同时和A、B两人暧昧，比较只能在脑海里靠印象进行。",
+            "subtitle.srt",
+        )
+        with patch.object(autosub, "find_upload_hardsub_video", return_value=hardsub), \
+             patch.object(autosub, "_load_llm_defaults", return_value=("glm-5.2", "dashscope")), \
+             patch.object(autosub, "_generate_title_from_description", side_effect=TimeoutError), \
+             patch.object(autosub, "_derive_wechat_title_from_bili_title", side_effect=TimeoutError), \
+             patch.dict(
+                 sys.modules,
+                 {
+                     "subtitle_title": subtitle_title,
+                     "llm_utils": MagicMock(get_client=lambda: MagicMock()),
+                 },
+             ):
+            metadata = autosub.generate_upload_metadata(
+                workdir,
+                source_title=(
+                    "[ENG] Palantir Ontology #1 - A groundbreaking interpretation "
+                    "(deep learning) you [gAggqvsYODs]"
+                ),
+            )
+
+        self.assertEqual(metadata["source_title"], "[ENG] Palantir Ontology #1 - A groundbreaking interpretation (deep learning) you [gAggqvsYODs]")
+        self.assertEqual(metadata["title"], "Palantir谈本体论：深度学习新解读")
+        self.assertEqual(metadata["wechat_title"], "Palantir谈本体论")
+
+    def test_batch_worker_passes_task_title_to_metadata_generation(self):
+        """The engine must not rely on a collapsed download filename."""
+        workdir = os.path.join(self.temp_dir, "batch_source_title")
+        os.makedirs(workdir)
+        task = SubTask(
+            uid=21,
+            url="https://www.youtube.com/watch?v=gAggqvsYODs",
+            title=(
+                "[ENG] Palantir Ontology #1 - A groundbreaking interpretation "
+                "(deep learning) you [gAggqvsYODs]"
+            ),
+            status="排队中 (GD)",
+            workdir=workdir,
+            pcts={
+                "DL": 100.0,
+                "TR": 100.0,
+                "TL": 100.0,
+                "MR": 100.0,
+                "BR": 100.0,
+                "GD": 100.0,
+                "BI": 0.0,
+                "WX": 0.0,
+            },
+        )
+        engine = BatchEngine(
+            output_dir=self.temp_dir,
+            state_file=os.path.join(self.temp_dir, "batch_state.json"),
+        )
+        engine.do_gdsync = False
+        engine.do_bili = True
+        engine.do_wechat = False
+        engine.task_map[task.uid] = task
+        observed_kwargs = {}
+
+        def fake_metadata(_workdir, **kwargs):
+            observed_kwargs.update(kwargs)
+            return None
+
+        def fake_disk_truth(current_task):
+            if current_task.status == "排队中 (GD)":
+                return
+            current_task.status = "完成"
+
+        worker = threading.Thread(target=engine.worker, args=(task,), daemon=True)
+        with patch.object(BatchEngine, "disk_truth", side_effect=fake_disk_truth), \
+             patch.object(batch_pro, "prepare_bili_upload_metadata", side_effect=fake_metadata):
+            worker.start()
+            worker.join(5)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(
+            observed_kwargs.get("source_title"),
+            "[ENG] Palantir Ontology #1 - A groundbreaking interpretation "
+            "(deep learning) you [gAggqvsYODs]",
+        )
+
     def test_generate_upload_metadata_stops_without_source_title_fallback(self):
         """Incomplete metadata is safer than a pure English publisher-title copy."""
         workdir = os.path.join(self.temp_dir, "metadata_source_fallback")
@@ -4029,6 +4163,7 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
                 "llm_provider": "dashscope",
                 "on_log": None,
                 "include_wechat": False,
+                "source_title": None,
             },
         )
         self.assertEqual(
@@ -4040,6 +4175,7 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
                 "llm_provider": "dashscope",
                 "on_log": None,
                 "include_wechat": True,
+                "source_title": None,
             },
         )
         bili_kwargs = next(call[1] for call in calls if call[0] == "BI")
