@@ -1392,6 +1392,12 @@ class AutoSubGUI:
                 bili_metadata = None
                 if sync_dir and bili_pending:
                     from autosub import prepare_bili_upload_metadata
+                    self.root.after(
+                        0,
+                        lambda: self.status_label.config(
+                            text="🧠 [MG] 生成B站标题和摘要..."
+                        ),
+                    )
                     bili_metadata = prepare_bili_upload_metadata(
                         sync_dir,
                         explicit_cover_title=None,
@@ -1470,6 +1476,12 @@ class AutoSubGUI:
                 wechat_metadata = None
                 if sync_dir and wechat_pending:
                     from autosub import prepare_wechat_upload_metadata
+                    self.root.after(
+                        0,
+                        lambda: self.status_label.config(
+                            text="🧠 [MG] 生成微信标题..."
+                        ),
+                    )
                     wechat_metadata = prepare_wechat_upload_metadata(
                         sync_dir,
                         explicit_cover_title=self.wechat_cover_title_var.get().strip() or None,

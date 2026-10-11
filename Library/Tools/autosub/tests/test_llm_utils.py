@@ -147,5 +147,26 @@ class TestDashscopeGatewayFallback(unittest.TestCase):
         self.assertEqual(client._call_openai_compatible.call_count, 1)
 
 
+class TestGenerateContentRetryLimit(unittest.TestCase):
+    def test_explicit_retry_limit_is_respected_for_timeouts(self):
+        client = LLMClient.__new__(LLMClient)
+        client.api_keys = {LLMProvider.DASHSCOPE: "test-key"}
+        client.limiter = MagicMock()
+        client.ordered_configs = []
+        client._execute_provider_call = MagicMock(
+            side_effect=Exception("HTTPSConnectionPool read timed out")
+        )
+
+        with self.assertRaises(Exception):
+            client.generate_content(
+                "hello",
+                model_name="glm-5.3",
+                provider=LLMProvider.DASHSCOPE,
+                max_retries=1,
+            )
+
+        self.assertEqual(client._execute_provider_call.call_count, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

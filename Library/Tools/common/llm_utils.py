@@ -787,6 +787,7 @@ class LLMClient:
         provider: Optional[LLMProvider] = None,
         disable_thinking: bool = False,
         request_timeout: Optional[int] = None,
+        max_retries: Optional[int] = None,
     ) -> Optional[str]:
         if model_name and "::" in model_name:
             vendor_str, model_name = model_name.split("::", 1)
@@ -884,7 +885,11 @@ class LLMClient:
             # Also cap at 1 retry for single-target no-fallback calls to avoid
             # 15-minute hangs when a proxy intercepts the connection (300s × 3
             # retries = 900s). With the reduced 120s timeout, 1 retry = ~240s max.
-            max_retries = 1 if len(targets) > 2 else (2 if len(targets) > 1 else 2)
+            effective_max_retries = max_retries
+            if effective_max_retries is None:
+                effective_max_retries = (
+                    1 if len(targets) > 2 else (2 if len(targets) > 1 else 2)
+                )
             attempt = 0
             while True:
                 try:
@@ -931,9 +936,13 @@ class LLMClient:
                         "timeout", "502", "503", "504", "104"
                     ])
 
-                    if is_transient and attempt < max_retries - 1:
+                    if is_transient and attempt < effective_max_retries - 1:
                         sleep_time = 3 * (attempt + 1)
-                        print(f"   [Retry {attempt+1}/{max_retries-1}] Transient error detected. Retrying {provider.value} in {sleep_time}s...")
+                        print(
+                            f"   [Retry {attempt+1}/{effective_max_retries-1}] "
+                            f"Transient error detected. Retrying "
+                            f"{provider.value} in {sleep_time}s..."
+                        )
                         time.sleep(sleep_time)
                         attempt += 1
                         continue

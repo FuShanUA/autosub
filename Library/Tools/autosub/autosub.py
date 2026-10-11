@@ -857,6 +857,7 @@ def _generate_content_with_timeout(
     model_name,
     provider=None,
     request_timeout=90,
+    max_retries=1,
 ):
     """Call metadata LLMs with a bounded read timeout without changing translation."""
     kwargs = {
@@ -873,6 +874,16 @@ def _generate_content_with_timeout(
         supports_timeout = True
     if supports_timeout:
         kwargs["request_timeout"] = request_timeout
+    try:
+        signature = inspect.signature(llm_client.generate_content)
+        supports_max_retries = "max_retries" in signature.parameters or any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        )
+    except (TypeError, ValueError):
+        supports_max_retries = True
+    if supports_max_retries:
+        kwargs["max_retries"] = max_retries
     return llm_client.generate_content(prompt, **kwargs)
 
 
