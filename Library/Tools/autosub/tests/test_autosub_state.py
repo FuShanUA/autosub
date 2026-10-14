@@ -72,8 +72,8 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         self.assertIn("[green]", completed)
         self.assertNotIn("[bright_blue]", completed)
         self.assertIn("[bright_blue]", active)
-        self.assertIn("[bright_blue]", queued_active)
-        self.assertNotIn("[grey37]", queued_active)
+        self.assertIn("[grey37]", queued_active)
+        self.assertNotIn("[bright_blue]", queued_active)
         self.assertIn("[grey37]", inactive)
 
     def test_find_tool_checks_macos_homebrew_fallback(self):
@@ -330,9 +330,18 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         self.assertEqual(engine.reset_task(task), "MG")
         self.assertEqual(task.status, "排队中 (MG)")
         self.assertEqual(task.pcts["GD"], 100.0)
-        self.assertEqual(task.pcts["BI"], 12.7)
+        self.assertEqual(task.pcts["BI"], 0.0)
         self.assertEqual(task.pcts["WX"], 0.0)
         self.assertTrue(os.path.exists(os.path.join(workdir, ".synced")))
+
+    def test_parse_reset_target_accepts_explicit_stage(self):
+        from autosub_batch_pro import parse_reset_target
+
+        self.assertEqual(parse_reset_target("15"), (15, None))
+        self.assertEqual(parse_reset_target("15tl"), (15, "TL"))
+
+        with self.assertRaises(ValueError):
+            parse_reset_target("15XX")
 
     def test_parse_indices_exclusion(self):
         """Standard input list should exclude specified indices."""
@@ -926,7 +935,7 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         self.assertIn("SESSDATA", task.error)
 
     def test_wechat_login_failure_surfaces_recovery_command(self):
-        """The batch worker must return the WeChat visible-login command."""
+        """An expired WeChat login must open the visible QR-login flow."""
         workdir = os.path.join(self.temp_dir, "task_wechat_login_failed")
         os.makedirs(workdir)
         task = SubTask(
@@ -934,6 +943,7 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
             url="http://test.com",
             title="Video 11",
             vid_id="vid11",
+            status="运行中 (WX)",
             workdir=workdir,
         )
         engine = BatchEngine(
@@ -943,19 +953,86 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         )
         engine.task_map[task.uid] = task
         result_box = [False, None]
+        commands = []
 
-        def fake_run(_cmd, on_log=None, **_kwargs):
-            on_log("微信登录态不可用或发布页加载失败；无头上传已停止")
+        def fake_run(cmd, on_log=None, **_kwargs):
+            commands.append(list(cmd))
+            if len(commands) == 1:
+                on_log("微信登录态不可用或发布页加载失败；无头上传已停止")
+                return False
+            on_log(">>> 登录超时")
             return False
 
-        with patch.object(batch_pro, "run_wechat_cmd", side_effect=fake_run):
+        with patch.object(
+                    batch_pro,
+                    "build_wechat_login_cmd",
+                    return_value=["wechat-login"],
+                ), \
+             patch.object(batch_pro, "run_wechat_cmd", side_effect=fake_run):
             engine._run_wechat_upload(task, ["wechat-upload"], result_box)
 
         self.assertFalse(result_box[0])
+        self.assertEqual(commands, [["wechat-upload"], ["wechat-login"]])
         self.assertIn("登录态失效", result_box[1])
         self.assertIn("wechat_upload.py --login", result_box[1])
         self.assertEqual(task.error, result_box[1])
+        self.assertEqual(task.status, "运行中 (WX)")
         self.assertFalse(os.path.exists(os.path.join(workdir, ".wechat_uploaded")))
+
+    def test_wechat_login_success_retries_upload_in_same_task(self):
+        """A completed QR login must automatically retry the headless upload."""
+        workdir = os.path.join(self.temp_dir, "task_wechat_login_retry")
+        os.makedirs(workdir)
+        task = SubTask(
+            uid=12,
+            url="http://test.com",
+            title="Video 12",
+            vid_id="vid12",
+            status="运行中 (BI/WX)",
+            workdir=workdir,
+        )
+        engine = BatchEngine(
+            output_dir=self.temp_dir,
+            sub_dir_name="project",
+            state_file=os.path.join(self.temp_dir, "batch_state.json"),
+        )
+        engine.task_map[task.uid] = task
+        result_box = [False, None]
+        commands = []
+        observed_login_status = None
+
+        def fake_run(cmd, on_log=None, on_progress=None, **_kwargs):
+            commands.append(list(cmd))
+            if len(commands) == 1:
+                on_log("微信登录态不可用或发布页加载失败；无头上传已停止")
+                return False
+            if len(commands) == 2:
+                nonlocal observed_login_status
+                observed_login_status = task.status
+                on_log(">>> 登录成功！")
+                return True
+            on_progress(25.0)
+            on_log(">>> 上传完成！")
+            return True
+
+        with patch.object(
+                    batch_pro,
+                    "build_wechat_login_cmd",
+                    return_value=["wechat-login"],
+                ), \
+             patch.object(batch_pro, "run_wechat_cmd", side_effect=fake_run):
+            engine._run_wechat_upload(task, ["wechat-upload"], result_box)
+
+        self.assertTrue(result_box[0])
+        self.assertEqual(
+            commands,
+            [["wechat-upload"], ["wechat-login"], ["wechat-upload"]],
+        )
+        self.assertEqual(observed_login_status, "等待登录 (WX)")
+        self.assertEqual(task.status, "运行中 (BI/WX)")
+        self.assertEqual(task.pcts["WX"], 100.0)
+        self.assertIsNone(task.error)
+        self.assertTrue(os.path.exists(os.path.join(workdir, ".wechat_uploaded")))
 
     def test_load_state_requeues_stale_wechat_limit_status(self):
         """A 超限 status left over from the removed cap must not stay terminal."""
@@ -2806,6 +2883,49 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
             "Palantir谈本体论",
         )
 
+    def test_korean_source_title_survives_language_gates(self):
+        """Korean publisher titles must remain usable without [ENG] crutches."""
+        source_title = (
+            "[ENG]팔란티어 온톨로지 #2 - "
+            "온톨로지의 목적은 딥러닝과 같다"
+        )
+
+        self.assertTrue(autosub._is_usable_source_title(source_title))
+        self.assertTrue(autosub._contains_hangul_text(source_title))
+        self.assertTrue(
+            autosub._metadata_title_is_source_copy(source_title, source_title)
+        )
+        self.assertEqual(
+            autosub._fallback_bili_title_from_source_title(source_title, 80),
+            "Palantir谈本体论：目的与深度学习相同",
+        )
+        self.assertEqual(
+            autosub._fallback_wechat_title_from_source_title(source_title, 16),
+            "Palantir谈本体论",
+        )
+        self.assertEqual(
+            autosub._fallback_description_from_source_title(source_title, True),
+            "Palantir 本体论第2期：本体论的目的与深度学习相同",
+        )
+
+    def test_metadata_llm_timeout_uses_client_environment(self):
+        """Metadata calls must not override LLM_REQUEST_TIMEOUT with 90s."""
+        client = MagicMock()
+
+        autosub._generate_content_with_timeout(
+            client,
+            "prompt",
+            "glm-5.3",
+        )
+
+        client.generate_content.assert_called_once_with(
+            "prompt",
+            model_name="glm-5.3",
+            provider=None,
+            request_timeout=None,
+            max_retries=1,
+        )
+
     def test_generate_upload_metadata_uses_explicit_source_title(self):
         """Batch retries must override a useless cached filename title."""
         workdir = os.path.join(self.temp_dir, "metadata_explicit_source")
@@ -2851,6 +2971,75 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         self.assertEqual(metadata["source_title"], "[ENG] Palantir Ontology #1 - A groundbreaking interpretation (deep learning) you [gAggqvsYODs]")
         self.assertEqual(metadata["title"], "Palantir谈本体论：深度学习新解读")
         self.assertEqual(metadata["wechat_title"], "Palantir谈本体论")
+
+    def test_korean_metadata_timeout_does_not_reinvalidate_fallback(self):
+        """A Korean source title must not create a regenerate-clear loop."""
+        workdir = os.path.join(self.temp_dir, "metadata_korean_timeout")
+        os.makedirs(workdir)
+        hardsub = os.path.join(workdir, "ENG_2 [V5fBnnBM2Go] [1080p]_hardsub.mp4")
+        with open(hardsub, "w") as handle:
+            handle.write("video")
+        source_title = (
+            "[ENG]팔란티어 온톨로지 #2 - "
+            "온톨로지의 목적은 딥러닝과 같다"
+        )
+        with open(os.path.join(workdir, "upload_metadata.json"), "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "source_title": source_title,
+                    "description": source_title,
+                    "title": (
+                        "[ENG]팔란티어 온톨로지 #2谈"
+                        "온톨로지의 목적은 딥러닝과 같다"
+                    ),
+                    "cover_title": "无数用户的深度学习不断汇聚，最终形成了一个巨大的深度学习",
+                    "wechat_title": "",
+                },
+                handle,
+                ensure_ascii=False,
+            )
+
+        subtitle_text = "本体论的目的与深度学习相同。\n无数用户的深度学习不断汇聚。"
+        subtitle_title = MagicMock()
+        subtitle_title.read_full_subtitle_text.return_value = (
+            subtitle_text,
+            "subtitle.srt",
+        )
+        llm_client = MagicMock()
+
+        with patch.object(autosub, "find_upload_hardsub_video", return_value=hardsub), \
+             patch.object(autosub, "_load_llm_defaults", return_value=("glm-5.3", "dashscope")), \
+             patch.object(autosub, "_generate_content_with_timeout", side_effect=TimeoutError), \
+             patch.dict(
+                 sys.modules,
+                 {
+                     "subtitle_title": subtitle_title,
+                     "llm_utils": MagicMock(get_client=lambda: llm_client),
+                 },
+             ):
+            metadata = autosub.generate_upload_metadata(
+                workdir,
+                source_title=source_title,
+            )
+
+        self.assertEqual(
+            metadata["description"],
+            "Palantir 本体论第2期：本体论的目的与深度学习相同",
+        )
+        self.assertEqual(metadata["title"], "Palantir谈本体论：目的与深度学习相同")
+        self.assertEqual(metadata["wechat_title"], "Palantir谈本体论")
+        self.assertEqual(
+            metadata["cover_title"],
+            "无数用户的深度学习不断汇聚，最终形成了一个巨大的深度学习",
+        )
+        self.assertEqual(
+            autosub._invalidate_cached_upload_metadata(
+                metadata,
+                source_title,
+                subtitle_text,
+            ),
+            [],
+        )
 
     def test_batch_worker_passes_task_title_to_metadata_generation(self):
         """The engine must not rely on a collapsed download filename."""
@@ -3920,6 +4109,13 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
 
         self.assertIn("WeChat browser profile not found", reason)
 
+    def test_wechat_login_command_is_visible(self):
+        """The recovery command must not inherit upload-only headless mode."""
+        cmd = autosub.build_wechat_login_cmd()
+
+        self.assertIn("--login", cmd)
+        self.assertNotIn("--headless", cmd)
+
     def test_upload_login_failure_hints_include_recovery_commands(self):
         """Login failures surface the exact QR-login command, not only code=1."""
         bili_hint = autosub.get_upload_login_failure_hint(
@@ -4005,7 +4201,7 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(workdir, marker)))
 
     def test_wechat_upload_updates_task_progress(self):
-        """The batch engine must persist WeChat upload percentages while running."""
+        """WeChat page transfer progress must map to the whole WX stage."""
         task = SubTask(
             uid=1,
             url="http://test.com",
@@ -4039,8 +4235,58 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         with patch.object(batch_pro, "run_wechat_cmd", side_effect=fake_run):
             engine._run_wechat_upload(task, ["wechat-upload"], result_box)
 
-        self.assertEqual(task.pcts["WX"], 12.3)
+        self.assertEqual(task.pcts["WX"], 40.5)
         self.assertFalse(result_box[0])
+
+    def test_wechat_upload_progress_combines_milestones_and_transfer(self):
+        """The WX bar advances through stages and never regresses."""
+        task = SubTask(
+            uid=2,
+            url="http://test.com",
+            title="Video 2",
+            status="运行中 (BI/WX)",
+            workdir=os.path.join(self.temp_dir, "wechat_stage_progress"),
+            pcts={
+                "DL": 100.0,
+                "TR": 100.0,
+                "TL": 100.0,
+                "MR": 100.0,
+                "BR": 100.0,
+                "GD": 100.0,
+                "BI": 100.0,
+                "WX": 0.0,
+            },
+        )
+        engine = BatchEngine(
+            output_dir=self.temp_dir,
+            sub_dir_name="project",
+            state_file=os.path.join(self.temp_dir, "batch_state.json"),
+        )
+        engine.task_map[task.uid] = task
+        snapshots = []
+
+        def fake_run(_cmd, on_progress=None, on_log=None, **_kwargs):
+            on_log(">>> 视频文件已选择，等待上传...")
+            snapshots.append(task.pcts["WX"])
+            on_progress(50.0)
+            snapshots.append(task.pcts["WX"])
+            on_log(">>> 等待视频上传完成（最多 10000 秒）...")
+            snapshots.append(task.pcts["WX"])
+            on_progress(0.0)
+            snapshots.append(task.pcts["WX"])
+            on_log(">>> 上传完成！")
+            snapshots.append(task.pcts["WX"])
+            on_log(">>> 已填写标题")
+            snapshots.append(task.pcts["WX"])
+            return True
+
+        result_box = [False]
+        with patch.object(batch_pro, "run_wechat_cmd", side_effect=fake_run):
+            engine._run_wechat_upload(task, ["wechat-upload"], result_box)
+
+        snapshots.append(task.pcts["WX"])
+        self.assertEqual(snapshots, [35.0, 57.5, 57.5, 57.5, 80.0, 82.0, 100.0])
+        self.assertTrue(result_box[0])
 
     def test_parallel_uploads_show_metadata_status_before_upload_threads(self):
         """Upload threads start while the task is still marked as metadata generation."""

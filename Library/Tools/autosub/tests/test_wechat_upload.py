@@ -322,6 +322,88 @@ class TestWechatUploadTitle(unittest.TestCase):
         with patch.object(self.module, "_get_video_duration_seconds", lambda _path: 0):
             self.assertFalse(self.module._within_wechat_duration_limit(self.video))
 
+    def test_upload_flow_allows_slow_wechat_dom_load(self):
+        class NavigationObserved(Exception):
+            pass
+
+        class FakePage:
+            url = self.module.WECHAT_HOME_URL
+
+            def __init__(self):
+                self.calls = []
+
+            async def goto(self, url, **kwargs):
+                self.calls.append((url, kwargs))
+                raise NavigationObserved()
+
+        class FakeContext:
+            def __init__(self):
+                self.closed = False
+
+            async def close(self):
+                self.closed = True
+
+        class FakeProfileLock:
+            def __init__(self):
+                self.released = False
+
+            async def release(self):
+                self.released = True
+
+        class FakePlaywright:
+            async def __aenter__(self):
+                return object()
+
+            async def __aexit__(self, *_args):
+                return False
+
+        page = FakePage()
+        context = FakeContext()
+        profile_lock = FakeProfileLock()
+
+        async def fake_ensure_browser(_playwright, headless=False):
+            return context, page, profile_lock
+
+        with patch.object(self.module, "_within_wechat_duration_limit", lambda _path: True), \
+             patch.object(self.module, "_load_cached_upload_metadata", lambda _path: {}), \
+             patch.object(self.module, "build_description", lambda *_args, **_kwargs: "description"), \
+             patch.object(self.module, "_read_subtitle_text", lambda _path: ("", None)), \
+             patch.object(
+                 self.module,
+                 "_generate_wechat_covers",
+                 lambda *_args, **_kwargs: ("portrait.jpg", "share.jpg"),
+             ), \
+             patch.object(self.module, "_ensure_browser", fake_ensure_browser), \
+             patch("playwright.async_api.async_playwright", lambda: FakePlaywright()):
+            ok = asyncio.run(
+                self.module.upload_one_video(
+                    self.video,
+                    "上传标题",
+                    desc="description",
+                    tags=["人工智能"],
+                    auto_title=False,
+                    cover_title="封面标题",
+                    max_retries=1,
+                )
+            )
+
+        self.assertFalse(ok)
+        self.assertEqual(
+            page.calls,
+            [
+                (
+                    self.module.WECHAT_HOME_URL,
+                    {
+                        "wait_until": "domcontentloaded",
+                        "timeout": self.module.WECHAT_PAGE_LOAD_TIMEOUT_MS,
+                    },
+                )
+            ],
+        )
+        self.assertEqual(self.module.WECHAT_PAGE_LOAD_TIMEOUT_MS, 60000)
+        self.assertTrue(context.closed)
+        self.assertTrue(profile_lock.released)
+
     def test_cover_title_is_independent_from_form_title(self):
         calls = []
 
@@ -551,18 +633,12 @@ class TestWechatUploadTitle(unittest.TestCase):
         "still connected" says nothing. Only the percentage not moving does, and
         waiting out a 10000s timeout blocks the serial WX queue for hours.
         """
-        progress_selectors = set(self.module.UPLOAD_PROGRESS_SELECTORS)
-
         class FakeLocator:
-            def __init__(self, text):
-                self._text = text
+            def __init__(self):
                 self.first = self
 
             async def count(self):
-                return 1 if self._text else 0
-
-            async def text_content(self):
-                return self._text
+                return 0
 
             async def is_visible(self):
                 return False
@@ -571,8 +647,15 @@ class TestWechatUploadTitle(unittest.TestCase):
                 return None
 
         class FakePage:
-            def locator(self, selector):
-                return FakeLocator("67%" if selector in progress_selectors else None)
+            async def evaluate(self, *_args, **_kwargs):
+                return {
+                    "pct": 67,
+                    "source": "progress-node",
+                    "detail": "67%",
+                }
+
+            def locator(self, _selector):
+                return FakeLocator()
 
         clock = {"now": 0.0}
 
@@ -591,26 +674,32 @@ class TestWechatUploadTitle(unittest.TestCase):
 
     def test_wait_upload_complete_keeps_waiting_while_progress_moves(self):
         """Moving progress must not trip the stall guard."""
-        progress_selectors = set(self.module.UPLOAD_PROGRESS_SELECTORS)
         state = {"pct": 10}
 
         class FakeLocator:
-            def __init__(self, text):
-                self._text = text
+            def __init__(self):
                 self.first = self
 
             async def count(self):
-                return 1 if self._text else 0
+                return 0
 
-            async def text_content(self):
-                return self._text
+            async def is_visible(self):
+                return False
+
+            async def get_attribute(self, _name):
+                return None
 
         class FakePage:
-            def locator(self, selector):
-                if selector in progress_selectors:
-                    state["pct"] = min(100, state["pct"] + 1)
-                    return FakeLocator(f"{state['pct']}%")
-                return FakeLocator(None)
+            async def evaluate(self, *_args, **_kwargs):
+                state["pct"] = min(100, state["pct"] + 1)
+                return {
+                    "pct": state["pct"],
+                    "source": "progress-node",
+                    "detail": f"{state['pct']}%",
+                }
+
+            def locator(self, _selector):
+                return FakeLocator()
 
         clock = {"now": 0.0}
 
@@ -625,6 +714,142 @@ class TestWechatUploadTitle(unittest.TestCase):
             )
 
         self.assertTrue(result)
+
+    def test_wait_upload_complete_fails_when_page_reports_network_error(self):
+        class FakeLocator:
+            def __init__(self):
+                self.first = self
+
+            async def count(self):
+                return 0
+
+            async def is_visible(self):
+                return False
+
+        class FakePage:
+            async def evaluate(self, *_args, **_kwargs):
+                return {
+                    "pct": None,
+                    "source": "upload-error",
+                    "detail": "网络出错，请重新上传",
+                    "error": "网络出错，请重新上传",
+                }
+
+            def locator(self, _selector):
+                return FakeLocator()
+
+        with patch.object(self.module.asyncio, "sleep", _noop_sleep):
+            result = asyncio.run(self.module._wait_upload_complete(FakePage(), timeout=10000))
+
+        self.assertFalse(result)
+
+    def test_wait_upload_complete_fails_when_no_progress_appears(self):
+        class FakeLocator:
+            def __init__(self):
+                self.first = self
+
+            async def count(self):
+                return 0
+
+            async def is_visible(self):
+                return False
+
+            async def get_attribute(self, _name):
+                return None
+
+        class FakePage:
+            async def evaluate(self, *_args, **_kwargs):
+                return {
+                    "pct": None,
+                    "source": "no-progress",
+                    "detail": "等待上传",
+                }
+
+            def locator(self, _selector):
+                return FakeLocator()
+
+        clock = {"now": 0.0}
+
+        def fake_time():
+            clock["now"] += 60.0
+            return clock["now"]
+
+        with patch.object(self.module.time, "time", fake_time), \
+             patch.object(self.module.asyncio, "sleep", _noop_sleep):
+            result = asyncio.run(
+                self.module._wait_upload_complete(FakePage(), timeout=10000)
+            )
+
+        self.assertFalse(result)
+        self.assertLess(clock["now"], 10000.0)
+
+    def test_read_upload_progress_times_out_a_stuck_evaluate(self):
+        class FakePage:
+            async def evaluate(self, *_args, **_kwargs):
+                await asyncio.sleep(0.05)
+                return {"pct": 1}
+
+        with patch.object(self.module, "UPLOAD_EVALUATE_TIMEOUT_SECONDS", 0.01):
+            progress = asyncio.run(self.module._read_upload_progress(FakePage()))
+
+        self.assertIsNone(progress["pct"])
+        self.assertEqual(progress["source"], "evaluate-timeout")
+
+    def test_read_upload_progress_prefers_largest_visible_candidate(self):
+        class FakePage:
+            async def evaluate(self, *_args, **_kwargs):
+                return {
+                    "candidates": [
+                        {
+                            "pct": 0,
+                            "source": "aria-progressbar",
+                            "detail": "0/100",
+                            "visible": True,
+                        },
+                        {
+                            "pct": 67,
+                            "source": "progress-node",
+                            "detail": "67%",
+                            "visible": True,
+                        },
+                    ],
+                    "pct": None,
+                    "source": "no-progress",
+                    "detail": "",
+                }
+
+        progress = asyncio.run(self.module._read_upload_progress(FakePage()))
+
+        self.assertEqual(progress["pct"], 67)
+        self.assertEqual(progress["source"], "progress-node")
+
+    def test_read_upload_progress_ignores_hidden_larger_candidate(self):
+        class FakePage:
+            async def evaluate(self, *_args, **_kwargs):
+                return {
+                    "candidates": [
+                        {
+                            "pct": 72,
+                            "source": "progress-node",
+                            "detail": "72%",
+                            "visible": False,
+                        },
+                        {
+                            "pct": 0,
+                            "source": "aria-progressbar",
+                            "detail": "0/100",
+                            "visible": True,
+                        },
+                    ],
+                    "pct": None,
+                    "source": "no-progress",
+                    "detail": "",
+                }
+
+        progress = asyncio.run(self.module._read_upload_progress(FakePage()))
+
+        self.assertEqual(progress["pct"], 0)
+        self.assertEqual(progress["source"], "aria-progressbar")
 
     def test_same_page_cover_flow_sets_both_previews_without_draft_reopen(self):
         calls = []
@@ -1051,10 +1276,20 @@ class TestWechatUploadTitle(unittest.TestCase):
         class FakePlaywright:
             chromium = FakeChromium()
 
-        with patch.object(self.module, "BROWSER_DATA_DIR", self.temp_dir):
-            _context, _page = asyncio.run(
-                self.module._ensure_browser(FakePlaywright(), headless=True)
+        async def launch_and_release():
+            context, page, lock = await self.module._ensure_browser(
+                FakePlaywright(), headless=True
             )
+            await lock.release()
+            return context, page
+
+        with patch.object(self.module, "BROWSER_DATA_DIR", self.temp_dir), \
+             patch.object(
+                 self.module,
+                 "BROWSER_LOCK_PATH",
+                 os.path.join(self.temp_dir, "browser_data.lock"),
+             ):
+            _context, _page = asyncio.run(launch_and_release())
 
         self.assertTrue(launch_kwargs["headless"])
         self.assertIn("--no-proxy-server", launch_kwargs["args"])

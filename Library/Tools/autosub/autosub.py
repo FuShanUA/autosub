@@ -12,6 +12,21 @@ import signal
 import inspect
 
 CREATE_NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+CAFFEINATE_CMD = (
+    "/usr/bin/caffeinate"
+    if sys.platform == "darwin" and os.path.exists("/usr/bin/caffeinate")
+    else None
+)
+
+
+def wrap_upload_cmd_with_sleep_guard(cmd):
+    """Prefix macOS upload children with a process-local sleep assertion."""
+    if not CAFFEINATE_CMD or not cmd:
+        return list(cmd)
+    if os.path.basename(str(cmd[0])) == "caffeinate":
+        return list(cmd)
+    return [CAFFEINATE_CMD, "-is", *cmd]
+
 
 # --- Global Window Suppression Patch for Windows ---
 if sys.platform == "win32":
@@ -293,6 +308,11 @@ def get_bili_login_command():
 def get_wechat_login_command():
     """Return the visible WeChat Channels QR-login command."""
     return f"{WECHAT_PYTHON} -u {WECHAT_SCRIPT} --login"
+
+
+def build_wechat_login_cmd():
+    """Build the visible WeChat QR-login command used by batch retries."""
+    return [WECHAT_PYTHON, "-u", WECHAT_SCRIPT, "--login"]
 
 def get_bili_login_skip_reason():
     """Check the local Bilibili cookie file before starting an upload."""
@@ -616,7 +636,8 @@ def _run_upload_cmd(
     process tree and returns False so the caller's existing retry path runs.
     """
     try:
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', creationflags=CREATE_NO_WINDOW)
+        launch_cmd = wrap_upload_cmd_with_sleep_guard(cmd)
+        p = subprocess.Popen(launch_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', creationflags=CREATE_NO_WINDOW)
     except Exception as e:
         if on_log:
             on_log(f"❌ Failed to start {label} upload: {e}")
@@ -856,10 +877,10 @@ def _generate_content_with_timeout(
     prompt,
     model_name,
     provider=None,
-    request_timeout=90,
+    request_timeout=None,
     max_retries=1,
 ):
-    """Call metadata LLMs with a bounded read timeout without changing translation."""
+    """Call metadata LLMs while letting the client apply its timeout policy."""
     kwargs = {
         "model_name": model_name,
         "provider": provider,
@@ -1442,7 +1463,7 @@ _TITLE_CJK_FUNCTION_CHARS = set("的了着是在和与把被给对向就都很�
 
 
 def _title_scoring_tokens(value):
-    """Extract stable reference tokens from a mixed Chinese/English title."""
+    """Extract stable reference tokens from mixed-language titles."""
     normalized = re.sub(r"\s+", " ", str(value or "")).strip().casefold()
     tokens = {
         token
@@ -1458,6 +1479,13 @@ def _title_scoring_tokens(value):
         tokens.update(
             compact[index:index + 2]
             for index in range(len(compact) - 1)
+        )
+    for run in re.findall(r"[\uac00-\ud7af]+", normalized):
+        if len(run) >= 2:
+            tokens.add(run)
+        tokens.update(
+            run[index:index + 2]
+            for index in range(len(run) - 1)
         )
     # A Chinese public nickname must count as coverage of the English name in
     # the source description. Otherwise good titles such as "大本" are rejected
@@ -1549,10 +1577,15 @@ def _contains_chinese_text(value, min_chars=2):
     return len(re.findall(r"[\u3400-\u9fff]", str(value or ""))) >= min_chars
 
 
+def _contains_hangul_text(value, min_chars=1):
+    """Return whether a source title carries Korean Hangul content."""
+    return len(re.findall(r"[\uac00-\ud7af]", str(value or ""))) >= min_chars
+
+
 def _comparison_title(value):
     """Normalize mixed-language titles for duplicate and source-copy checks."""
     return re.sub(
-        r"[^0-9A-Za-z\u3400-\u9fff]",
+        r"[^0-9A-Za-z\u3400-\u9fff\uac00-\ud7af]",
         "",
         str(value or ""),
     ).casefold()
@@ -2081,7 +2114,6 @@ def _generate_structured_title_from_description(
                 llm_client,
                 prompt,
                 model_name,
-                request_timeout=90,
             )
             text = str(raw or "").strip()
             text = re.sub(
@@ -2990,11 +3022,60 @@ def _extract_source_title(video_path):
 
 _SOURCE_TITLE_TOPIC_TRANSLATIONS = (
     ("ontology", "本体论"),
+    ("온톨로지", "本体论"),
     ("deep learning", "深度学习"),
+    ("딥러닝", "深度学习"),
     ("artificial intelligence", "AI"),
+    ("인공지능", "AI"),
     ("machine learning", "机器学习"),
+    ("머신러닝", "机器学习"),
     ("robots", "机器人"),
+    ("로봇", "机器人"),
 )
+
+
+_SOURCE_TITLE_KOREAN_SUBJECTS = {
+    "팔란티어": "Palantir",
+}
+
+_KOREAN_SOURCE_TITLE_PHRASES = (
+    ("목적은 딥러닝과 같다", "目的与深度学习相同"),
+    ("온톨로지의 목적은", "本体论的目的"),
+    ("온톨로지의", "本体论的"),
+    ("딥러닝과 같다", "与深度学习相同"),
+    ("팔란티어", "Palantir"),
+    ("온톨로지", "本体论"),
+    ("딥러닝", "深度学习"),
+)
+
+
+def _translate_known_korean_source_title(source_title):
+    """Turn a known Korean publisher title into a recoverable Chinese summary."""
+    value = re.sub(r"\s+", " ", str(source_title or "")).strip()
+    value = re.sub(r"^\[[A-Za-z]{2,3}\]\s*", "", value)
+    for korean, chinese in _KOREAN_SOURCE_TITLE_PHRASES:
+        value = value.replace(korean, chinese)
+    value = re.sub(r"#(\d+)", r"第\1期", value)
+    value = re.sub(r"\s*-\s*", "：", value)
+    value = re.sub(
+        r"(?<=[\u3400-\u9fff])\s+(?=[\u3400-\u9fff])",
+        "",
+        value,
+    )
+    value = re.sub(r"\s+", " ", value).strip()
+    if _contains_hangul_text(value):
+        return ""
+    return value if _contains_chinese_text(value, 8) else ""
+
+
+def _fallback_description_from_source_title(source_title, require_chinese):
+    """Use a publisher title only when it satisfies the output language gate."""
+    value = re.sub(r"\s+", " ", str(source_title or "")).strip()
+    if not value:
+        return ""
+    if not require_chinese or _contains_chinese_text(value, 8):
+        return value
+    return _translate_known_korean_source_title(value)
 
 
 def _source_title_topic_fallback(source_title, max_chars, description=""):
@@ -3006,13 +3087,22 @@ def _source_title_topic_fallback(source_title, max_chars, description=""):
     lower_value = value.casefold()
     topics = [
         chinese
-        for english, chinese in _SOURCE_TITLE_TOPIC_TRANSLATIONS
-        if english in lower_value
+        for source, chinese in _SOURCE_TITLE_TOPIC_TRANSLATIONS
+        if source in lower_value
     ]
     if not topics:
         return ""
 
-    subject = _description_cover_subject(value, description)
+    subject = next(
+        (
+            target
+            for korean, target in _SOURCE_TITLE_KOREAN_SUBJECTS.items()
+            if korean in value
+        ),
+        "",
+    )
+    if not subject:
+        subject = _description_cover_subject(value, description)
     if not subject:
         subject = next(
             (
@@ -3036,7 +3126,10 @@ def _source_title_topic_fallback(source_title, max_chars, description=""):
     if subject:
         candidate = f"{subject}谈{primary_topic}"
         if "深度学习" in topics and primary_topic != "深度学习":
-            candidate = f"{subject}谈{primary_topic}：深度学习新解读"
+            if "목적은" in lower_value and "같다" in lower_value:
+                candidate = f"{subject}谈{primary_topic}：目的与深度学习相同"
+            else:
+                candidate = f"{subject}谈{primary_topic}：深度学习新解读"
     else:
         candidate = f"用{'与'.join(topics[:2])}讲清主题"
     if len(candidate) > max_chars:
@@ -3057,7 +3150,9 @@ def _is_usable_source_title(value):
         normalized,
     ):
         return False
-    return len(re.sub(r"[^a-z0-9\u3400-\u9fff]", "", normalized)) >= 4
+    return len(
+        re.sub(r"[^a-z0-9\u3400-\u9fff\uac00-\ud7af]", "", normalized)
+    ) >= 4
 
 
 def _fallback_bili_title_from_source_title(source_title, max_chars, description=""):
@@ -4628,6 +4723,7 @@ def generate_upload_metadata(
     # this summary, so sharing its first sentence keeps the title tied to the
     # whole video instead of one striking transcript fragment.
     if not meta.get("description") and sub_text and llm_client:
+        _log("⏳ [MetaGen] 开始生成简介...")
         try:
             prompt = (
                 "根据以下视频字幕，写一段100-200字的视频简介。简洁有力，概括核心内容，不要AI味。\n\n"
@@ -4646,7 +4742,6 @@ def generate_upload_metadata(
                     prompt,
                     model,
                     provider=provider,
-                    request_timeout=90,
                 )
                 desc = re.sub(r"\s+", " ", str(desc or "")).strip()
                 issues = _metadata_text_issues(desc, full_sub_text, hardsub_path)
@@ -4668,6 +4763,7 @@ def generate_upload_metadata(
     # The whole-video description is the title source. If every model candidate
     # fails, use a conservative local summary only when it passes the same gate.
     if not meta.get("title") and meta.get("description") and sub_text and llm_client:
+        _log("⏳ [MetaGen] 简介完成，开始生成B站标题...")
         for candidate_model in metadata_models:
             try:
                 summary_title = _generate_title_from_description(
@@ -4729,6 +4825,7 @@ def generate_upload_metadata(
         and sub_text
         and llm_client
     ):
+        _log("⏳ [MetaGen] B站标题完成，开始生成视频号标题...")
         wechat_models = _metadata_model_candidates(
             preferred_model,
             provider,
@@ -4807,6 +4904,7 @@ def generate_upload_metadata(
 
     # 3. Cover title (editorial headline style)
     if not meta.get("cover_title") and sub_text and llm_client:
+        _log("⏳ [MetaGen] 表单元数据完成，开始生成封面标题...")
         cover_models = _metadata_model_candidates(
             preferred_model,
             provider,
@@ -4881,8 +4979,13 @@ def generate_upload_metadata(
     # transcript-grounded title, but a known-topic upload is more recoverable
     # than an upload permanently blocked by metadata generation.
     if not meta.get("description") and source_title:
-        meta["description"] = source_title
-        _log(">>> [MetaGen] 简介（原标题兜底）: " + source_title[:60])
+        fallback_description = _fallback_description_from_source_title(
+            source_title,
+            bool(sub_text),
+        )
+        if fallback_description:
+            meta["description"] = fallback_description
+            _log(">>> [MetaGen] 简介（原标题兜底）: " + fallback_description[:60])
     if not meta.get("title") and source_title:
         meta["title"] = _fallback_bili_title_from_source_title(
             source_title,

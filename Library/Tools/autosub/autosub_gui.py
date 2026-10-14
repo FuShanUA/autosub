@@ -379,7 +379,8 @@ class AutoSubGUI:
             "llm_vendor": "Alibaba (Bailian)",
             "llm_model": DEFAULTS.get("llm_model", "glm-5.2"),
             "api_key": "", "model": "large-v2", "style": "auto",
-            "trans_mode": "balanced", "quick": False, "remove_ads": False, "quality": "high",
+            "trans_mode": "balanced", "quick": False, "remove_ads": False,
+            "ad_detector": "auto", "ad_cut_mode": "auto", "quality": "high",
             "layout": "bilingual", "main_lang": "cn",
             "cn_font": "STKaiti", "en_font": "Calibri",
             "jp_font": "Hiragino Maru Gothic ProN", "jp_size": "36",
@@ -492,8 +493,22 @@ class AutoSubGUI:
         ttk.Checkbutton(f2, text="快捷转录（大模型/网页视频实验性）", variable=self.quick_var).grid(row=4, column=0, columnspan=2, sticky="w", pady=5)
         self.remove_ads_var = tk.BooleanVar(value=bool(self.settings.get("remove_ads", False)))
         ttk.Checkbutton(f2, text="剪除广告片段", variable=self.remove_ads_var).grid(row=4, column=2, columnspan=2, sticky="w", pady=5)
+
+        ttk.Label(f2, text="广告检测:").grid(row=5, column=0, sticky="w", pady=5)
+        self.ad_detector_var = tk.StringVar(value=str(self.settings.get("ad_detector", "auto")))
+        ttk.Combobox(
+            f2, textvariable=self.ad_detector_var,
+            values=["auto", "visual", "llm"], state="readonly", width=18,
+        ).grid(row=5, column=1, sticky="w", padx=5)
+        ttk.Label(f2, text="剪切方式:").grid(row=5, column=2, sticky="w", padx=10)
+        self.ad_cut_mode_var = tk.StringVar(value=str(self.settings.get("ad_cut_mode", "auto")))
+        ttk.Combobox(
+            f2, textvariable=self.ad_cut_mode_var,
+            values=["auto", "precise", "legacy"], state="readonly", width=18,
+        ).grid(row=5, column=3, sticky="w")
+
         self.multilang_var = tk.BooleanVar(value=bool(self.settings.get("multilang", False)))
-        ttk.Checkbutton(f2, text="多语言检测（混合语言视频自动分段检测）", variable=self.multilang_var).grid(row=5, column=0, columnspan=4, sticky="w", pady=5)
+        ttk.Checkbutton(f2, text="多语言检测（混合语言视频自动分段检测）", variable=self.multilang_var).grid(row=6, column=0, columnspan=4, sticky="w", pady=5)
 
         # 3. Subtitle Style (Parent: tab2)
         f3 = ttk.LabelFrame(self.tab2, text=" 字幕样式 ", padding=10)
@@ -1214,6 +1229,10 @@ class AutoSubGUI:
                     _ra_cmd = [py_exe, _ra_script, sync_dir, "--model", _ra_model]
                     if _ra_prov:
                         _ra_cmd += ["--provider", _ra_prov]
+                    _ra_cmd += [
+                        "--detector", self.ad_detector_var.get(),
+                        "--cut-mode", self.ad_cut_mode_var.get(),
+                    ]
                     _ra_proc = None
                     try:
                         _ra_proc = subprocess.Popen(_ra_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1)
@@ -1642,6 +1661,10 @@ class AutoSubGUI:
         cmd = [py_exe, script, target, "--model", model]
         if provider_id:
             cmd += ["--provider", provider_id]
+        cmd += [
+            "--detector", self.ad_detector_var.get(),
+            "--cut-mode", self.ad_cut_mode_var.get(),
+        ]
         print(f"📺 [GUI] Launching remove_ads: {' '.join(cmd)}")
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
@@ -1695,6 +1718,8 @@ class AutoSubGUI:
             "quick": self.quick_var.get(),
             "multilang": self.multilang_var.get(),
             "remove_ads": self.remove_ads_var.get(),
+            "ad_detector": self.ad_detector_var.get(),
+            "ad_cut_mode": self.ad_cut_mode_var.get(),
             "sync_gdrive": self.sync_gdrive_var.get(),
             "gdrive_enabled": self.gdrive_enabled_var.get(),
             "wechat_enabled": self.wechat_enabled_var.get(),

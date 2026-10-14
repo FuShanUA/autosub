@@ -22,6 +22,7 @@ import argparse
 import subprocess
 import tempfile
 import shutil
+from collections import Counter
 
 
 if getattr(sys, "frozen", False):
@@ -407,6 +408,118 @@ def probe_has_video(path):
         return False
 
 
+def probe_stream_layout(path):
+    """Return (video_count, audio_count) for the first input file."""
+    try:
+        out = subprocess.check_output(
+            [FFPROBE, "-v", "error", "-show_entries", "stream=codec_type",
+             "-of", "csv=p=0", path],
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
+        types = [line.strip() for line in out.splitlines() if line.strip()]
+        return types.count("video"), types.count("audio")
+    except Exception:
+        return 0, 0
+
+
+def probe_packets(path, stream_type):
+    """Read packet timestamps without decoding the media."""
+    cmd = [
+        FFPROBE, "-v", "error", "-select_streams", f"{stream_type}:0",
+        "-show_entries", "packet=pts_time,dts_time,duration_time,flags",
+        "-of", "csv=p=0", path,
+    ]
+    out = subprocess.check_output(cmd, stderr=subprocess.PIPE).decode()
+    packets = []
+    for line in out.splitlines():
+        fields = line.split(",")
+        if len(fields) < 4 or not fields[0]:
+            continue
+        try:
+            pts = float(fields[0])
+            dts = float(fields[1]) if fields[1] and fields[1] != "N/A" else None
+            duration = float(fields[2]) if fields[2] else 0.0
+        except ValueError:
+            continue
+        packets.append({
+            "pts": pts,
+            "dts": dts,
+            "duration": duration,
+            "keyframe": "K" in fields[3],
+        })
+    return packets
+
+
+def detect_visual_ad_segments(media_path, min_duration=3.0, max_duration=120.0):
+    """Detect resolution-anomaly ad candidates from video keyframes.
+
+    Streamed ad inserts often change the video resolution (for example
+    1920x800 feature to 1920x1080 ad). Scanning only keyframes keeps this
+    cheap while still finding the transition points that stream-copy can cut.
+    """
+    if not media_path or not probe_has_video(media_path):
+        return []
+
+    cmd = [
+        FFPROBE, "-v", "error", "-select_streams", "v:0", "-skip_frame", "nokey",
+        "-show_entries", "frame=pts_time,width,height", "-of", "csv=p=0",
+        media_path,
+    ]
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.PIPE).decode()
+    except Exception as e:
+        print(f"   ⚠️ Visual keyframe scan failed ({e}), skipping visual detector")
+        return []
+
+    frames = []
+    for line in out.splitlines():
+        fields = line.split(",")
+        if len(fields) < 3:
+            continue
+        try:
+            frames.append((float(fields[0]), int(fields[1]), int(fields[2])))
+        except ValueError:
+            continue
+    if len(frames) < 3:
+        return []
+
+    resolution_counts = Counter((w, h) for _, w, h in frames)
+    main_resolution = resolution_counts.most_common(1)[0][0]
+    duration = probe_duration(media_path) or frames[-1][0]
+
+    candidates = []
+    start = None
+    anomaly_count = 0
+    for t, w, h in frames:
+        if (w, h) == main_resolution:
+            if start is not None:
+                candidates.append((start, t, anomaly_count))
+                start = None
+                anomaly_count = 0
+            continue
+        if start is None:
+            start = t
+        anomaly_count += 1
+    if start is not None:
+        candidates.append((start, duration, anomaly_count))
+
+    segments = []
+    for s, e, count in candidates:
+        if count < 2 and (e - s) >= min_duration:
+            # A single keyframe can still be a short ad when GOPs are long.
+            pass
+        elif count < 2:
+            continue
+        if min_duration <= e - s <= max_duration:
+            segments.append((s, e))
+
+    if segments:
+        print(f"   🖥️ Visual detector: main resolution {main_resolution[0]}x{main_resolution[1]}")
+        for s, e in segments:
+            print(f"      candidate {s:.3f}-{e:.3f} ({e - s:.3f}s)")
+    return segments
+
+
 def _keep_arg(seg):
     s, e = seg
     if e is None:
@@ -414,7 +527,182 @@ def _keep_arg(seg):
     return f"{s}:{e}"
 
 
-def cut_media(media_path, keep_segments, out_path, reencode=False):
+def _run_checked(cmd, label):
+    proc = subprocess.run(
+        cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+    )
+    if proc.returncode != 0:
+        detail = proc.stderr.strip().splitlines()
+        tail = "\n".join(detail[-8:]) if detail else "no ffmpeg stderr"
+        raise RuntimeError(f"{label} failed:\n{tail}")
+
+
+def _write_concat_list(path, files):
+    with open(path, "w", encoding="utf-8") as f:
+        for file_path in files:
+            escaped = str(file_path).replace("\\", "\\\\").replace("'", "\\'")
+            f.write(f"file '{escaped}'\n")
+
+
+def _precise_segment_plan(video_packets, audio_packets, seg):
+    start, end = seg
+    end_time = float("inf") if end is None else float(end)
+
+    keyframe_indices = [
+        i for i, p in enumerate(video_packets)
+        if p["keyframe"] and p["pts"] >= start and p["pts"] < end_time
+    ]
+    if not keyframe_indices:
+        return None
+    keyframe_index = keyframe_indices[0]
+    keyframe = video_packets[keyframe_index]
+    video_start = keyframe["pts"]
+    video_seek = keyframe["dts"] if keyframe["dts"] is not None else video_start
+
+    last_index = keyframe_index - 1
+    for i in range(keyframe_index, len(video_packets)):
+        if video_packets[i]["pts"] >= end_time:
+            break
+        last_index = i
+    video_count = last_index - keyframe_index + 1
+    if video_count <= 0:
+        return None
+
+    audio_start = None
+    audio_count = 0
+    if audio_packets is not None:
+        audio_candidates = [p for p in audio_packets if p["pts"] >= video_start]
+        if not audio_candidates:
+            return None
+        audio_start = audio_candidates[0]["pts"]
+        audio_count = sum(
+            1 for p in audio_packets
+            if p["pts"] >= audio_start and p["pts"] < end_time
+        )
+        if audio_count <= 0:
+            return None
+
+    return {
+        "source": seg,
+        "video_start": video_start,
+        "video_seek": video_seek,
+        "video_count": video_count,
+        "audio_start": audio_start,
+        "audio_count": audio_count,
+    }
+
+
+def _cut_media_precise(media_path, keep_segments, out_path):
+    """Stream-copy video and audio separately, then mux the two timelines.
+
+    Video starts on the first keyframe at or after each requested boundary so
+    a copied segment remains independently decodable. Audio is aligned to that
+    video start and cut by packet count. This avoids the keyframe rollback and
+    packet over-read that occur when both streams are copied together.
+    """
+    video_count, audio_count = probe_stream_layout(media_path)
+    if video_count != 1:
+        raise RuntimeError("Precise copy requires exactly one video stream")
+    if audio_count > 1:
+        raise RuntimeError("Precise copy does not support multiple audio streams")
+
+    video_packets = probe_packets(media_path, "v")
+    audio_packets = probe_packets(media_path, "a") if audio_count == 1 else None
+    if not video_packets:
+        raise RuntimeError("No video packet timestamps found for precise copy")
+
+    plans = []
+    for seg in keep_segments:
+        plan = _precise_segment_plan(video_packets, audio_packets, seg)
+        if plan is None:
+            boundary = f"{seg[0]:.3f}-{seg[1]:.3f}" if seg[1] is not None else f"{seg[0]:.3f}-end"
+            raise RuntimeError(f"No precise-copy packets in keep segment {boundary}")
+        plans.append(plan)
+
+    ext = os.path.splitext(media_path)[1].lower() or ".mp4"
+    with tempfile.TemporaryDirectory(prefix="removeads_precise_") as tmpdir:
+        video_parts = []
+        audio_parts = []
+        for i, plan in enumerate(plans):
+            video_part = os.path.join(tmpdir, f"v{i:03d}{ext}")
+            # ffmpeg selects stream-copy input points by DTS. Seek just before
+            # the keyframe DTS so timestamp rounding cannot skip that packet.
+            video_seek = max(0.0, plan["video_seek"] - 0.01)
+            video_cmd = [
+                FFMPEG, "-y", "-seek2any", "1", "-ss", f"{video_seek:.6f}",
+                "-i", media_path, "-map", "0:v:0", "-frames:v", str(plan["video_count"]),
+                "-an", "-c:v", "copy", "-avoid_negative_ts", "make_zero", video_part,
+            ]
+            _run_checked(video_cmd, f"precise video segment {i + 1}")
+            video_parts.append(video_part)
+
+            if plan["audio_start"] is not None:
+                audio_part = os.path.join(tmpdir, f"a{i:03d}.mka")
+                audio_cmd = [
+                    FFMPEG, "-y", "-i", media_path, "-ss", f"{plan['audio_start']:.6f}",
+                    "-map", "0:a:0", "-frames:a", str(plan["audio_count"]),
+                    "-vn", "-c:a", "copy", "-avoid_negative_ts", "make_zero",
+                    audio_part,
+                ]
+                _run_checked(audio_cmd, f"precise audio segment {i + 1}")
+                audio_parts.append(audio_part)
+
+        video_list = os.path.join(tmpdir, "video.txt")
+        _write_concat_list(video_list, video_parts)
+        if audio_parts:
+            audio_list = os.path.join(tmpdir, "audio.txt")
+            _write_concat_list(audio_list, audio_parts)
+            cmd = [
+                FFMPEG, "-y", "-f", "concat", "-safe", "0", "-i", video_list,
+                "-f", "concat", "-safe", "0", "-i", audio_list,
+                "-map", "0:v:0", "-map", "1:a:0", "-c", "copy", out_path,
+            ]
+        else:
+            cmd = [
+                FFMPEG, "-y", "-f", "concat", "-safe", "0", "-i", video_list,
+                "-map", "0:v:0", "-an", "-c", "copy", out_path,
+            ]
+        _run_checked(cmd, "precise concat/mux")
+
+    expected_video = sum(p["video_count"] for p in plans)
+    actual_video = len(probe_packets(out_path, "v"))
+    if actual_video != expected_video:
+        raise RuntimeError(
+            f"Precise-copy validation failed: expected {expected_video} video packets, got {actual_video}"
+        )
+    if audio_packets is not None:
+        expected_audio = sum(p["audio_count"] for p in plans)
+        actual_audio = len(probe_packets(out_path, "a"))
+        if actual_audio != expected_audio:
+            raise RuntimeError(
+                f"Precise-copy validation failed: expected {expected_audio} audio packets, got {actual_audio}"
+            )
+    return out_path
+
+
+def _cut_media_legacy(media_path, keep_segments, out_path):
+    ext = os.path.splitext(media_path)[1]
+    tmpdir = tempfile.mkdtemp(prefix="removeads_")
+    parts = []
+    concat_list = os.path.join(tmpdir, "concat.txt")
+    for i, seg in enumerate(keep_segments):
+        s, e = seg
+        part = os.path.join(tmpdir, f"part_{i:03d}{ext}")
+        c = [FFMPEG, "-y", "-ss", str(s)]
+        if e is not None:
+            c += ["-to", str(e)]
+        c += ["-i", media_path, "-c", "copy", "-avoid_negative_ts", "make_zero", part]
+        subprocess.run(c, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        parts.append(part)
+    with open(concat_list, "w") as f:
+        for p in parts:
+            f.write(f"file '{p}'\n")
+    cmd = [FFMPEG, "-y", "-f", "concat", "-safe", "0", "-i", concat_list, "-c", "copy", out_path]
+    subprocess.run(cmd, check=True)
+    return out_path
+
+
+def cut_media(media_path, keep_segments, out_path, reencode=False, cut_mode="auto"):
     """Cut ad spans out of media. Audio-only: filter (atrim+concat). Video: stream-copy."""
     has_video = probe_has_video(media_path)
     use_filter = reencode or not has_video
@@ -457,28 +745,20 @@ def cut_media(media_path, keep_segments, out_path, reencode=False):
                 FFMPEG, "-y", "-i", media_path, "-filter_complex", fc,
                 "-map", "[outa]",
             ] + ac + [out_path]
+        print(f"   ffmpeg: re-encode (filter) | {n} segment(s)")
+        subprocess.run(cmd, check=True)
+        return out_path
     else:
-        ext = os.path.splitext(media_path)[1]
-        tmpdir = tempfile.mkdtemp(prefix="removeads_")
-        parts = []
-        concat_list = os.path.join(tmpdir, "concat.txt")
-        for i, seg in enumerate(keep_segments):
-            s, e = seg
-            part = os.path.join(tmpdir, f"part_{i:03d}{ext}")
-            c = [FFMPEG, "-y", "-ss", str(s)]
-            if e is not None:
-                c += ["-to", str(e)]
-            c += ["-i", media_path, "-c", "copy", "-avoid_negative_ts", "make_zero", part]
-            subprocess.run(c, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            parts.append(part)
-        with open(concat_list, "w") as f:
-            for p in parts:
-                f.write(f"file '{p}'\n")
-        cmd = [FFMPEG, "-y", "-f", "concat", "-safe", "0", "-i", concat_list, "-c", "copy", out_path]
-
-    print(f"   ffmpeg: {'re-encode (filter)' if use_filter else 'stream-copy (concat)'} | {n} segment(s)")
-    subprocess.run(cmd, check=True)
-    return out_path
+        if cut_mode in ("auto", "precise"):
+            try:
+                print(f"   ffmpeg: precise stream-copy (split A/V) | {n} segment(s)")
+                return _cut_media_precise(media_path, keep_segments, out_path)
+            except Exception as e:
+                if cut_mode == "precise":
+                    raise
+                print(f"   ⚠️ Precise copy unavailable, falling back to legacy concat: {e}")
+        print(f"   ffmpeg: stream-copy (concat) | {n} segment(s)")
+        return _cut_media_legacy(media_path, keep_segments, out_path)
 
 
 def rewrite_srt_file(srt_path, merged, out_path):
@@ -616,6 +896,14 @@ def main():
     ap.add_argument("--media", default=None, help="Explicit media path (else auto-detected)")
     ap.add_argument("--model", default="glm-5.2", help="LLM model for ad detection")
     ap.add_argument("--provider", default="dashscope", help="LLM provider")
+    ap.add_argument(
+        "--detector", choices=("auto", "llm", "visual"), default="auto",
+        help="Ad detector: auto tries visual keyframes first, then LLM",
+    )
+    ap.add_argument(
+        "--cut-mode", choices=("auto", "precise", "legacy"), default="auto",
+        help="Video cut mode: precise splits A/V for packet-accurate stream copy",
+    )
     ap.add_argument("--reencode", action="store_true", help="Re-encode media (slower, frame-accurate)")
     ap.add_argument("--redetect", action="store_true", help="Re-run ad detection even if json exists")
     ap.add_argument("--dry-run", action="store_true", help="Detect + report only; do not cut/rewrite")
@@ -643,30 +931,58 @@ def main():
     ad_json = ad_json_path_for(project_dir, srt_path)
     blocks = srt_utils.parse_srt(srt_path)
     print(f"   Parsed {len(blocks)} subtitle blocks.")
+    media = find_media(project_dir, args.media)
 
     if os.path.isfile(ad_json) and not args.redetect:
         print(f"Reusing existing ad map: {os.path.basename(ad_json)}")
         with open(ad_json, "r", encoding="utf-8") as f:
             ad_segments = json.load(f)
+        used_visual = any(
+            isinstance(seg, dict) and seg.get("detector") == "visual"
+            for seg in ad_segments
+        ) if isinstance(ad_segments, list) else False
     else:
-        print(f"Detecting ad segments via LLM ({args.provider}/{args.model})...")
-        client = LLMClient()
-        provider_enum = None
-        if args.provider:
-            try:
-                provider_enum = LLMProvider(args.provider)
-            except ValueError:
-                pass
-        ad_segments = detect_ad_segments(blocks, client, model=args.model, provider=provider_enum)
+        visual_segments = []
+        if args.detector in ("auto", "visual"):
+            if media:
+                print("Detecting ad segments via visual keyframe resolution scan...")
+                visual_segments = detect_visual_ad_segments(media)
+            elif args.detector == "visual":
+                print("Visual detector requires a media file, but none was found.")
+                sys.exit(1)
+            else:
+                print("No media found for visual detector; using LLM detector.")
+
+        if visual_segments:
+            ad_segments = [
+                {"start_time": s, "end_time": e, "detector": "visual"}
+                for s, e in visual_segments
+            ]
+            used_visual = True
+        elif args.detector == "visual":
+            ad_segments = []
+            used_visual = True
+        else:
+            print(f"Detecting ad segments via LLM ({args.provider}/{args.model})...")
+            client = LLMClient()
+            provider_enum = None
+            if args.provider:
+                try:
+                    provider_enum = LLMProvider(args.provider)
+                except ValueError:
+                    pass
+            ad_segments = detect_ad_segments(blocks, client, model=args.model, provider=provider_enum)
+            used_visual = False
+
         with open(ad_json, "w", encoding="utf-8") as f:
             json.dump(ad_segments, f, ensure_ascii=False, indent=2)
         print(f"   Saved -> {os.path.basename(ad_json)}")
 
     merged = merge_ad_segments(ad_segments)
-    merged = expand_ad_boundaries(merged, blocks)
-    media_for_vad = find_media(project_dir, args.media)
-    if media_for_vad:
-        merged = refine_boundaries_with_vad(merged, media_for_vad)
+    if not used_visual:
+        merged = expand_ad_boundaries(merged, blocks)
+        if media:
+            merged = refine_boundaries_with_vad(merged, media)
     remap, total_removed = build_remap(merged)
 
     print(f"\nAd report: {len(merged)} segment(s), {total_removed:.1f}s (~{int(total_removed // 60)}m{int(total_removed % 60)}s) to cut.")
@@ -683,13 +999,12 @@ def main():
         print("\n--dry-run: stopping after detection.")
         return None
 
-    media = find_media(project_dir, args.media)
     if media:
         dur = probe_duration(media)
         keep = compute_keep_segments(merged, dur)
         out_media = noads_path(media)
         print(f"\nCutting media: {os.path.basename(media)} -> {os.path.basename(out_media)}")
-        cut_media(media, keep, out_media, reencode=args.reencode)
+        cut_media(media, keep, out_media, reencode=args.reencode, cut_mode=args.cut_mode)
         print(f"   OK {out_media}")
     else:
         print("\nNo media file found; skipping media cut (subtitles only).")
@@ -702,7 +1017,7 @@ def main():
             out_hb = noads_path(hb)
             print(f"   {os.path.basename(hb)} -> {os.path.basename(out_hb)}")
             try:
-                cut_media(hb, keep, out_hb, reencode=False)
+                cut_media(hb, keep, out_hb, reencode=False, cut_mode=args.cut_mode)
                 print(f"   OK {out_hb}")
             except Exception as he:
                 print(f"   WARN {os.path.basename(hb)}: {he}")

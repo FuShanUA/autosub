@@ -468,6 +468,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
             cn_final_txt = ""
             en_final_txt = ""
+            final_content = ""
 
             if config.mode != 'en' and p['cn']:
                  # 1. Wrap first
@@ -526,22 +527,20 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                      final_parts.append(processed)
                  cn_final_txt = "\\N".join(final_parts)
 
-                 if config.mode != 'cn' and p['en']:
-                     en_with_tags = convert_markdown_to_ass(p['en'])
-                     parts = [auto_wrap(sub, wrap_en, False) for sub in en_with_tags.split('\\N')]
-                     # Wrap Japanese runs in JA font within the EN track
-                     en_processed_parts = []
-                     for part in parts:
-                         def replace_ja_en(m):
-                             txt = m.group(0)
-                             if re.search(r'[぀-ヿㇰ-ㇿ]', txt):
-                                return f"{{\\fn{config.ja_font}}}{txt}{{\\fn{config.en_font}}}"
-                             return txt
-                         part = re.sub(r'[\u3040-\u30ff\u31f0-\u31ff\u4e00-\u9fff\u3000-\u303f\uff00-\uffef\s]+', replace_ja_en, part)
-                         en_processed_parts.append(part)
-                     en_final_txt = "\\N".join(en_processed_parts)
-
-                 final_content = ""
+            if config.mode != 'cn' and p['en']:
+                en_with_tags = convert_markdown_to_ass(p['en'])
+                parts = [auto_wrap(sub, wrap_en, False) for sub in en_with_tags.split('\\N')]
+                # Wrap Japanese runs in JA font within the EN track
+                en_processed_parts = []
+                for part in parts:
+                    def replace_ja_en(m):
+                        txt = m.group(0)
+                        if re.search(r'[぀-ヿㇰ-ㇿ]', txt):
+                            return f"{{\\fn{config.ja_font}}}{txt}{{\\fn{config.en_font}}}"
+                        return txt
+                    part = re.sub(r'[\u3040-\u30ff\u31f0-\u31ff\u4e00-\u9fff\u3000-\u303f\uff00-\uffef\s]+', replace_ja_en, part)
+                    en_processed_parts.append(part)
+                en_final_txt = "\\N".join(en_processed_parts)
 
             # --- Layout Calculation ---
             # We need to know which lines are what to calc box sizes

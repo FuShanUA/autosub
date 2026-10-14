@@ -80,6 +80,7 @@ import ctypes
 # Keep retries low, but allow the request itself enough time to finish.
 os.environ.setdefault("LLM_REQUEST_TIMEOUT", "300")
 os.environ.setdefault("LLM_MAX_RETRIES", "1")
+os.environ.setdefault("LLM_QUALITY_TIMEOUT", "600")
 
 CREATE_NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 import select
@@ -214,6 +215,11 @@ if getattr(sys, 'frozen', False):
     TOOLS_DIR = os.path.join(getattr(sys, '_MEIPASS', ''), "Library", "Tools")
 else:
     TOOLS_DIR = os.environ.get("AUTOSUB_TOOLS_DIR") or os.path.dirname(CURRENT_DIR)
+# Keep subtitle parsing shared with smart_translate.py, including when the
+# engine is launched from a nested checkout or packaged app.
+if TOOLS_DIR not in sys.path:
+    sys.path.insert(0, TOOLS_DIR)
+from common import srt_utils  # noqa: E402
 # Propagate to child processes (smart_translate, transcriber, etc.) so they
 # resolve TOOLS_DIR the same way instead of relying on __file__ relative paths.
 os.environ.setdefault("AUTOSUB_TOOLS_DIR", TOOLS_DIR)
@@ -237,9 +243,11 @@ DEFAULT_OUTPUT_ROOT = os.path.join(PROJECT_ROOT, "Projects")
 # Reuse the canonical Bilibili upload API from the base autosub module.
 sys.path.insert(0, CURRENT_DIR)
 from autosub import (  # noqa: E402
+    CAFFEINATE_CMD,
     DEFAULTS,
     VENDOR_MAP,
     build_bili_cmd,
+    build_wechat_login_cmd,
     build_wechat_cmd,
     get_bili_login_command,
     get_bili_login_skip_reason,
@@ -250,6 +258,7 @@ from autosub import (  # noqa: E402
     run_wechat_cmd,
     prepare_bili_upload_metadata,
     prepare_wechat_upload_metadata,
+    wrap_upload_cmd_with_sleep_guard,
     UPLOAD_STALL_TIMEOUT,
     UPLOAD_SILENCE_TIMEOUT,
 )
@@ -291,6 +300,45 @@ logging.basicConfig(
     encoding='utf-8'
 )
 logger = logging.getLogger("AutoSubBatchPro")
+
+_UPLOAD_SLEEP_GUARD = None
+
+
+def _stop_upload_sleep_guard():
+    """Terminate the batch-level sleep guard started by _start_upload_sleep_guard."""
+    global _UPLOAD_SLEEP_GUARD
+    guard = _UPLOAD_SLEEP_GUARD
+    if guard is None or guard.poll() is not None:
+        return
+    try:
+        guard.terminate()
+        guard.wait(timeout=3)
+    except Exception:
+        try:
+            guard.kill()
+        except Exception:
+            pass
+
+
+def _start_upload_sleep_guard():
+    """Keep the whole batch awake while the engine process is alive."""
+    global _UPLOAD_SLEEP_GUARD
+    if not CAFFEINATE_CMD:
+        return
+    try:
+        _UPLOAD_SLEEP_GUARD = subprocess.Popen(
+            [CAFFEINATE_CMD, "-is", "-w", str(os.getpid())],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        atexit.register(_stop_upload_sleep_guard)
+        logger.info(
+            "Started macOS sleep guard "
+            f"(pid={_UPLOAD_SLEEP_GUARD.pid}, engine pid={os.getpid()})"
+        )
+    except Exception as e:
+        logger.warning(f"Failed to start macOS sleep guard: {e}")
 
 # --- 工具查找 (FFmpeg 等) ---
 def get_tool_path(tool_name="ffmpeg"):
@@ -480,6 +528,36 @@ STAGE_MARKERS = {
     "WX": ".wechat_uploaded",
 }
 
+# BI and WX are parallel terminal stages. Resetting one platform must not
+# discard the other platform's successful upload marker.
+RESET_DOWNSTREAM_STAGES = {
+    "DL": ("DL", "TR", "TL", "MR", "BR", "GD", "MG", "BI", "WX"),
+    "TR": ("TR", "TL", "MR", "BR", "GD", "MG", "BI", "WX"),
+    "TL": ("TL", "MR", "BR", "GD", "MG", "BI", "WX"),
+    "MR": ("MR", "BR", "GD", "MG", "BI", "WX"),
+    "BR": ("BR", "GD", "MG", "BI", "WX"),
+    "GD": ("GD",),
+    "MG": ("MG", "BI", "WX"),
+    "BI": ("BI",),
+    "WX": ("WX",),
+}
+
+
+def parse_reset_target(value: str) -> tuple[int, Optional[str]]:
+    """Parse TUI reset input such as ``15`` or ``15TL``."""
+    text = str(value).strip().upper()
+    match = re.fullmatch(r"(\d+)([A-Z]{2})?", text)
+    if not match:
+        raise ValueError("格式应为 ID 或 ID+STAGE，例如 15 或 15TL")
+
+    uid = int(match.group(1))
+    stage = match.group(2)
+    if stage and stage not in STAGE_ORDER:
+        raise ValueError(
+            f"未知环节 {stage}；可用环节：{', '.join(STAGE_ORDER)}"
+        )
+    return uid, stage
+
 
 @dataclass
 class SubTask:
@@ -532,6 +610,106 @@ def is_wechat_over_limit_reason(reason: Optional[str]) -> bool:
     """Whether a WeChat upload stop reason is the platform duration limit."""
     value = str(reason or "")
     return "超过视频号" in value and "分钟限制" in value
+
+
+def is_wechat_ambiguous_upload_reason(reason: Optional[str]) -> bool:
+    """Whether WeChat received the file but did not confirm the final result."""
+    return "文件已提交给微信" in str(reason or "")
+
+
+CHINESE_CHAR_RE = re.compile(r'[\u4e00-\u9fff]')
+
+
+def validate_translation_srt(path: str, bilingual: bool = False) -> Optional[str]:
+    """Return a failure reason when a translation track lacks Chinese blocks.
+
+    Bilingual files produced by merge_tracks() put the translation on the first
+    text line and the source language on following lines. Monolingual Chinese
+    files must contain Chinese in every non-empty subtitle block.
+    """
+    try:
+        blocks = srt_utils.parse_srt(path)
+    except Exception as exc:
+        return f"翻译质检失败：无法读取 {os.path.basename(path)}：{exc}"
+
+    if not blocks:
+        return f"翻译质检失败：{os.path.basename(path)} 没有可解析的字幕块"
+
+    bad_ids = []
+    for block in blocks:
+        lines = [str(line).strip() for line in block.get("lines", []) if str(line).strip()]
+        target = lines[0] if bilingual else " ".join(lines)
+        if not target or not (
+            CHINESE_CHAR_RE.search(target)
+            or srt_utils.is_non_speech_marker(target)
+        ):
+            bad_ids.append(str(block.get("index", "?")))
+
+    if bad_ids:
+        sample = ", ".join(bad_ids[:20])
+        suffix = "..." if len(bad_ids) > 20 else ""
+        return (
+            f"翻译质检失败：{os.path.basename(path)} 中 {len(bad_ids)}/{len(blocks)} "
+            f"个字幕块没有中文（ID: {sample}{suffix}）。请重置 TL 重新翻译"
+        )
+    return None
+
+
+# WeChat's page percentage only covers the file transfer. Keep room for
+# metadata, browser setup, form filling, covers, and draft verification.
+WECHAT_UPLOAD_PROGRESS_START = 35.0
+WECHAT_UPLOAD_PROGRESS_SPAN = 45.0
+WECHAT_LOG_MILESTONES = (
+    ("视频号上传:", 1.0),
+    ("标题来源", 3.0),
+    ("标签来源", 5.0),
+    ("封面标题来源", 8.0),
+    ("已获得微信浏览器 profile 锁", 15.0),
+    ("打开发布页面", 20.0),
+    ("等待页面加载", 25.0),
+    ("选择视频文件", 30.0),
+    ("视频文件已选择", 35.0),
+    ("等待视频上传完成", 35.0),
+    ("上传完成！", 80.0),
+    ("已填写标题", 82.0),
+    ("已填写描述", 84.0),
+    ("已添加 ", 86.0),
+    ("封面与分享卡片生成完成", 88.0),
+    ("已上传个人主页封面", 90.0),
+    ("已上传分享封面", 92.0),
+    ("已设置为公开", 94.0),
+    ("点击存草稿按钮", 96.0),
+    ("点击发布按钮", 96.0),
+    ("正在到草稿箱核验", 98.0),
+    ("等待发布完成", 98.0),
+    ("草稿箱已确认保存", 99.0),
+    ("发布成功！", 99.0),
+    ("存草稿完成！", 99.0),
+)
+
+
+def _map_wechat_upload_progress(pct):
+    """Map the page transfer percentage to the whole WX stage percentage."""
+    try:
+        value = float(pct)
+    except (TypeError, ValueError):
+        return None
+    value = min(100.0, max(0.0, value))
+    return round(
+        WECHAT_UPLOAD_PROGRESS_START
+        + value * WECHAT_UPLOAD_PROGRESS_SPAN / 100.0,
+        1,
+    )
+
+
+def _wechat_log_milestone(line):
+    """Return the WX stage percentage implied by a uploader log milestone."""
+    text = str(line)
+    matches = [
+        pct for marker, pct in WECHAT_LOG_MILESTONES
+        if marker in text
+    ]
+    return max(matches) if matches else None
 
 # --- 子进程树控制 ---
 # 上传子进程会再派生 chromium / ffmpeg，只杀父进程会留下占着浏览器 Profile 的
@@ -1138,51 +1316,107 @@ class BatchEngine:
                 return stage
         return None
 
-    def reset_task(self, task: SubTask) -> Optional[str]:
-        """Reset the next unfinished stage without discarding completed work."""
+    def reset_task(self, task: SubTask, stage: Optional[str] = None) -> Optional[str]:
+        """Reset a stage and its downstream outputs.
+
+        Without ``stage``, the next unfinished stage is selected. With ``stage``,
+        the caller can force an earlier stage to rerun (for example TL after a
+        translation quality failure even when persisted state says BR).
+        """
         with self.lock:
-            stage = self._first_unfinished_stage(task)
-            if stage is None:
+            selected_stage = stage.upper() if stage else self._first_unfinished_stage(task)
+            if selected_stage is None:
                 task.status = "完成"
                 task.error = None
                 task.retries = 0
                 self.save_state()
                 return None
+            if selected_stage not in STAGE_ORDER:
+                raise ValueError(
+                    f"未知环节 {selected_stage}；可用环节：{', '.join(STAGE_ORDER)}"
+                )
 
-            if stage in ("TR", "TL", "MR", "BR") and task.workdir and os.path.isdir(task.workdir):
+            reset_stages = RESET_DOWNSTREAM_STAGES[selected_stage]
+
+            if task.workdir and os.path.isdir(task.workdir):
                 try:
                     files = os.listdir(task.workdir)
-                    if stage == "TR":
+                    if "DL" in reset_stages:
+                        for name in files:
+                            if (
+                                name.lower().endswith((".mp4", ".mkv", ".webm", ".mov", ".ts"))
+                                and "_hardsub" not in name
+                            ):
+                                try: os.remove(os.path.join(task.workdir, name))
+                                except OSError: pass
+                    if "TR" in reset_stages:
                         for name in files:
                             if name.endswith(".srt") and not any(
                                 ext in name for ext in (".zh", ".cn", ".bi")
                             ):
                                 try: os.remove(os.path.join(task.workdir, name))
                                 except OSError: pass
-                    elif stage == "TL":
+                        try: os.remove(os.path.join(task.workdir, "transcribe_state.json"))
+                        except OSError: pass
+                    if "TL" in reset_stages:
                         for name in files:
-                            if ".zh.srt" in name or ".cn.srt" in name:
+                            if (
+                                ".zh.srt" in name
+                                or ".cn.srt" in name
+                                or ".bi.srt" in name
+                                or name.endswith(".ass")
+                                or (
+                                    "_hardsub" in name
+                                    and name.endswith((".mp4", ".mkv", ".webm"))
+                                )
+                            ):
                                 try: os.remove(os.path.join(task.workdir, name))
                                 except OSError: pass
-                    elif stage == "MR":
+                    if "MR" in reset_stages:
                         for name in files:
                             if ".bi.srt" in name:
                                 try: os.remove(os.path.join(task.workdir, name))
                                 except OSError: pass
-                    elif stage == "BR":
+                    if "BR" in reset_stages:
                         for name in files:
-                            if name.endswith(".ass") or name.endswith("_hardsub.mp4"):
+                            if (
+                                name.endswith(".ass")
+                                or (
+                                    "_hardsub" in name
+                                    and name.endswith((".mp4", ".mkv", ".webm"))
+                                )
+                            ):
                                 try: os.remove(os.path.join(task.workdir, name))
                                 except OSError: pass
+                    if "MG" in reset_stages:
+                        try: os.remove(os.path.join(task.workdir, "upload_metadata.json"))
+                        except OSError: pass
+                    for reset_stage in reset_stages:
+                        marker = STAGE_MARKERS.get(reset_stage)
+                        if not marker:
+                            continue
+                        try: os.remove(os.path.join(task.workdir, marker))
+                        except OSError: pass
                 except OSError:
                     pass
 
-            task.status = f"排队中 ({stage})"
-            task.pcts[stage] = 0.0
+            for reset_stage in reset_stages:
+                task.pcts[reset_stage] = 0.0
+            task.status = f"排队中 ({selected_stage})"
             task.error = None
             task.retries = 0
             self.save_state()
-            return stage
+            return selected_stage
+
+    def _fail_translation_quality(self, task: SubTask, reason: str):
+        """Stop a task before merge/burn when its translation track is invalid."""
+        with self.lock:
+            task.status = "失败 (TL)"
+            task.error = reason
+            task.pid = None
+            task.pcts.update({"TL": 0.0, "MR": 0.0, "BR": 0.0})
+        self.save_state()
+        logger.error(f"Task {task.uid} | TL | translation quality check failed: {reason}")
 
     def _refresh_wechat_skip(self, task: SubTask) -> Optional[str]:
         """Persist an early WeChat duration-limit decision from known duration."""
@@ -1483,6 +1717,30 @@ class BatchEngine:
 
             # 4. 判定环节状态
             files = os.listdir(task.workdir)
+
+            # Translation quality is a hard gate. Old .cn/.bi files from a run
+            # before this check must not be promoted to MR/BR merely because
+            # they exist on disk.
+            bi_files = [f for f in files if ".bi.srt" in f]
+            if bi_files:
+                reason = validate_translation_srt(
+                    os.path.join(task.workdir, bi_files[0]), bilingual=True
+                )
+                if reason:
+                    self._fail_translation_quality(task, reason)
+                    return
+            else:
+                cn_files = [
+                    f for f in files
+                    if re.search(r'(\.cn|\.zh)\.srt$', f)
+                ]
+                if cn_files:
+                    reason = validate_translation_srt(
+                        os.path.join(task.workdir, cn_files[0]), bilingual=False
+                    )
+                    if reason:
+                        self._fail_translation_quality(task, reason)
+                        return
            
             # 前置检查：如果上传标记都已存在，直接判完成，无需检查中间产物
             has_bili_done = os.path.exists(os.path.join(task.workdir, ".bili_uploaded"))
@@ -1685,9 +1943,14 @@ class BatchEngine:
             with self.lock:
                 task.status = f"运行中 ({display_label})"
 
-            logger.info(f"Task {task.uid} | {stage} | Start: {' '.join(cmd)}")
+            launch_cmd = (
+                wrap_upload_cmd_with_sleep_guard(cmd)
+                if stage in ("BI", "WX")
+                else cmd
+            )
+            logger.info(f"Task {task.uid} | {stage} | Start: {' '.join(launch_cmd)}")
             p = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                launch_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding='utf-8', errors='replace',
                cwd=task.workdir, creationflags=CREATE_NO_WINDOW
            )
@@ -1813,6 +2076,18 @@ class BatchEngine:
                         if stage == "BI"
                         else "视频号 WeChat (WX)"
                     )
+                    if stage == "WX" and is_wechat_ambiguous_upload_reason(
+                        "".join(output_lines)
+                    ):
+                        task.status = "失败 (WX)"
+                        task.error = (
+                            "视频号上传结果不确定：文件已提交给微信，请先检查草稿箱；"
+                            "为避免重复投稿，已停止自动重试"
+                        )
+                        logger.error(
+                            f"Task {task.uid} | {stage} | FAILED | {task.error}"
+                        )
+                        return False
                     login_reason = get_upload_login_failure_hint(
                         label, "".join(output_lines)
                     )
@@ -1929,6 +2204,12 @@ class BatchEngine:
                     stage = "MR"
                     en = [f for f in os.listdir(workdir) if f.endswith(".srt") and not re.search(r'(\.zh|\.cn|\.bi)\.srt$', f)][0]
                     zh = [f for f in os.listdir(workdir) if re.search(r'(\.cn|\.zh)\.srt$', f)][0]
+                    quality_reason = validate_translation_srt(
+                        os.path.join(workdir, zh), bilingual=False
+                    )
+                    if quality_reason:
+                        self._fail_translation_quality(task, quality_reason)
+                        break
                     cmd = list(SUBTRANSLATOR_CMD) + ["merge", os.path.join(workdir, en), "--translated-file", os.path.join(workdir, zh)]
                 elif "BR" in task.status:
                     stage = "BR"
@@ -1936,6 +2217,12 @@ class BatchEngine:
                     vid = [f for f in os.listdir(workdir) if f.lower().endswith((".mp4", ".mkv", ".webm", ".mov", ".ts")) and "_hardsub" not in f][0]
                     ass = bi.replace(".srt", ".ass")
                     out = os.path.splitext(vid)[0] + "_hardsub.mp4"
+                    quality_reason = validate_translation_srt(
+                        os.path.join(workdir, bi), bilingual=True
+                    )
+                    if quality_reason:
+                        self._fail_translation_quality(task, quality_reason)
+                        break
                     
                     # Load and apply global subtitle styles
                     settings = self._load_global_settings()
@@ -2245,6 +2532,7 @@ class BatchEngine:
                             )
                         permanent_upload_failure = permanent_upload_failure or any(
                             "登录态失效" in reason
+                            or is_wechat_ambiguous_upload_reason(reason)
                             for reason in upload_failure_reasons
                         ) or metadata_failed
 
@@ -2327,7 +2615,10 @@ class BatchEngine:
                         self.disk_truth(task)
                     else:
                         # 失败重试逻辑
-                        if task.error and "登录态失效" in task.error:
+                        if task.error and (
+                            "登录态失效" in task.error
+                            or is_wechat_ambiguous_upload_reason(task.error)
+                        ):
                             task.status = f"失败 ({stage})"
                             self.save_state()
                             break
@@ -2545,15 +2836,22 @@ class BatchEngine:
             logger.info(f"Task {task.uid} | WX | Start (parallel): {' '.join(cmd)}")
             output_lines = []
 
+            def set_progress(pct):
+                if pct is None:
+                    return
+                with self.lock:
+                    if pct <= task.pcts.get("WX", 0.0):
+                        return
+                    task.pcts["WX"] = round(min(100.0, max(0.0, pct)), 1)
+                    self.save_state()
+
             def on_log(line):
                 output_lines.append(str(line))
+                set_progress(_wechat_log_milestone(line))
                 logger.info(f"Task {task.uid} | WX | {line}")
 
             def on_progress(pct):
-                if pct > task.pcts.get("WX", 0.0):
-                    with self.lock:
-                        task.pcts["WX"] = round(pct, 1)
-                        self.save_state()
+                set_progress(_map_wechat_upload_progress(pct))
 
             ok = run_wechat_cmd(
                 cmd,
@@ -2562,6 +2860,51 @@ class BatchEngine:
                 abort_flag=lambda: self.abort,
             )
             output = "\n".join(output_lines)
+            login_reason = get_upload_login_failure_hint("视频号 WeChat (WX)", output)
+            if not ok and login_reason and not self.abort:
+                previous_status = task.status
+                with self.lock:
+                    task.status = "等待登录 (WX)"
+                    task.pcts["WX"] = 0.0
+                    task.error = None
+                    self.save_state()
+                logger.info(
+                    f"Task {task.uid} | WX | 登录态失效，"
+                    "正在打开可见扫码登录窗口..."
+                )
+
+                def _login_log(line):
+                    logger.info(f"Task {task.uid} | WX | {line}")
+
+                login_ok = run_wechat_cmd(
+                    build_wechat_login_cmd(),
+                    on_log=_login_log,
+                    abort_flag=lambda: self.abort,
+                    on_process_start=lambda proc: setattr(task, "pid", proc.pid),
+                    on_process_end=lambda _proc: setattr(task, "pid", None),
+                )
+                with self.lock:
+                    task.status = previous_status
+                    task.pcts["WX"] = 0.0
+                    task.error = None
+                    self.save_state()
+                if login_ok:
+                    logger.info(
+                        f"Task {task.uid} | WX | 扫码登录完成，自动重试无头上传..."
+                    )
+                    output_lines.clear()
+                    ok = run_wechat_cmd(
+                        cmd,
+                        on_progress=on_progress,
+                        on_log=on_log,
+                        abort_flag=lambda: self.abort,
+                    )
+                    output = "\n".join(output_lines)
+                else:
+                    logger.error(
+                        f"Task {task.uid} | WX | 可见登录未完成，停止本次上传"
+                    )
+            output = "\n".join(output_lines)
             if ok:
                 with self.lock:
                     task.pcts["WX"] = 100.0
@@ -2569,7 +2912,14 @@ class BatchEngine:
                 result_box[0] = True
                 logger.info(f"Task {task.uid} | WX | Success")
             else:
-                reason = get_upload_login_failure_hint("视频号 WeChat (WX)", output) or "WX upload failed"
+                if is_wechat_ambiguous_upload_reason(output):
+                    reason = (
+                        "视频号上传结果不确定：文件已提交给微信，请先检查草稿箱；"
+                        "为避免重复投稿，已停止自动重试"
+                    )
+                    task.wx_skip_reason = reason
+                else:
+                    reason = get_upload_login_failure_hint("视频号 WeChat (WX)", output) or "WX upload failed"
                 task.error = reason
                 if len(result_box) > 1:
                     result_box[1] = reason
@@ -2609,8 +2959,7 @@ class Dashboard:
         if p >= 100:
             bar_color = "green"
         elif stage_active:
-            # Queued rows are grey, but an active stage still has live work.
-            bar_color = "bright_blue" if row_color == "grey37" else row_color
+            bar_color = row_color
         else:
             bar_color = "grey37"
 
@@ -2782,7 +3131,7 @@ class Dashboard:
         # ASCII-only (Up/Dn instead of arrows) to avoid ambiguous-width chars.
         page_info = f"Total Tasks: {total_tasks} | Showing: {self.scroll_offset+1}-{min(self.scroll_offset+self.page_size, total_tasks)} | Up/Dn Scroll"
         cmd_text = f"[bold cyan]Cmd: [/][white]{self.cmd_buf}[/]" if self.cmd_buf else "[dim]Waiting for command...[/]"
-        help_msg = f"{cmd_text} | [bold yellow]P+A[/]:Pause/Resume All | [bold yellow]P+ID[/]:Pause/Resume One | [bold yellow]R+ID[/]:Reset | [bold red]Q[/]:Exit"
+        help_msg = f"{cmd_text} | [bold yellow]P+A[/]:Pause/Resume All | [bold yellow]P+ID[/]:Pause/Resume One | [bold yellow]R+ID/ID+STAGE[/]:Reset | [bold red]Q[/]:Exit"
 
         cap1 = Text.from_markup(help_msg)
         cap2 = Text.from_markup(f"[dim]{page_info}[/]")
@@ -2818,6 +3167,8 @@ def main():
     parser.add_argument("--quality", choices=["standard", "high", "lossless"], default="high", help="压制字幕画质 (standard, high, lossless)")
     parser.add_argument("--no-sequence", action="store_true", help="不要在视频文件夹名称前加序列号")
     args = parser.parse_args()
+
+    _start_upload_sleep_guard()
 
     engine = BatchEngine(output_dir=args.output, sub_dir_name=args.sub_dir_name, state_file=args.state_file)
     engine.quality = args.quality
@@ -2969,7 +3320,10 @@ def main():
                     continue
 
                 ch = raw_ch.lower()
-                if ch == b'q': engine.abort = True; break
+                if ch == b'q':
+                    logger.info("Quit requested from dashboard; stopping engine and child uploads")
+                    engine.abort = True
+                    break
 
                 if sys.platform == "win32":
                     # 翻页支持
@@ -3001,9 +3355,12 @@ def main():
                     dash.cmd_buf = "P (A/ID): "
                     cmd_mode = 'P'
                 elif ch == b'r':
-                    dash.cmd_buf = "R (ID): "
+                    dash.cmd_buf = "R (ID/ID+STAGE): "
                     cmd_mode = 'R'
                 elif ch.isdigit() and cmd_mode:
+                    id_buf += ch.decode()
+                    dash.cmd_buf += ch.decode()
+                elif cmd_mode == 'R' and ch.isalpha():
                     id_buf += ch.decode()
                     dash.cmd_buf += ch.decode()
                 elif ch.lower() == b'a' and cmd_mode == 'P':
@@ -3050,7 +3407,11 @@ def main():
                                             threading.Thread(target=engine.worker, args=(t,), daemon=True).start()
                         else:
                             try:
-                                uid = int(id_buf)
+                                requested_stage = None
+                                if cmd_mode == 'R':
+                                    uid, requested_stage = parse_reset_target(id_buf)
+                                else:
+                                    uid = int(id_buf)
                                 t = engine.task_map.get(uid)
                                 if t:
                                     if cmd_mode == 'P':
@@ -3077,13 +3438,18 @@ def main():
                                                 kill_pid_tree(t.pid)
                                                 t.pid = None
 
-                                            reset_stage = engine.reset_task(t)
+                                            reset_stage = engine.reset_task(
+                                                t, stage=requested_stage
+                                            )
                                             # 仅在没有活跃工人时才重新拉起线程，防止“泥潭”效应
                                             if t.uid not in engine.active_workers:
                                                 threading.Thread(target=engine.worker, args=(t,), daemon=True).start()
                                             else:
                                                 logger.info(f"Task {t.uid} | Reset ({reset_stage or 'complete'}) | Worker thread already active, it will pick up the reset status.")
-                            except: pass
+                            except ValueError as e:
+                                logger.warning(f"Invalid command {cmd_mode}:{id_buf}: {e}")
+                            except Exception as e:
+                                logger.error(f"Command {cmd_mode}:{id_buf} failed: {e}")
                         cmd_mode, id_buf, dash.cmd_buf = None, "", ""
                 elif ch == b'\x1b' and sys.platform == "win32": # ESC on Windows
                     cmd_mode, id_buf, dash.cmd_buf = None, "", ""

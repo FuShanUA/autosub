@@ -101,6 +101,29 @@ def is_chinese(text):
     """Checks if text contains Chinese characters."""
     return bool(re.search(r'[\u4e00-\u9fff]', text))
 
+
+NON_SPEECH_MARKER_RE = re.compile(
+    r'^[\(\（]\s*(杂音|音乐|笑声|掌声|无声|歌词|音效|咳嗽|叹气|欢呼)\s*[\)\）]$'
+)
+
+
+def is_non_speech_marker(text):
+    """Whether a complete line is an intentional non-speech subtitle marker."""
+    return bool(NON_SPEECH_MARKER_RE.match(str(text).strip()))
+
+
+def remove_parenthetical_glosses(text):
+    """Remove glosses while preserving intentional non-speech markers."""
+    def replace(match):
+        return match.group(0) if is_non_speech_marker(match.group(0)) else ""
+
+    return re.sub(
+        r'\s*[\(\（][^\)\）]*[\)\）]',
+        replace,
+        text,
+    ).strip()
+
+
 def extract_tracks(input_path, output_dir=None):
     """
     Splits a bilingual SRT into separate .en.srt and .cn.srt files.
@@ -237,7 +260,7 @@ def merge_tracks(path_master, path_secondary, output_path):
 
             m_text = " ".join([l.strip() for l in m_block.get('lines', [])]).replace('\n', ' ')
             m_text = re.sub(r'\s+', ' ', m_text).strip()
-            m_text = re.sub(r'\s*[\(\（][^\)\）]*[\)\）]', '', m_text).strip()
+            m_text = remove_parenthetical_glosses(m_text)
 
             new_lines = []
             if m_text:
@@ -301,9 +324,9 @@ def merge_tracks(path_master, path_secondary, output_path):
         joined_trans = " ".join([l.strip() for l in matched_text]).replace('\n', ' ')
         joined_trans = re.sub(r'\s+', ' ', joined_trans).strip()
 
-        # CLEANING: Remove "Chinese (English)" pattern
-        # Remove (English) or （English）
-        joined_trans = re.sub(r'\s*[\(\（][^\)\）]*[\)\）]', '', joined_trans).strip()
+        # CLEANING: Remove "Chinese (English)" pattern, but keep markers such
+        # as （杂音） that are the whole translation for a noisy source block.
+        joined_trans = remove_parenthetical_glosses(joined_trans)
 
         # Construct merged block
         # Translation on top? No, usually Translation is Master, Source is Secondary.

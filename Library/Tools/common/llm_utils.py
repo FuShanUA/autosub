@@ -10,7 +10,7 @@ import base64
 import warnings
 from urllib.parse import urlparse
 from enum import Enum
-from typing import List, Dict, Optional, Union, Tuple
+from typing import Callable, List, Dict, Optional, Union, Tuple
 
 # Suppress SDK migration and version warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -219,6 +219,77 @@ class LLMClient:
     # Same-provider model cascade for Dashscope (Bailian / 百炼).
     # When the primary model fails, try these in order before crossing to other providers.
     DASHSCOPE_FALLBACK_CHAIN = ["qwen3.7-max", "kimi-k2.6", "deepseek-v4-pro"]
+    _FALLBACK_MODES = {"off", "same_provider", "cross_provider"}
+
+    @staticmethod
+    def _normalize_fallback_mode(value) -> str:
+        mode = str(value or "").strip().lower().replace("-", "_")
+        aliases = {
+            "disabled": "off",
+            "disable": "off",
+            "false": "off",
+            "none": "off",
+            "same": "same_provider",
+            "cross": "cross_provider",
+        }
+        mode = aliases.get(mode, mode)
+        return mode if mode in LLMClient._FALLBACK_MODES else "same_provider"
+
+    @staticmethod
+    def _parse_fallback_models(value) -> Optional[List[str]]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            if value.strip().lower() in {"0", "false", "off", "none", "disabled"}:
+                return []
+            return [
+                item.strip()
+                for item in re.split(r"[,;\s]+", value.strip())
+                if item.strip()
+            ]
+        if isinstance(value, (list, tuple)):
+            return [str(item).strip() for item in value if str(item).strip()]
+        return []
+
+    @staticmethod
+    def _load_llm_fallback_config() -> Tuple[str, Optional[List[str]]]:
+        """Load provider-agnostic fallback settings from env or AutoSub config."""
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        tools_dir = os.path.dirname(current_dir)
+        autosub_dir = os.path.join(tools_dir, "autosub")
+        default_path = os.path.join(autosub_dir, "defaults.json")
+        settings_path = os.path.join(autosub_dir, "settings.json")
+        configured_path = os.environ.get("AUTOSUB_SETTINGS_PATH")
+        config_paths = [default_path, settings_path]
+        if configured_path:
+            config_paths.append(configured_path)
+
+        settings = {}
+        for path in config_paths:
+            if not os.path.exists(path):
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    loaded = json.load(handle)
+                if isinstance(loaded, dict):
+                    settings.update(loaded)
+            except (OSError, ValueError):
+                continue
+
+        env_mode = os.environ.get("LLM_FALLBACK_MODE")
+        mode_value = env_mode if env_mode is not None else settings.get(
+            "llm_fallback_mode", "same_provider"
+        )
+        env_models = os.environ.get("LLM_FALLBACK_MODELS")
+        models_value = (
+            env_models
+            if env_models is not None
+            else settings.get("llm_fallback_models")
+        )
+        return (
+            LLMClient._normalize_fallback_mode(mode_value),
+            LLMClient._parse_fallback_models(models_value),
+        )
 
     @staticmethod
     def _normalize_openai_base_url(base_url: str) -> str:
@@ -353,6 +424,7 @@ class LLMClient:
                 existing_providers.add(prov)
 
         # Default tier settings
+        self.fallback_mode, self.fallback_models = self._load_llm_fallback_config()
         tier_str = os.environ.get("LLM_TIER", "tier1").lower()
         if tier_str == "free":
             self.rpm_limit = 10
@@ -789,6 +861,22 @@ class LLMClient:
         request_timeout: Optional[int] = None,
         max_retries: Optional[int] = None,
     ) -> Optional[str]:
+        if request_timeout is None:
+            env_timeout = os.environ.get("LLM_REQUEST_TIMEOUT")
+            if env_timeout:
+                try:
+                    request_timeout = int(env_timeout)
+                except ValueError:
+                    print(f"⚠️ Invalid LLM_REQUEST_TIMEOUT value: {env_timeout}")
+
+        if max_retries is None:
+            env_retries = os.environ.get("LLM_MAX_RETRIES")
+            if env_retries:
+                try:
+                    max_retries = max(1, int(env_retries))
+                except ValueError:
+                    print(f"⚠️ Invalid LLM_MAX_RETRIES value: {env_retries}")
+
         if model_name and "::" in model_name:
             vendor_str, model_name = model_name.split("::", 1)
             try:
@@ -802,6 +890,9 @@ class LLMClient:
         primary_prov = provider
         if model_name and not primary_prov:
             primary_prov = self._get_provider(model_name)
+
+        fallback_mode = getattr(self, "fallback_mode", "same_provider")
+        configured_fallback_models = getattr(self, "fallback_models", None)
 
         if primary_prov == LLMProvider.VERTEX:
             # 1. 尝试 Vertex
@@ -820,37 +911,58 @@ class LLMClient:
                 targets.append((LLMProvider.DASHSCOPE, ds_key, "deepseek-v4-pro"))
         else:
             # If user hardcoded a specific model, try it first
+            prov = primary_prov
             if model_name:
-                prov = provider or self._get_provider(model_name)
+                prov = provider or primary_prov or self._get_provider(model_name)
                 key = self.api_keys.get(prov)
                 # Vertex can run without a key if using ADC (Application Default Credentials)
                 is_vertex_adc = (prov == LLMProvider.VERTEX and self.vertex_project)
                 if key or is_vertex_adc:
                     targets.append((prov, key, model_name))
-            
-            # Same-provider model cascade for Dashscope (Bailian / 百炼):
-            # glm-5.2 -> qwen3.7-max -> kimi-k2.6 -> deepseek-v4-pro
-            if fallback and prov == LLMProvider.DASHSCOPE:
-                ds_key = self.api_keys.get(LLMProvider.DASHSCOPE)
-                for fb_model in self.DASHSCOPE_FALLBACK_CHAIN:
-                    if fb_model != model_name:
-                        targets.append((LLMProvider.DASHSCOPE, ds_key, fb_model))
 
-            # [MODIFIED] If fallback is disabled (default), we only try the primary target.
-            # If fallback is enabled, we still limit it to the same provider if possible,
-            # or respect the strict "no silent fallback to other brands" rule.
-            if (not targets or fallback) and os.path.exists(ENV_PATH):
-                # Try to pick others from .env
-                for prov, key, mod in self.ordered_configs:
-                    # Skip Vertex (broken 403 project) and Gemini (paid) in fallback cascade
-                    if prov == LLMProvider.VERTEX: continue
-                    if prov == LLMProvider.GEMINI: continue
-                    # If we already have a target for this provider, skip unless it's a different model
-                    if any(t[0] == prov and t[2] == mod for t in targets): continue
-                    targets.append((prov, key, mod))
-            
-            # If still nothing, fallback to available keys but ONLY the first one
-            if not targets:
+            if fallback and fallback_mode != "off":
+                fallback_candidates = configured_fallback_models
+                if not fallback_candidates and prov == LLMProvider.DASHSCOPE:
+                    # Preserve the current Bailian behavior when no explicit
+                    # model list is configured.
+                    fallback_candidates = list(self.DASHSCOPE_FALLBACK_CHAIN)
+
+                if fallback_candidates:
+                    for candidate in fallback_candidates:
+                        value = str(candidate or "").strip()
+                        if not value:
+                            continue
+                        target_provider = prov
+                        target_model = value
+                        if "::" in value:
+                            provider_name, target_model = value.split("::", 1)
+                            try:
+                                target_provider = LLMProvider(provider_name.lower())
+                            except ValueError:
+                                continue
+                        if fallback_mode == "same_provider" and target_provider != prov:
+                            continue
+                        if target_model.casefold() == str(model_name or "").casefold():
+                            continue
+                        target_key = self.api_keys.get(target_provider)
+                        if not target_key:
+                            continue
+                        target = (target_provider, target_key, target_model)
+                        if target not in targets:
+                            targets.append(target)
+                elif fallback_mode == "cross_provider":
+                    # Cross-provider fallback must be explicit. It is not a
+                    # DashScope-specific dependency and does not run by default.
+                    for ordered_provider, ordered_key, ordered_model in self.ordered_configs:
+                        if ordered_provider in {LLMProvider.VERTEX, LLMProvider.GEMINI}:
+                            continue
+                        target = (ordered_provider, ordered_key, ordered_model)
+                        if target not in targets:
+                            targets.append(target)
+
+            # Keep the legacy behavior for callers that provide neither model
+            # nor provider: use the first configured key and its default model.
+            if not targets and not model_name:
                 for prov, key in self.api_keys.items():
                     if key and prov != LLMProvider.VERTEX: # Skip Vertex (broken 403 project config)
                         guess = "gpt-4o"
@@ -858,14 +970,6 @@ class LLMClient:
                         elif prov == LLMProvider.DASHSCOPE: guess = "deepseek-v4-pro"
                         targets.append((prov, key, guess))
                         break
-
-            # [STRICT] If targets has multiple entries but fallback is False, we ONLY try the first one.
-            # EXCEPT: If Vertex AI is the primary target, we always allow same-brand fallback to Developer Gemini.
-            if not fallback and len(targets) > 1:
-                if targets[0][0] == LLMProvider.VERTEX:
-                    targets = [t for t in targets if t[0] in [LLMProvider.VERTEX, LLMProvider.GEMINI]]
-                else:
-                    targets = targets[:1]
 
         errors = []
         # [STRICT] If targets has multiple entries but fallback is False, we ONLY try the first one.
@@ -953,7 +1057,18 @@ class LLMClient:
 
         raise Exception(f"❌ All LLM API fallbacks exhausted. Errors: {errors}")
 
-    def generate_batch(self, tasks: List[Dict], model_name: str = "gemini-3.1-flash-preview", fallback: bool = False, provider: Optional[LLMProvider] = None, disable_thinking: bool = False) -> List[Dict]:
+    def generate_batch(
+        self,
+        tasks: List[Dict],
+        model_name: str = "gemini-3.1-flash-preview",
+        fallback: bool = False,
+        provider: Optional[LLMProvider] = None,
+        disable_thinking: bool = False,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+        request_timeout: Optional[int] = None,
+        max_retries: Optional[int] = None,
+        batch_timeout: Optional[float] = None,
+    ) -> List[Dict]:
         results = []
         total = len(tasks)
 
@@ -967,6 +1082,26 @@ class LLMClient:
 
         print(f"🚀 Starting batch generation for {total} items (Workers: {effective_workers}, Model: {model_name}, Fallback: {fallback})...")
 
+        _env_request_timeout = os.environ.get("LLM_REQUEST_TIMEOUT")
+        if request_timeout is None and _env_request_timeout:
+            try:
+                request_timeout = int(_env_request_timeout)
+            except ValueError:
+                print(f"⚠️ Invalid LLM_REQUEST_TIMEOUT value: {_env_request_timeout}")
+
+        _env_retries = os.environ.get("LLM_MAX_RETRIES")
+        if max_retries is None and _env_retries:
+            try:
+                max_retries = max(1, int(_env_retries))
+            except ValueError:
+                print(f"⚠️ Invalid LLM_MAX_RETRIES value: {_env_retries}")
+
+        # Batch calls fail soft: their results are parsed and missing chunks are
+        # retried by the caller. A default of one attempt prevents a bad network
+        # path from multiplying every wave by hidden retries.
+        if max_retries is None:
+            max_retries = 1
+
         # Batch timeout: if a single chunk's LLM call hangs, skip it after this many
         # seconds instead of blocking the entire batch indefinitely.
         #
@@ -976,9 +1111,13 @@ class LLMClient:
         # 200-250s. Scale the timeout accordingly so large batches don't get
         # killed prematurely.
         _env_timeout = os.environ.get("LLM_BATCH_TIMEOUT")
-        if _env_timeout:
-            per_task_timeout = int(_env_timeout)
-        else:
+        if batch_timeout is None and _env_timeout:
+            try:
+                batch_timeout = float(_env_timeout)
+            except ValueError:
+                print(f"⚠️ Invalid LLM_BATCH_TIMEOUT value: {_env_timeout}")
+
+        if batch_timeout is None:
             # Auto-scale: 300s per chunk-wave (ceil(N/W) waves), min 300s.
             # Thinking models can take 120-250s per chunk; with 1 retry that's
             # up to 600s per wave. The 300s floor is generous for non-reasoning
@@ -986,20 +1125,31 @@ class LLMClient:
             _mn = model_name.lower() if model_name else ''
             _is_reasoning = any(x in _mn for x in ['o1', 'o3', 'reasoner', 'k2.6', 'k2.5', 'k3', 'kimi-k3', 'glm-5', 'glm5', 'deepseek-v4-pro', 'r1'])
             _is_thinking = _is_reasoning and not disable_thinking
-            _per_chunk = 300 if _is_thinking else 60
+            if request_timeout is None:
+                request_timeout = 300 if _is_thinking else 90
+            _per_chunk = request_timeout * max(1, max_retries)
             import math as _math
             _waves = _math.ceil(total / max(effective_workers, 1))
-            per_task_timeout = max(300, _waves * _per_chunk)
+            batch_timeout = max(300.0, _waves * float(_per_chunk))
 
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers)
         future_to_task = {
-           executor.submit(self.generate_content, task['prompt'], model_name, fallback=fallback, provider=provider, disable_thinking=disable_thinking): task
+           executor.submit(
+               self.generate_content,
+               task['prompt'],
+               model_name,
+               fallback=fallback,
+               provider=provider,
+               disable_thinking=disable_thinking,
+               request_timeout=request_timeout,
+               max_retries=max_retries,
+           ): task
            for task in tasks
         }
 
         import time as _time
         completed = 0
-        batch_start = _time.time()
+        batch_start = _time.monotonic()
         pending = dict(future_to_task)
         # Heartbeat: print status every 30s so the user knows the batch is
         # still alive (reasoning models can take minutes per chunk).
@@ -1007,33 +1157,37 @@ class LLMClient:
         _stop_hb = _threading.Event()
         def _heartbeat():
            while not _stop_hb.wait(30):
-               el = _time.time() - batch_start
+               el = _time.monotonic() - batch_start
                done = total - len(pending)
                inflight = len(pending)
                print(f"   ⏳ {done}/{total} done, {inflight} in flight ({el:.0f}s elapsed)", flush=True)
+               if progress_callback:
+                   progress_callback(done, total)
         _hb_thread = _threading.Thread(target=_heartbeat, daemon=True)
         _hb_thread.start()
         # Iterate as chunks finish (out of order) so the user sees live progress
         # instead of a frozen screen while long LLM calls are in flight.
         try:
-           for future in concurrent.futures.as_completed(future_to_task, timeout=per_task_timeout):
+           for future in concurrent.futures.as_completed(future_to_task, timeout=batch_timeout):
                task = future_to_task[future]
                chunk_id = task.get('chunk_idx', task.get('index', task.get('n', '?')))
                try:
                    result_text = future.result(timeout=0.1)
                    results.append({**task, 'result': result_text})
-                   print(f"   ✅ Chunk {chunk_id} done ({completed + 1}/{total}, {_time.time()-batch_start:.0f}s elapsed)", flush=True)
+                   print(f"   ✅ Chunk {chunk_id} done ({completed + 1}/{total}, {_time.monotonic()-batch_start:.0f}s elapsed)", flush=True)
                except Exception as e:
                    print(f"   ❌ Chunk {chunk_id} failed: {type(e).__name__}: {str(e)[:80]}", flush=True)
                    results.append({**task, 'result': None, 'error': str(e)})
                completed += 1
                pending.pop(future, None)
+               if progress_callback:
+                   progress_callback(completed, total)
         except concurrent.futures.TimeoutError:
             # as_completed overall timeout: remaining chunks are still in flight.
-            print(f"   ⏰ {len(pending)} chunk(s) still pending after {per_task_timeout}s — skipping them.", flush=True)
+            print(f"   ⏰ {len(pending)} chunk(s) still pending after {batch_timeout:g}s — skipping them.", flush=True)
             for fut, task in pending.items():
                 chunk_id = task.get('chunk_idx', '?')
-                results.append({**task, 'result': None, 'error': f'timeout_{per_task_timeout}s'})
+                results.append({**task, 'result': None, 'error': f'batch_timeout_{batch_timeout:g}s'})
                 print(f"   ⏰ Chunk {chunk_id} skipped (will use original text).", flush=True)
             completed = total
 

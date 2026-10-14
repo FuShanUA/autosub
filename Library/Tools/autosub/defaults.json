@@ -2,6 +2,8 @@
     "whisper_model": "large-v2",
   "llm_model": "qwen3.7-max",
     "llm_vendor": "Alibaba (Bailian)",
+    "llm_fallback_mode": "same_provider",
+    "llm_fallback_models": [],
     "style": "auto",
     "layout": "bilingual",
     "main_lang": "cn",

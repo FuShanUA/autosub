@@ -18,8 +18,10 @@
 import argparse
 import asyncio
 import base64
+import fcntl
 import glob
 import json
+import math
 import os
 import re
 import sys
@@ -37,11 +39,66 @@ BROWSER_DATA_DIR = os.environ.get(
     "WECHAT_BROWSER_DATA_DIR",
     os.path.join(SKILL_DIR, "assets", "browser_data"),
 )
+_BROWSER_DATA_REAL_PATH = os.path.realpath(BROWSER_DATA_DIR)
+BROWSER_LOCK_PATH = os.environ.get(
+    "WECHAT_BROWSER_LOCK_PATH",
+    os.path.join(
+        os.path.dirname(_BROWSER_DATA_REAL_PATH),
+        os.path.basename(_BROWSER_DATA_REAL_PATH) + ".lock",
+    ),
+)
 QUEUE_PATH = os.path.join(SKILL_DIR, "assets", "failed_queue.json")
 
 # Upload metadata has local fallbacks, so avoid long LLM retry chains here.
 os.environ.setdefault("LLM_REQUEST_TIMEOUT", "30")
 os.environ.setdefault("LLM_MAX_RETRIES", "1")
+
+
+class _BrowserProfileLock:
+    """Serialize all Playwright users of one persistent WeChat profile."""
+
+    def __init__(self):
+        self.path = BROWSER_LOCK_PATH
+        self._fd = None
+
+    async def acquire(self):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._acquire)
+
+    def _acquire(self):
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        self._fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+        waited = 0
+        while True:
+            try:
+                fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if waited == 0:
+                    print(
+                        ">>> 另一个微信上传/登录进程正在使用浏览器 profile，本进程排队等待..."
+                    )
+                elif waited % 15 == 0:
+                    print(f">>> 仍在等待微信浏览器 profile 锁（{waited} 秒）...")
+                time.sleep(1)
+                waited += 1
+        os.ftruncate(self._fd, 0)
+        os.write(self._fd, f"{os.getpid()}\n".encode("ascii"))
+        print(f">>> 已获得微信浏览器 profile 锁: {self.path} (pid={os.getpid()})")
+        return self
+
+    async def release(self):
+        if self._fd is None:
+            return
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._release)
+
+    def _release(self):
+        fd, self._fd = self._fd, None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
 # 复用统一 LLM 接口（与 bili_upload.py 对齐）
 _COMMON_DIR = os.environ.get("AUTOSUB_COMMON_DIR", "/Users/shanfu/cc/Library/Tools/common")
@@ -82,6 +139,18 @@ WECHAT_CREATE_URL = "https://channels.weixin.qq.com/platform/post/create"
 WECHAT_DRAFT_URL = "https://channels.weixin.qq.com/platform/post/draftListManager"
 WECHAT_TITLE_MAX_CHARS = 16
 WECHAT_TITLE_FALLBACK = "未命名视频"
+# The creator platform is on a domestic direct route, while the system DNS may
+# point at the VPN resolver. First-page DOM loading can exceed 30s on that path.
+WECHAT_PAGE_LOAD_TIMEOUT_MS = 60000
+
+
+async def _goto_wechat_page(page, url):
+    """Open a WeChat creator-platform route with the shared load timeout."""
+    await page.goto(
+        url,
+        wait_until="domcontentloaded",
+        timeout=WECHAT_PAGE_LOAD_TIMEOUT_MS,
+    )
 
 
 def _find_ffprobe():
@@ -410,30 +479,36 @@ def build_cover_title(
 async def _ensure_browser(playwright, headless=False):
     """启动持久化 browser context。返回 (browser_context, page)。"""
     os.makedirs(BROWSER_DATA_DIR, exist_ok=True)
-    context = await playwright.chromium.launch_persistent_context(
-        user_data_dir=BROWSER_DATA_DIR,
-        headless=headless,
-        locale="zh-CN",
-        timezone_id="Asia/Shanghai",
-        viewport={"width": 1280, "height": 800},
-        user_agent=(
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-        ),
-        args=[
-            "--disable-blink-features=AutomationControlled",
-            "--no-proxy-server",
-        ],
-    )
-    # 拦截可能的自动化检测
-    await context.add_init_script("""
-        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-    """)
-    if not context.pages:
-        page = await context.new_page()
-    else:
-        page = context.pages[0]
-    return context, page
+    profile_lock = _BrowserProfileLock()
+    await profile_lock.acquire()
+    try:
+        context = await playwright.chromium.launch_persistent_context(
+            user_data_dir=BROWSER_DATA_DIR,
+            headless=headless,
+            locale="zh-CN",
+            timezone_id="Asia/Shanghai",
+            viewport={"width": 1280, "height": 800},
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+            ),
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-proxy-server",
+            ],
+        )
+        # 拦截可能的自动化检测
+        await context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+        """)
+        if not context.pages:
+            page = await context.new_page()
+        else:
+            page = context.pages[0]
+    except Exception:
+        await profile_lock.release()
+        raise
+    return context, page, profile_lock
 
 
 async def _wait_login(page, timeout=120):
@@ -535,7 +610,7 @@ async def _do_login(headless=False):
     """首次登录流程：打开浏览器，等待扫码。"""
     from playwright.async_api import async_playwright
     async with async_playwright() as p:
-        context, page = await _ensure_browser(p, headless=False)  # 登录必须 headless=False
+        context, page, profile_lock = await _ensure_browser(p, headless=False)  # 登录必须 headless=False
         try:
             print(f">>> 打开微信视频号创作者平台: {WECHAT_LOGIN_URL}")
             await page.goto(WECHAT_LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
@@ -546,7 +621,10 @@ async def _do_login(headless=False):
                 return True
             return False
         finally:
-            await context.close()
+            try:
+                await context.close()
+            finally:
+                await profile_lock.release()
 
 
 # 多组容错选择器
@@ -606,7 +684,14 @@ UPLOAD_DONE_INDICATORS = [
 
 # 进度百分比连续这么久不变就判定上传卡死。正常上传每几秒就会跳一个百分点，
 # 而卡死时页面仍在轮询自己的接口，看起来"还活着"，只有进度不再前进。
-UPLOAD_STALL_SECONDS = 900
+UPLOAD_STALL_SECONDS = float(os.environ.get("WECHAT_UPLOAD_STALL_SECONDS", "900"))
+# 文件已选择但页面始终不给进度时，也不能占用串行上传槽位到 10000 秒。
+UPLOAD_NO_PROGRESS_SECONDS = float(
+    os.environ.get("WECHAT_UPLOAD_NO_PROGRESS_SECONDS", "300")
+)
+UPLOAD_EVALUATE_TIMEOUT_SECONDS = float(
+    os.environ.get("WECHAT_UPLOAD_EVALUATE_TIMEOUT_SECONDS", "10")
+)
 
 
 async def _try_selectors(page, selectors, description="element"):
@@ -659,12 +744,168 @@ async def _add_tags(page, tags):
     print(f">>> 已添加 {len(tags)} 个标签")
 
 
+async def _read_upload_progress(page):
+    """Read upload progress from progress nodes, ARIA state, or page text."""
+    try:
+        raw_progress = await asyncio.wait_for(
+            page.evaluate(
+                """() => {
+                const root = document.querySelector('wujie-app')?.shadowRoot?.querySelector('html') || document;
+                const text = root.innerText || document.body?.innerText || '';
+                const uploadError = ['上传失败', '网络出错，请重新上传'].find(
+                    (message) => text.includes(message)
+                );
+                if (uploadError) {
+                    return {
+                        pct: null,
+                        source: 'upload-error',
+                        detail: uploadError,
+                        error: uploadError,
+                    };
+                }
+                const nodes = Array.from(root.querySelectorAll(
+                    '[class*="progress"], [class*="upload-status"], [class*="uploading"], [role="progressbar"]'
+                ));
+                const candidates = [];
+                const isVisible = (node) => {
+                    const rect = node.getBoundingClientRect();
+                    const style = window.getComputedStyle(node);
+                    return Boolean(
+                        rect
+                        && rect.width > 0
+                        && rect.height > 0
+                        && style
+                        && style.display !== 'none'
+                        && style.visibility !== 'hidden'
+                    );
+                };
+                for (const node of nodes) {
+                    let pct = null;
+                    let source = '';
+                    let detail = '';
+                    const textValues = [
+                        node.getAttribute('aria-valuetext'),
+                        node.innerText,
+                        node.textContent,
+                    ].filter(Boolean).map((value) => String(value).trim());
+                    for (const value of textValues) {
+                        const match = value.match(/(\\d{1,3}(?:\\.\\d+)?)\\s*%/);
+                        if (match) {
+                            pct = Math.min(100, Math.round(parseFloat(match[1])));
+                            source = 'progress-node';
+                            detail = value.slice(0, 160);
+                            break;
+                        }
+                    }
+
+                    if (pct === null) {
+                        const ariaNow = Number(node.getAttribute('aria-valuenow'));
+                        if (Number.isFinite(ariaNow) && ariaNow >= 0) {
+                            const ariaMax = Number(node.getAttribute('aria-valuemax')) || 100;
+                            if (ariaMax > 0) {
+                                pct = Math.min(100, Math.round((ariaNow / ariaMax) * 100));
+                                source = 'aria-progressbar';
+                                detail = `${ariaNow}/${ariaMax}`;
+                            }
+                        }
+                    }
+
+                    if (pct === null) {
+                        const width = node.style && node.style.width;
+                        const widthMatch = width && String(width).match(/^(\\d{1,3}(?:\\.\\d+)?)%$/);
+                        if (widthMatch) {
+                            pct = Math.min(100, Math.round(parseFloat(widthMatch[1])));
+                            source = 'progress-width';
+                            detail = String(width);
+                        }
+                    }
+
+                    if (pct !== null) {
+                        candidates.push({
+                            pct,
+                            source,
+                            detail,
+                            visible: isVisible(node),
+                        });
+                    }
+                }
+
+                const lines = text.split('\\n').map((line) => line.trim()).filter(Boolean);
+                const progressLine = lines.find(
+                    (line) => /\\d{1,3}(?:\\.\\d+)?\\s*%/.test(line)
+                        && /(上传|进度|转码|传输|完成)/.test(line)
+                );
+                if (progressLine) {
+                    const match = progressLine.match(/(\\d{1,3}(?:\\.\\d+)?)\\s*%/);
+                    candidates.push({
+                        pct: Math.min(100, Math.round(parseFloat(match[1]))),
+                        source: 'page-text',
+                        detail: progressLine.slice(0, 160),
+                        visible: true,
+                    });
+                }
+                return {
+                    candidates,
+                    pct: null,
+                    source: 'no-progress',
+                    detail: lines.slice(0, 20).join(' | ').slice(0, 500),
+                };
+            }"""
+            ),
+            timeout=UPLOAD_EVALUATE_TIMEOUT_SECONDS,
+        )
+        return _select_upload_progress(raw_progress)
+    except asyncio.TimeoutError:
+        return {
+            "pct": None,
+            "source": "evaluate-timeout",
+            "detail": f"page.evaluate exceeded {UPLOAD_EVALUATE_TIMEOUT_SECONDS}s",
+        }
+    except Exception as e:
+        return {"pct": None, "source": "evaluate-error", "detail": str(e)[:200]}
+
+
+def _select_upload_progress(raw_progress):
+    """Choose the most useful progress candidate returned by the page."""
+    if not isinstance(raw_progress, dict):
+        return {"pct": None, "source": "evaluate-error", "detail": "invalid progress result"}
+    if raw_progress.get("error"):
+        return raw_progress
+
+    candidates = raw_progress.get("candidates")
+    if not isinstance(candidates, list):
+        return raw_progress
+
+    valid = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        pct = candidate.get("pct")
+        if isinstance(pct, bool) or not isinstance(pct, (int, float)):
+            continue
+        if not math.isfinite(pct) or pct < 0 or pct > 100:
+            continue
+        valid.append(candidate)
+    if not valid:
+        return raw_progress
+
+    visible = [candidate for candidate in valid if candidate.get("visible")]
+    pool = visible or valid
+    best = max(pool, key=lambda candidate: candidate["pct"])
+    return {
+        "pct": best["pct"],
+        "source": best.get("source") or "progress-node",
+        "detail": str(best.get("detail") or ""),
+    }
+
+
 async def _wait_upload_complete(page, timeout=10000):
     """等待视频上传完成。"""
     print(f">>> 等待视频上传完成（最多 {timeout} 秒）...")
     start = time.time()
     last_pct = -1
     last_progress_at = start
+    last_diagnostic_at = 0.0
     while time.time() - start < timeout:
         # 检测上传完成指示器
         for sel in UPLOAD_DONE_INDICATORS:
@@ -674,26 +915,29 @@ async def _wait_upload_complete(page, timeout=10000):
                     return True
             except Exception:
                 continue
-        # 检测进度条
-        for sel in UPLOAD_PROGRESS_SELECTORS:
-            try:
-                el = page.locator(sel).first
-                if await el.count() > 0:
-                    text = await el.text_content()
-                    if text:
-                        # 提取百分比
-                        m = re.search(r'(\d+)%', text)
-                        if m:
-                            pct = int(m.group(1))
-                            if pct != last_pct:
-                                print(f"\r>>> 上传进度: {pct}%", end="", flush=True)
-                                last_pct = pct
-                                last_progress_at = time.time()
-                            if pct >= 100:
-                                print()
-                                return True
-            except Exception:
-                continue
+        progress = await _read_upload_progress(page)
+        pct = progress.get("pct")
+        upload_error = progress.get("error")
+        if upload_error:
+            print(f"\n>>> 页面显示上传错误: {upload_error}")
+            return False
+        if pct is not None:
+            if pct != last_pct:
+                print(f"\r>>> 上传进度: {pct}% ({progress.get('source')})", end="", flush=True)
+                last_pct = pct
+                last_progress_at = time.time()
+            if pct >= 100:
+                print()
+                return True
+        elif time.time() - last_diagnostic_at >= 60:
+            detail = re.sub(r"\s+", " ", str(progress.get("detail") or "")).strip()
+            print(f"\n>>> 未识别到上传进度；页面文本片段: {detail[:300]}")
+            last_diagnostic_at = time.time()
+            if time.time() - last_progress_at >= UPLOAD_NO_PROGRESS_SECONDS:
+                print(
+                    f"\n>>> {UPLOAD_NO_PROGRESS_SECONDS} 秒内未识别到上传进度，判定为上传未启动或网络断流"
+                )
+                return False
         # 快速上传可能在第一次轮询前完成，进度条已经消失。
         # 此时用“保存草稿/发表按钮恢复可用”兜底，但至少等待 45 秒。
         if time.time() - last_progress_at >= 45:
@@ -715,13 +959,14 @@ async def _wait_upload_complete(page, timeout=10000):
                 f"\n>>> 上传进度在 {UPLOAD_STALL_SECONDS} 秒内停在 {last_pct}%，判定为卡死，放弃等待"
             )
             return False
-        try:
-            error = page.locator('text="上传失败"').first
-            if await error.count() > 0 and await error.is_visible():
-                print("\n>>> 页面显示上传失败")
-                return False
-        except Exception:
-            pass
+        for error_text in ("上传失败", "网络出错，请重新上传"):
+            try:
+                error = page.locator(f'text="{error_text}"').first
+                if await error.count() > 0 and await error.is_visible():
+                    print(f"\n>>> 页面显示上传错误: {error_text}")
+                    return False
+            except Exception:
+                pass
         await asyncio.sleep(2)
     print("\n>>> 上传等待超时")
     return False
@@ -1725,32 +1970,20 @@ async def upload_one_video(video_path, title, desc=None, tags=None, is_public=Fa
     for attempt in range(1, max_retries + 1):
         try:
             async with async_playwright() as p:
-                context, page = await _ensure_browser(p, headless=headless)
+                context, page, profile_lock = await _ensure_browser(p, headless=headless)
                 try:
-                    await page.goto(
-                        WECHAT_HOME_URL,
-                        wait_until="domcontentloaded",
-                        timeout=30000,
-                    )
+                    await _goto_wechat_page(page, WECHAT_HOME_URL)
                     await asyncio.sleep(2)
                     if not await _ensure_logged_in(page, allow_qr=not headless):
                         return False
-                    await page.goto(
-                        WECHAT_HOME_URL,
-                        wait_until="domcontentloaded",
-                        timeout=30000,
-                    )
+                    await _goto_wechat_page(page, WECHAT_HOME_URL)
                     await asyncio.sleep(2)
                     known_drafts = await _snapshot_drafts(page)
                     if known_drafts is None:
                         print(">>> 草稿箱读取失败，先复查微信登录态...")
                         if not await _ensure_logged_in(page):
                             return False
-                        await page.goto(
-                            WECHAT_HOME_URL,
-                            wait_until="domcontentloaded",
-                            timeout=30000,
-                        )
+                        await _goto_wechat_page(page, WECHAT_HOME_URL)
                         await asyncio.sleep(2)
                         known_drafts = await _snapshot_drafts(page)
                     if known_drafts is None:
@@ -1772,7 +2005,7 @@ async def upload_one_video(video_path, title, desc=None, tags=None, is_public=Fa
                     # 1. 直接打开发布页。首页按钮在 Wujie 微前端中加载时机不稳定，
                     # 直达 /post/create 后顶层文档即可看到 file input。
                     print(f">>> 打开发布页面 (尝试 {attempt}/{max_retries})...")
-                    await page.goto(WECHAT_CREATE_URL, wait_until="domcontentloaded", timeout=30000)
+                    await _goto_wechat_page(page, WECHAT_CREATE_URL)
                     await asyncio.sleep(3)
 
                     # 登录态失效时会跳回登录页；已登录时发布页会加载 file input。
@@ -1800,7 +2033,7 @@ async def upload_one_video(video_path, title, desc=None, tags=None, is_public=Fa
                         if not ok:
                             return False
                         await asyncio.sleep(3)
-                        await page.goto(WECHAT_CREATE_URL, wait_until="domcontentloaded", timeout=30000)
+                        await _goto_wechat_page(page, WECHAT_CREATE_URL)
                         await asyncio.sleep(5)
                         for _ in range(20):
                             candidate = page.locator('input[type="file"]').first
@@ -1907,7 +2140,10 @@ async def upload_one_video(video_path, title, desc=None, tags=None, is_public=Fa
                     return True
 
                 finally:
-                    await context.close()
+                    try:
+                        await context.close()
+                    finally:
+                        await profile_lock.release()
 
         except Exception as e:
             last_error = e

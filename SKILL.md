@@ -31,7 +31,8 @@ When using the `ide` translator (default), the Agent MUST follow this strategy:
 2.  **Verbalize First**: Apply `verbalizer` principles (Tone/Persona) during the initial translation draft.
 3.  **Humanize First**: Apply `humanizer-zh` rules (De-AI) to polish the drafted text.
 4.  **No Reverse Explanations**: Do NOT include the original English term in parentheses after translation (e.g., avoid `韧性（Persistent）`).
-5.  **Sync Check**: Verify strict block count matching before saving.
+5.  **Chinese National Leader Naming**: In Chinese output, never use a full personal name for a Chinese national leader; preserve an official title if the source provides one, otherwise use the formal office title.
+6.  **Sync Check**: Verify strict block count matching before saving.
 
 ### Options
 *   `--model`: Whisper model (default: `large-v2`).

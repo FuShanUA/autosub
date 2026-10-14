@@ -5,7 +5,7 @@ import math
 import time
 import re
 import json
-from typing import List, Dict
+from typing import Dict, List, Optional
 import io
 
 # Force UTF-8 for stdout/stderr to handle emojis in logs on Windows (essential for pythonw)
@@ -145,10 +145,19 @@ ALIGNMENT_CONSTRAINTS = """### STEP 3.8: SYNCHRONIZATION & ALIGNMENT CONSTRAINTS
 - **Natural Reorganization Within Sentences**: When a sentence spans multiple blocks, you may redistribute the Chinese across those blocks in a way that reads naturally. The key constraint is: each CN block must still correspond to roughly the same span of meaning as its EN block. Moving words between adjacent blocks for fluency is acceptable; wholesale replacing block N\'s content with block N+1\'s content is not.
 - **Output count rule**: Output exactly the same number of [ID] lines as the input. If the input has 20 blocks, output exactly 20 [ID] lines.
 - **Pronoun & Role Accuracy**: In business/interview contexts, pay close attention to who is paying whom, who is the buyer vs. the seller, and who "they/them/you" refers to. A phrase like "the person you're paying a lot of money to" means the vendor/lab you're paying, NOT your customer. Getting the direction of money/value transfer wrong completely reverses the meaning. Always resolve pronoun references against the conversational context before translating.
+- **Second-Person Reference Accuracy**: Resolve "you/your" against the actual speaker and addressee. If one guest is being addressed, use "你" or "您", not "你们". If the source refers to an organization, "your company" may become "贵公司", "该公司", or "你们公司"; "this network" may become "贵台" or "你们电视台". If "you" is generic rather than addressed to the on-screen speakers, translate the generic meaning (for example "各方", "企业", "人们") or omit the pronoun when natural. Never default to "你们" merely because a conversation has two sides.
 - **Context-Driven Word Sense**: When a word has multiple meanings, choose the sense that fits the speaker's context, not the most common dictionary sense. Examples: "highlighted" in a news segment means "特别指出/重点强调", not "提到"; "pain" for enterprises means "痛苦/困扰", not the business jargon "痛点"; "vulgar" for a blunt business complaint means "直来直去的/不客气的", not "粗俗的"; "world historic figure" means "划时代的人物", not "世界历史意义的人物". Always ask: what does the speaker actually mean here?
 - **Proper Noun vs Common Word (CRITICAL)**: Some English words are BOTH a proper noun (company/fund name) and a common word. You MUST distinguish by context. "Conviction" as Sarah Guo\'s venture fund name stays in English ("Conviction内部最大的分歧"); "conviction" as a personal belief/investment thesis is translated as "确信" or "信念" ("leap of conviction" -> "纵身一跃的确信"). "Apple" the company stays "Apple"; "apple" the fruit is "苹果". When a company name appears in a sentence that also uses the same word as a common noun, keep the company name in English and translate the common noun.
 - **Idioms, Slang & Cultural References (CRITICAL)**: English idioms and cultural references MUST be translated by their MEANING, not word-for-word, and must NOT be confused with other idioms. "the cat is out of the bag" means "秘密已经泄露了/事情已经公开了" — do NOT confuse it with "the genie is out of the bottle" (which means something similar but is a DIFFERENT idiom — use the correct one). "reverse dog years" means time feels compressed (opposite of dog years where 1 year = 7), translate as "时间过得比狗年还快" or explain the meaning naturally. "leap of faith" -> "纵身一跃的信念". Always: (1) identify the idiom, (2) understand its actual meaning, (3) express that meaning in natural Chinese. Never substitute one English idiom for another in the translation.
 - **No Residual English (CRITICAL)**: Every English word in a block MUST be translated into Chinese, with ONLY these exceptions: (1) proper nouns — person names (Sarah, Mike, Andrej Karpathy), company/org names (OpenAI, DeepMind, Toyota Research, Greylock, Conviction), product names (ChatGPT, Cursor, Felix); (2) widely-used acronyms (AI, LP, VC, GPU, SSO, API); (3) brand/term names with no standard Chinese equivalent (DevCon, WorkOS). Common English words like "hopefully", "creativity", "genie", "actually", "so", "like" must ALWAYS be translated — never leave them embedded in a Chinese sentence. When in doubt about whether a word is a proper noun, translate it rather than keeping it in English."""
+
+
+LEADER_TITLE_CONSTRAINT = """### CHINESE NATIONAL LEADER NAMING (HARD RULE)
+- In Chinese output, never use a full personal name for a Chinese national leader.
+- If the source text already provides an official title, preserve that title.
+- If the source text uses only a full personal name, replace it with the formal office title (for example, 习主席).
+- Never invent a title that is not supported by the source or public office.
+"""
 
 
 # Retrieve API Keys from environment
@@ -172,6 +181,324 @@ def get_context_window(blocks: List[Dict], index: int, window_size: int = 2) -> 
     next_text = " ".join([" ".join(b['lines']) for b in blocks[index+1:end]])
 
     return {"prev": prev_text, "next": next_text}
+
+
+def _sample_blocks(blocks: List[Dict], max_blocks: int = 60) -> List[Dict]:
+    """Evenly samples a transcript, always retaining its beginning and end."""
+    if len(blocks) <= max_blocks:
+        return blocks
+    positions = sorted({
+        round(i * (len(blocks) - 1) / (max_blocks - 1))
+        for i in range(max_blocks)
+    })
+    return [blocks[pos] for pos in positions]
+
+
+def _quality_deadline_from_env(default_seconds: float = 600.0) -> float:
+    """Builds a wall-clock deadline for optional post-translation checks."""
+    seconds = default_seconds
+    env_value = os.environ.get("LLM_QUALITY_TIMEOUT")
+    if env_value:
+        try:
+            seconds = float(env_value)
+        except ValueError:
+            print(f"⚠️ Invalid LLM_QUALITY_TIMEOUT value: {env_value}")
+    return time.monotonic() + max(0.0, seconds)
+
+
+def _deadline_expired(deadline: Optional[float]) -> bool:
+    return deadline is not None and time.monotonic() >= deadline
+
+
+def _quality_request_timeout(deadline: Optional[float], cap: int = 120) -> Optional[int]:
+    if deadline is None:
+        return cap
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None
+    return max(1, min(cap, math.ceil(remaining)))
+
+
+def detect_conversation_profile(blocks: List[Dict], client, model: str,
+                                provider=None, video_title: str = "") -> str:
+    """
+    Builds a compact speaker/addressee profile for pronoun-sensitive dialogue.
+    The result is injected into every translation prompt so retry batches do
+    not lose the video-level conversational setting.
+    """
+    if not blocks:
+        return ""
+
+    sample = _sample_blocks(blocks)
+    sample_text = "\n".join(
+        f"[{b['index']}] {' '.join(b['lines']).strip()}" for b in sample
+    )
+    title_line = f"VIDEO TITLE: {video_title}\n\n" if video_title else ""
+
+    prompt = f"""Analyze this subtitle transcript sample and identify the conversation setup.
+Use only evidence in the sample. Do not invent speaker names or roles.
+
+{title_line}TRANSCRIPT SAMPLE:
+{sample_text}
+
+Return exactly these four lines and nothing else:
+FORMAT: <interview, panel, presentation, narration, or unknown>
+SPEAKERS: <host/interviewer and guest(s), presenter, narrator, or unknown>
+SECOND_PERSON: <who is addressed by "you/your", and whether that addressee is singular, plural, an organization, or generic>
+NOTES: <one short sentence about speaker changes or ambiguous references>"""
+
+    try:
+        result = client.generate_content(
+            prompt,
+            model_name=model,
+            fallback=True,
+            provider=provider,
+            disable_thinking=True,
+            request_timeout=120,
+            max_retries=1,
+        )
+    except Exception as e:
+        print(f"⚠️ Conversation profile detection failed: {e}")
+        return ""
+
+    if not result:
+        return ""
+
+    fields = {}
+    for line in result.strip().splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        key = key.strip().upper()
+        if key in {"FORMAT", "SPEAKERS", "SECOND_PERSON", "NOTES"}:
+            fields[key] = value.strip()[:300]
+
+    if "SECOND_PERSON" not in fields:
+        return ""
+
+    profile_lines = ["### CONVERSATION PROFILE (speaker and addressee reference)"]
+    if video_title:
+        profile_lines.append(f"- Video title: {video_title}")
+    for key in ("FORMAT", "SPEAKERS", "SECOND_PERSON", "NOTES"):
+        if key in fields:
+            label = "Second-person guidance" if key == "SECOND_PERSON" else key.title()
+            profile_lines.append(f"- {label}: {fields[key]}")
+    profile = "\n".join(profile_lines)
+    print("👥 Conversation profile detected for pronoun-sensitive translation.")
+    return profile
+
+
+def _target_context_string(source_lines: Dict[str, str], final_blocks: List[Dict],
+                           pos: int, window_size: int = 1) -> str:
+    """Formats adjacent EN blocks as context without making them translation targets."""
+    if pos <= 0:
+        prev_en = ""
+    else:
+        prev_en = source_lines.get(str(final_blocks[pos - 1]['index']), "")
+    if pos + 1 >= len(final_blocks):
+        next_en = ""
+    else:
+        next_en = source_lines.get(str(final_blocks[pos + 1]['index']), "")
+
+    context = ""
+    if prev_en:
+        context += f"PREVIOUS BLOCK (context only, DO NOT translate): {prev_en}\n"
+    if next_en:
+        context += f"NEXT BLOCK (context only, DO NOT translate): {next_en}\n"
+    return context
+
+
+def _build_retry_context_map(final_blocks: List[Dict], source_lines: Optional[Dict[str, str]],
+                             positions: List[int], window_size: int = 1) -> Dict[str, Dict[str, str]]:
+    """Builds per-block adjacent context for retry batches."""
+    if not source_lines:
+        return {}
+    context_map = {}
+    for pos in positions:
+        idx = str(final_blocks[pos]['index'])
+        if pos <= 0:
+            prev_en = ""
+        else:
+            prev_en = source_lines.get(str(final_blocks[pos - 1]['index']), "")
+        if pos + 1 >= len(final_blocks):
+            next_en = ""
+        else:
+            next_en = source_lines.get(str(final_blocks[pos + 1]['index']), "")
+        if prev_en or next_en:
+            context_map[idx] = {"prev": prev_en, "next": next_en}
+    return context_map
+
+
+_SECOND_PERSON_SOURCE_RE = re.compile(
+    r"\b(?:you|your|yours|yourself|yourselves)\b", re.IGNORECASE
+)
+_SECOND_PERSON_CN_RE = re.compile(r"[你您]|你们")
+
+
+def audit_second_person_references(final_blocks: List[Dict], source_lines: Dict[str, str],
+                                   client, model: str, conversation_profile: str = "",
+                                   provider=None,
+                                   deadline: Optional[float] = None) -> List[Dict]:
+    """
+    Conservative second-person audit. It only reviews blocks whose source and
+    translation both contain second-person language, then re-translates clear
+    person/number errors with adjacent context.
+    """
+    candidates = []
+    for pos, block in enumerate(final_blocks):
+        idx = str(block['index'])
+        en = source_lines.get(idx, "")
+        cn = " ".join(block.get('lines', []))
+        if _SECOND_PERSON_SOURCE_RE.search(en) and _SECOND_PERSON_CN_RE.search(cn):
+            candidates.append((pos, idx))
+
+    if not candidates:
+        print("✅ Second-person reference check passed: no candidate blocks.")
+        return final_blocks
+
+    if deadline is None:
+        deadline = _quality_deadline_from_env()
+    if _deadline_expired(deadline):
+        print("⏰ Quality-check deadline reached before second-person audit.")
+        print("Progress: 99.0% (Quality deadline reached; skipping second-person audit)", flush=True)
+        return final_blocks
+
+    BATCH_SIZE = 12
+    total_audit_batches = math.ceil(len(candidates) / BATCH_SIZE)
+    tasks = []
+    print(
+        f"🔍 Second-person reference check: auditing {len(candidates)} "
+        f"candidate block(s) in {total_audit_batches} batch(es)..."
+    )
+    for start in range(0, len(candidates), BATCH_SIZE):
+        items = candidates[start:start + BATCH_SIZE]
+        audit_text = ""
+        for item_no, (pos, idx) in enumerate(items, 1):
+            prev_en = source_lines.get(str(final_blocks[pos - 1]['index']), "") if pos > 0 else ""
+            next_en = source_lines.get(str(final_blocks[pos + 1]['index']), "") if pos + 1 < len(final_blocks) else ""
+            audit_text += f"ITEM {item_no} | BLOCK {idx}\n"
+            if prev_en:
+                audit_text += f"  PREVIOUS EN: {prev_en}\n"
+            audit_text += f"  TARGET EN: {source_lines.get(idx, '')}\n"
+            audit_text += f"  CURRENT CN: {' '.join(final_blocks[pos].get('lines', []))}\n"
+            if next_en:
+                audit_text += f"  NEXT EN: {next_en}\n"
+
+        profile_section = conversation_profile or "CONVERSATION PROFILE: unavailable; infer only from the supplied context."
+        prompt = f"""You audit second-person reference accuracy in bilingual subtitles.
+
+{profile_section}
+
+For each item, decide whether the Chinese second-person form matches the English
+speaker/addressee and meaning. Be conservative: flag an item only when the error is clear.
+
+FLAG an item when:
+- The English addresses one person, but the Chinese uses "你们".
+- The English "you" is generic, but the Chinese binds it to the visible dialogue participants.
+- The English refers to an institution in a way that requires a specific institutional reference, and the Chinese changes that meaning.
+
+Do NOT flag:
+- "your company" translated as "贵公司", "该公司", or "你们公司".
+- "this network" translated as "贵台" or "你们电视台".
+- Natural Chinese that omits the pronoun or uses "你/您" appropriately.
+
+ITEMS:
+{audit_text}
+Output exactly "ALL_OK" if every item is acceptable. Otherwise output only:
+FLAG: <item numbers separated by commas>"""
+
+        tasks.append({'chunk_idx': start // BATCH_SIZE, 'prompt': prompt, 'items': items})
+
+    try:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            print("⏰ Quality-check deadline reached before second-person audit batch.")
+            print("Progress: 99.0% (Quality deadline reached; skipping second-person audit)", flush=True)
+            return final_blocks
+
+        def report_audit_progress(done: int, batch_total: int) -> None:
+            fraction = done / batch_total if batch_total else 1.0
+            progress = 98.5 + fraction * 0.5
+            print(
+                f"Progress: {progress:.1f}% "
+                f"(Second-person audit: {done}/{batch_total} batches)",
+                flush=True,
+            )
+
+        results = client.generate_batch(
+            tasks,
+            model,
+            fallback=False,
+            provider=provider,
+            progress_callback=report_audit_progress,
+            request_timeout=_quality_request_timeout(deadline, cap=180),
+            max_retries=1,
+            batch_timeout=remaining,
+        )
+    except Exception as e:
+        print(f"⚠️ Second-person audit failed: {e}")
+        return final_blocks
+
+    flagged_positions = []
+    for res in results:
+        result_text = (res.get('result') or "").strip()
+        items = res.get('items', [])
+        if not result_text or "ALL_OK" in result_text.upper():
+            continue
+        match = re.search(r"\bFLAG(?:GED)?\s*:\s*([0-9,\s]+)", result_text, re.IGNORECASE)
+        if not match:
+            continue
+        for number in re.findall(r"\d+", match.group(1)):
+            item_no = int(number)
+            if 1 <= item_no <= len(items):
+                flagged_positions.append(items[item_no - 1][0])
+
+    flagged_positions = sorted(set(flagged_positions))
+    if not flagged_positions:
+        print("✅ Second-person reference check passed: no clear person/number errors.")
+        return final_blocks
+
+    print(f"⚠️ Second-person reference check: {len(flagged_positions)} block(s) need correction. "
+          f"Re-translating: {[final_blocks[pos]['index'] for pos in flagged_positions]}")
+
+    for pos in flagged_positions:
+        if _deadline_expired(deadline):
+            print("⏰ Quality-check deadline reached during second-person corrections.")
+            break
+        idx = str(final_blocks[pos]['index'])
+        en_src = source_lines.get(idx, "")
+        if not en_src:
+            continue
+        context_str = _target_context_string(source_lines, final_blocks, pos)
+        profile_section = conversation_profile or "CONVERSATION PROFILE: unavailable; infer only from the supplied context."
+        prompt = f"""You are correcting one subtitle translation into Simplified Chinese.
+Resolve the second-person reference against the conversation profile and adjacent blocks.
+Translate ONLY the TARGET BLOCK. The PREVIOUS and NEXT blocks are context only.
+If the target is a partial sentence, translate exactly that fragment.
+
+{profile_section}
+
+{context_str}TARGET BLOCK (translate ONLY this): {en_src}
+
+Reply with ONLY the corrected Chinese translation, nothing else."""
+        try:
+            corrected = client.generate_content(
+                prompt,
+                model_name=model,
+                provider=provider,
+                request_timeout=_quality_request_timeout(deadline),
+                max_retries=1,
+            )
+            corrected = (corrected or "").strip()
+            if corrected and re.search(r"[\u4e00-\u9fff]", corrected):
+                final_blocks[pos]['lines'] = [corrected]
+                print(f"   ✔ block {idx}: second-person reference corrected")
+            else:
+                print(f"   ✗ block {idx}: correction failed validation, kept current translation")
+        except Exception as e:
+            print(f"   ✗ block {idx}: correction error {e}, kept current translation")
+
+    return final_blocks
 
 def detect_translation_style(blocks: List[Dict], model_name: str, provider=None) -> str:
     """
@@ -204,7 +531,15 @@ Respond with ONLY the category name (`casual`, `formal`, or `edgy`) as a single 
 """
     try:
         # Use fallback=True to ensure robust cascading if Vertex/primary provider fails
-        detected = client.generate_content(prompt, model_name=model_name, fallback=True, provider=provider, disable_thinking=True)
+        detected = client.generate_content(
+            prompt,
+            model_name=model_name,
+            fallback=True,
+            provider=provider,
+            disable_thinking=True,
+            request_timeout=120,
+            max_retries=1,
+        )
         detected = detected.strip().lower() if detected else "casual"
         if detected not in ["casual", "formal", "edgy"]:
             # Clean up if model added markdown or formatting
@@ -258,7 +593,15 @@ If no ads are found, return [].
 {transcript}
 """
     try:
-        raw = client.generate_content(prompt, model_name=model, fallback=True, provider=provider, disable_thinking=True)
+        raw = client.generate_content(
+            prompt,
+            model_name=model,
+            fallback=True,
+            provider=provider,
+            disable_thinking=True,
+            request_timeout=120,
+            max_retries=1,
+        )
         if not raw:
             return []
         # LLMs sometimes wrap output in ```json ... ```; extract the first array.
@@ -327,7 +670,7 @@ def smart_translate_chunk(chunk_blocks: List[Dict], style: str = "casual", model
     prompt = f"""
 You are an expert subtitle translator and editor.
 Translate the following subtitles into Simplified Chinese.
-The source language may be English, Japanese, or a mix of both.
+The source language may be English, Japanese, Korean, or a mix of them.
 
 ### STEP 1: VERBALIZATION (Tone & Persona)
 {VERBALIZER_RULES}
@@ -474,15 +817,15 @@ def humanize_text(text: str, is_source: bool = False) -> str:
 def is_untranslated(block: Dict) -> bool:
     """
     Returns True if a block has not been successfully translated.
-    Detects: empty lines, known marker tags, or predominantly English text.
-    Blocks containing CJK characters are considered translated UNLESS the text
-    is predominantly English with only a few Chinese chars (which can happen
-    when terminology pre-replacement injects Chinese into otherwise untranslated
-    English lines, e.g. "Head of 前线部署工程师ing at OpenAI").
+    Detects: empty lines, known marker tags, predominantly English text, and
+    untranslated Japanese/Korean text. Blocks containing Chinese characters are
+    considered translated unless another source script dominates the line.
     """
     text = " ".join(block.get('lines', [])).strip()
     if not text:
         return True
+    if srt_utils.is_non_speech_marker(text):
+        return False
     markers = ['[UNTRANSLATED]', '[TRANSLATION_FAILED]']
     if any(m in text for m in markers):
         return True
@@ -490,19 +833,39 @@ def is_untranslated(block: Dict) -> bool:
     # If present, the block is untranslated Japanese, not Chinese.
     if re.search(r'[\u3040-\u30ff\u31f0-\u31ff]', text):
         return True
+    korean_chars = len(re.findall(r'[\uac00-\ud7af]', text))
     if re.search(r'[\u4e00-\u9fff]', text):
         chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', text))
         english_words = len(re.findall(r'[a-zA-Z]+', text))
+        english_tokens = re.findall(r"\b[A-Za-z][A-Za-z0-9'-]*\b", text)
+        # A translated list of products can legitimately contain many English
+        # proper nouns/acronyms. Those letters must not make the whole block
+        # look untranslated, while ordinary English words remain a failure.
+        non_proper_english = [
+            token for token in english_tokens
+            if not (token.isupper() or token[0].isupper())
+        ]
+        # Korean source text can survive without kana or ASCII. Treat it as
+        # untranslated when Hangul outnumbers Chinese (a Chinese translation may
+        # legitimately retain a short Korean proper noun).
+        if korean_chars and korean_chars > chinese_chars:
+            return True
         # Partially translated: mostly English with a few Chinese chars
         # (typically from terminology pre-replacement that injected Chinese).
         # Check both absolute count AND ratio: if English words outnumber CJK
         # chars, or if English is >60% of the text, it's likely untranslated.
-        if english_words >= 3 and (chinese_chars < english_words or english_chars_ratio(text) > 0.6):
+        if (
+            english_words >= 3
+            and not (not non_proper_english and chinese_chars >= 2)
+            and (chinese_chars < english_words or english_chars_ratio(text) > 0.6)
+        ):
             return True
         return False
     alpha = [c for c in text if c.isalpha()]
     if not alpha:
         return False
+    if korean_chars:
+        return True
     ascii_ratio = sum(1 for c in alpha if ord(c) < 128) / len(alpha)
     # Lowered from 8 to 2 alpha chars to catch short untranslated fragments
     # (e.g. "Yeah.", "OK.", "So.") that were previously slipping through.
@@ -517,9 +880,53 @@ def english_chars_ratio(text: str) -> float:
     return sum(1 for c in alpha if ord(c) < 128) / len(alpha)
 
 
+def parse_translated_lines(result_text: str) -> Dict[str, str]:
+    """Parse an LLM response into an ID-to-translation map."""
+    translations: Dict[str, str] = {}
+    if not result_text:
+        return translations
+    for raw_line in result_text.splitlines():
+        match = re.match(r'\[(\d+)\]\s*(.*)', raw_line.strip())
+        if not match:
+            continue
+        content = match.group(2).strip()
+        if content:
+            translations[match.group(1)] = content
+    return translations
+
+
+def apply_translated_lines(blocks: List[Dict], translations: Dict[str, str]) -> List[Dict]:
+    """Apply parsed translations while preserving unmatched source blocks."""
+    output: List[Dict] = []
+    for block in blocks:
+        new_block = block.copy()
+        idx = str(block['index'])
+        if idx in translations:
+            new_block['lines'] = [translations[idx]]
+        output.append(new_block)
+    return output
+
+
+def merge_processed_blocks(base_blocks: List[Dict], processed_blocks: List[Dict]) -> List[Dict]:
+    """Merge translated blocks back by ID without dropping cached blocks."""
+    processed_by_id = {
+        str(block['index']): block for block in processed_blocks
+    }
+    return [
+        processed_by_id.get(str(block['index']), block)
+        for block in base_blocks
+    ]
+
+
 def translate_blocks(blocks: List[Dict], client, model: str, style: str,
                      verbalizer_snippet: str, humanizer_snippet: str,
-                     knowledge_snippet: str, trans_mode_snippet: str = "", provider=None) -> List[Dict]:
+                     knowledge_snippet: str, trans_mode_snippet: str = "",
+                     provider=None, progress_callback=None,
+                     context_lines: Optional[Dict[str, Dict[str, str]]] = None,
+                     request_timeout: Optional[int] = None,
+                     max_retries: Optional[int] = None,
+                     batch_timeout: Optional[float] = None,
+                     fallback: bool = False) -> List[Dict]:
     """
     Translates a list of blocks (may be any size) using generate_batch.
     Returns the blocks with translations applied. Does NOT apply humanize_text.
@@ -540,9 +947,24 @@ def translate_blocks(blocks: List[Dict], client, model: str, style: str,
                 scrubbed_text = text
             input_text += f"[{block['index']}] {scrubbed_text}\n"
 
+        context_text = ""
+        if context_lines:
+            context_text += "\n### SURROUNDING SOURCE CONTEXT (context only, DO NOT translate)\n"
+            for block in chunk:
+                idx = str(block['index'])
+                context = context_lines.get(idx)
+                if not context:
+                    continue
+                before = context.get('prev', '')
+                after = context.get('next', '')
+                if before:
+                    context_text += f"- Before [{idx}]: {before}\n"
+                if after:
+                    context_text += f"- After [{idx}]: {after}\n"
+
         prompt = f"""You are an expert subtitle translator and editor.
 Translate the following subtitles into Simplified Chinese.
-The source language may be English, Japanese, or a mix of both.
+The source language may be English, Japanese, Korean, or a mix of them.
 
 ### STEP 1: VERBALIZATION (Tone & Persona)
 {verbalizer_snippet}...
@@ -560,6 +982,7 @@ TARGET STYLE: {style}
 ### STEP 4: CONTEXT AWARENESS
 INPUT BLOCK:
 {input_text}
+{context_text}
 
 OUTPUT FORMAT (STRICT — one line per segment, no extra text):
 [ID] Translated Text
@@ -567,56 +990,108 @@ OUTPUT FORMAT (STRICT — one line per segment, no extra text):
 """
         tasks.append({'index': i // BATCH, 'chunk': chunk, 'prompt': prompt})
 
-    results = client.generate_batch(tasks, model, fallback=False, provider=provider)
+    results = client.generate_batch(
+        tasks,
+        model,
+        fallback=fallback,
+        provider=provider,
+        progress_callback=progress_callback,
+        request_timeout=request_timeout,
+        max_retries=max_retries,
+        batch_timeout=batch_timeout,
+    )
     results.sort(key=lambda x: x['index'])
 
     # Build a map of all translations
     translated_map = {}
     for res in results:
-        result_text = res.get('result')
-        if result_text:
-            for line in result_text.split('\n'):
-                match = re.match(r'\[(\d+)\]\s*(.*)', line.strip())
-                if match:
-                    idx = match.group(1)
-                    content = match.group(2).strip()
-                    if content:  # guard: reject empty translations
-                        translated_map[idx] = content
+        translated_map.update(parse_translated_lines(res.get('result')))
 
-    # Apply translations; fall back to original text if missing
-    out = []
-    for block in blocks:
-        new_block = block.copy()
-        idx = str(block['index'])
-        if idx in translated_map:
-            new_block['lines'] = [translated_map[idx]]
-        # else: keep whatever was there (original EN or previous attempt)
-        out.append(new_block)
-    return out
+    return apply_translated_lines(blocks, translated_map)
 
 
 def postprocess_retry_loop(final_blocks: List[Dict], client, model: str, style: str,
                             verbalizer_snippet: str, humanizer_snippet: str,
-                            knowledge_snippet: str, trans_mode_snippet: str = "", max_iterations: int = 5, provider=None) -> List[Dict]:
+                            knowledge_snippet: str, trans_mode_snippet: str = "",
+                            max_iterations: int = 5, provider=None,
+                            progress_start: float = 96.0,
+                            progress_end: float = 97.0,
+                            source_lines: Optional[Dict[str, str]] = None,
+                            deadline_seconds: Optional[float] = None) -> List[Dict]:
     """
     Iteratively re-translates any untranslated/empty blocks until all are done
     (or max_iterations is reached). Returns final_blocks with all translations filled.
     Does NOT apply humanize_text — that is done in a single pass after this function.
     """
+    if deadline_seconds is None:
+        env_deadline = os.environ.get("LLM_POSTPROCESS_TIMEOUT")
+        if env_deadline:
+            try:
+                deadline_seconds = float(env_deadline)
+            except ValueError:
+                print(f"⚠️ Invalid LLM_POSTPROCESS_TIMEOUT value: {env_deadline}")
+    initial_untranslated = sum(1 for block in final_blocks if is_untranslated(block))
+    if deadline_seconds is None:
+        # A fixed ten-minute cap is too small for a cached run that still has
+        # dozens of missing blocks. Scale by the 20-block retry batches, while
+        # the no-progress check below prevents an empty wait from consuming it.
+        retry_batches = math.ceil(max(1, initial_untranslated) / 20)
+        deadline_seconds = max(600.0, retry_batches * 300.0)
+
+    deadline = time.monotonic() + max(0.0, deadline_seconds)
+    last_reported_progress = progress_start
+    still_missed: List[int] = []
+
+    def report_progress(value: float, detail: str) -> None:
+        nonlocal last_reported_progress
+        clamped = min(progress_end, max(progress_start, value))
+        if clamped < last_reported_progress:
+            return
+        last_reported_progress = clamped
+        print(f"Progress: {clamped:.1f}% ({detail})", flush=True)
+
     for iteration in range(1, max_iterations + 1):
         missed_positions = [i for i, b in enumerate(final_blocks) if is_untranslated(b)]
         if not missed_positions:
             print(f"✅ Post-processing complete after {iteration - 1} extra pass(es). All segments translated.")
+            report_progress(progress_end, "Post-processing complete")
+            break
+
+        remaining_seconds = deadline - time.monotonic()
+        if remaining_seconds <= 0:
+            print("⏰ Post-processing deadline reached before another retry pass.")
+            report_progress(progress_end, "Post-processing deadline reached")
+            still_missed = missed_positions
             break
 
         print(f"🔄 Post-processing pass {iteration}/{max_iterations}: "
               f"{len(missed_positions)} untranslated segment(s) detected. Re-translating...")
 
         missed_blocks = [final_blocks[i] for i in missed_positions]
+        missed_before = len(missed_positions)
+        retry_context = _build_retry_context_map(final_blocks, source_lines, missed_positions)
+
+        def report_batch_progress(done: int, batch_total: int) -> None:
+            pass_fraction = done / batch_total if batch_total else 1.0
+            attempted_fraction = (
+                (iteration - 1 + pass_fraction) / max_iterations
+            )
+            report_progress(
+                progress_start + attempted_fraction * (progress_end - progress_start),
+                f"Post-processing: pass {iteration}/{max_iterations}, "
+                f"{done}/{batch_total} batches in this pass, {missed_before} segment(s) being retried",
+            )
+
         retranslated = translate_blocks(
             missed_blocks, client, model, style,
             verbalizer_snippet, humanizer_snippet, knowledge_snippet, trans_mode_snippet,
-            provider=provider
+            provider=provider,
+            progress_callback=report_batch_progress,
+            context_lines=retry_context,
+            request_timeout=max(1, min(180, int(remaining_seconds))),
+            max_retries=1,
+            batch_timeout=remaining_seconds,
+            fallback=True,
         )
 
         # Re-insert results at original positions
@@ -627,43 +1102,71 @@ def postprocess_retry_loop(final_blocks: List[Dict], client, model: str, style: 
         still_missed = [i for i, b in enumerate(final_blocks) if is_untranslated(b)]
         resolved = len(missed_positions) - len(still_missed)
         print(f"   ✔ Resolved: {resolved} | Still untranslated: {len(still_missed)}")
-    else:
-        still_missed = [i for i, b in enumerate(final_blocks) if is_untranslated(b)]
-        if still_missed:
-            print(f"⚠️ Max iterations ({max_iterations}) reached. "
-                  f"{len(still_missed)} segment(s) still untranslated.")
-            # Final naked-prompt fallback: the batch prompt (with large
-            # verbalizer/humanizer rule blocks) sometimes makes the LLM return
-            # malformed [ID] lines for tricky fragments (e.g. a bare list of
-            # proper nouns). Re-translate each remaining block with a minimal
-            # single-line prompt that has no rule preamble — this reliably
-            # produces a clean [ID] <translation> line. Prevents 1 stuck
-            # block from failing the entire 978-block translation.
-            print("🔄 Naked-prompt fallback for remaining stuck block(s)...")
-            for pos in still_missed:
-                blk = final_blocks[pos]
-                idx = str(blk['index'])
-                src = " ".join(blk.get('lines', [])).replace("\n", " ").strip()
-                if not src:
-                    continue
-                naked = (f"Translate this ONE subtitle fragment into Simplified Chinese. "
-                         f"Keep proper nouns/acronyms in English. "
-                         f"Reply with ONLY one line in this exact format: [{idx}] <translation>\n\n"
-                         f"[{idx}] {src}\n")
-                try:
-                    out = client.generate_content(naked, model_name=model, provider=provider)
-                    if out:
-                        import re as _re
-                        m = _re.search(r'\[%s\]\s*(.+)' % _re.escape(idx), out)
-                        if m:
-                            cn = m.group(1).strip()
-                            if cn and _re.search(r'[\u4e00-\u9fff]', cn):
-                                final_blocks[pos]['lines'] = [cn]
-                                print(f"   ✔ block {idx}: naked fallback succeeded")
-                                continue
-                    print(f"   ✗ block {idx}: naked fallback failed, keeping original")
-                except Exception as e:
-                    print(f"   ✗ block {idx}: naked fallback error {e}")
+        resolution_fraction = (
+            (initial_untranslated - len(still_missed)) / initial_untranslated
+            if initial_untranslated else 1.0
+        )
+        attempted_fraction = iteration / max_iterations
+        progress_fraction = max(resolution_fraction, attempted_fraction)
+        report_progress(
+            progress_start + progress_fraction * (progress_end - progress_start),
+            f"Post-processing: pass {iteration}/{max_iterations} complete, "
+            f"{len(still_missed)} segment(s) left",
+        )
+
+        if resolved == 0:
+            print("⚠️ No segments were resolved in this pass. Stopping repeated batch retries.")
+            report_progress(progress_end, "Post-processing made no progress")
+            break
+
+    still_missed = [i for i, b in enumerate(final_blocks) if is_untranslated(b)]
+    if still_missed:
+        # Final naked-prompt fallback: the batch prompt (with large
+        # verbalizer/humanizer rule blocks) sometimes makes the LLM return
+        # malformed [ID] lines for tricky fragments (e.g. a bare list of
+        # proper nouns). Keep it inside the same wall-clock deadline so a bad
+        # network path cannot turn this loop into a multi-hour wait.
+        print("🔄 Naked-prompt fallback for remaining stuck block(s)...")
+        for pos in still_missed:
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                print("⏰ Post-processing deadline reached; stopping naked-prompt fallback.")
+                report_progress(progress_end, "Post-processing deadline reached")
+                break
+
+            blk = final_blocks[pos]
+            idx = str(blk['index'])
+            src = " ".join(blk.get('lines', [])).replace("\n", " ").strip()
+            if not src:
+                continue
+            context_str = _target_context_string(source_lines or {}, final_blocks, pos)
+            naked = (f"Translate this ONE subtitle fragment into Simplified Chinese. "
+                     f"Keep proper nouns/acronyms in English. "
+                     f"The Chinese must form a readable fragment, not only a list of English names. "
+                     f"Use adjacent blocks only to resolve references. "
+                     f"Reply with ONLY one line in this exact format: [{idx}] <translation>\n\n"
+                     f"{context_str}"
+                     f"[{idx}] {src}\n")
+            try:
+                out = client.generate_content(
+                    naked,
+                    model_name=model,
+                    provider=provider,
+                    request_timeout=max(1, min(120, int(remaining_seconds))),
+                    max_retries=1,
+                    fallback=True,
+                )
+                if out:
+                    m = re.search(r'\[%s\]\s*(.+)' % re.escape(idx), out)
+                    if m:
+                        cn = m.group(1).strip()
+                        if cn and not is_untranslated({"lines": [cn]}):
+                            final_blocks[pos]['lines'] = [cn]
+                            print(f"   ✔ block {idx}: naked fallback succeeded")
+                            continue
+                print(f"   ✗ block {idx}: naked fallback failed, keeping original")
+            except Exception as e:
+                print(f"   ✗ block {idx}: naked fallback error {e}")
 
     return final_blocks
 
@@ -709,7 +1212,15 @@ Phrase -> Translation
 """
 
     try:
-        result = client.generate_content(prompt, model_name=model, fallback=True, provider=provider, disable_thinking=True)
+        result = client.generate_content(
+            prompt,
+            model_name=model,
+            fallback=True,
+            provider=provider,
+            disable_thinking=True,
+            request_timeout=120,
+            max_retries=1,
+        )
         if not result:
             return ""
         glossary_lines = []
@@ -733,7 +1244,8 @@ def detect_misaligned_blocks(final_blocks: List[Dict], source_lines: Dict[str, s
                             client, model: str, style: str, verbalizer_snippet: str,
                             humanizer_snippet: str, knowledge_snippet: str,
                             trans_mode_snippet: str = "",
-                            provider=None) -> List[Dict]:
+                            provider=None, conversation_profile: str = "",
+                            deadline: Optional[float] = None) -> List[Dict]:
     """
     Desync backstop. The translation LLM sometimes merges content from EN
     block N+1 (or later) into the CN translation of block N, so the Chinese
@@ -747,6 +1259,13 @@ def detect_misaligned_blocks(final_blocks: List[Dict], source_lines: Dict[str, s
     content shifts that the token-based heuristic misses (e.g. when the LLM
     skips a block and shifts all subsequent translations forward by one).
     """
+    if deadline is None:
+        deadline = _quality_deadline_from_env()
+    if _deadline_expired(deadline):
+        print("⏰ Quality-check deadline reached before alignment backstop.")
+        print("Progress: 98.5% (Quality deadline reached; skipping alignment backstop)", flush=True)
+        return final_blocks
+
     # Build per-block EN distinctive-token sets.
     en_tokens = {}
     for b in final_blocks:
@@ -774,7 +1293,11 @@ def detect_misaligned_blocks(final_blocks: List[Dict], source_lines: Dict[str, s
     if misaligned:
         print(f"\u26a0\ufe0f Token-based alignment check: {len(misaligned)} block(s) absorb later content. "
               f"Re-translating individually: {[(idx, toks) for _, idx, toks in misaligned]}")
-        final_blocks = _retranslate_misaligned(final_blocks, misaligned, source_lines, client, model, provider=provider)
+        final_blocks = _retranslate_misaligned(
+            final_blocks, misaligned, source_lines, client, model,
+            provider=provider, conversation_profile=conversation_profile,
+            deadline=deadline
+        )
 
     # LLM-based alignment verification: catches general content shifts that
     # the token-based heuristic misses (e.g. the LLM skipped an EN block and
@@ -782,29 +1305,44 @@ def detect_misaligned_blocks(final_blocks: List[Dict], source_lines: Dict[str, s
     final_blocks = _llm_alignment_check(
         final_blocks, source_lines, client, model, style,
         verbalizer_snippet, humanizer_snippet, knowledge_snippet, trans_mode_snippet,
-        provider=provider
+        provider=provider, conversation_profile=conversation_profile,
+        deadline=deadline
     )
 
     return final_blocks
 
 
-def _retranslate_misaligned(final_blocks, misaligned, source_lines, client, model, provider=None):
+def _retranslate_misaligned(final_blocks, misaligned, source_lines, client, model,
+                            provider=None, conversation_profile: str = "",
+                            deadline: Optional[float] = None):
     """Re-translate blocks that absorbed later content, using a strict single-fragment prompt."""
     for pos, idx, toks in misaligned:
+        if _deadline_expired(deadline):
+            print("⏰ Quality-check deadline reached during alignment corrections.")
+            break
         en_src = source_lines.get(idx, "")
         if not en_src:
             continue
+        context_str = _target_context_string(source_lines, final_blocks, pos)
+        profile_section = conversation_profile or ""
         strict_prompt = f"""You are translating ONE subtitle fragment. Translate ONLY the
-text below into Simplified Chinese. Do NOT include content from any other fragment, do NOT
-look ahead or behind. The text is a partial sentence \u2014 translate exactly that fragment,
+TARGET BLOCK below into Simplified Chinese. Adjacent blocks are context only; do NOT
+include their content. The target is a partial sentence \u2014 translate exactly that fragment,
 even if it is incomplete, so it aligns with this one subtitle block on the timeline.
 These tokens must NOT appear unless they are in the source fragment: {', '.join(toks)}.
 
-FRAGMENT: {en_src}
+{profile_section}
+{context_str}TARGET BLOCK: {en_src}
 
 Reply with ONLY the Chinese translation, nothing else."""
         try:
-            corrected = client.generate_content(strict_prompt, model_name=model, provider=provider)
+            corrected = client.generate_content(
+                strict_prompt,
+                model_name=model,
+                provider=provider,
+                request_timeout=_quality_request_timeout(deadline),
+                max_retries=1,
+            )
             corrected = (corrected or "").strip()
             if corrected and re.search(r"[\u4e00-\u9fff]", corrected):
                 final_blocks[pos]['lines'] = [corrected]
@@ -820,7 +1358,8 @@ def _llm_alignment_check(final_blocks: List[Dict], source_lines: Dict[str, str],
                          client, model: str, style: str, verbalizer_snippet: str,
                          humanizer_snippet: str, knowledge_snippet: str,
                          trans_mode_snippet: str = "",
-                         provider=None) -> List[Dict]:
+                         provider=None, conversation_profile: str = "",
+                         deadline: Optional[float] = None) -> List[Dict]:
     """
     LLM-based alignment verification. Sends batches of consecutive (EN, CN)
     pairs to the LLM and asks it to identify pairs where the Chinese does NOT
@@ -828,6 +1367,13 @@ def _llm_alignment_check(final_blocks: List[Dict], source_lines: Dict[str, str],
     adjacent block). Re-translates flagged blocks with a strict single-fragment
     prompt that includes surrounding context but forbids absorbing it.
     """
+    if deadline is None:
+        deadline = _quality_deadline_from_env()
+    if _deadline_expired(deadline):
+        print("⏰ Quality-check deadline reached before LLM alignment check.")
+        print("Progress: 98.5% (Quality deadline reached; skipping LLM alignment check)", flush=True)
+        return final_blocks
+
     BATCH_SIZE = 10
     total = len(final_blocks)
     tasks = []
@@ -875,7 +1421,32 @@ If ALL pairs are correctly aligned, output exactly: ALL_ALIGNED"""
 
     print(f"\U0001f50d LLM alignment check: verifying {total} blocks in {len(tasks)} batches...")
     print(f"Progress: 97.5% (LLM alignment check: {len(tasks)} batches)", flush=True)
-    results = client.generate_batch(tasks, model, fallback=False, provider=provider)
+
+    def report_alignment_progress(done: int, batch_total: int) -> None:
+        fraction = done / batch_total if batch_total else 1.0
+        progress = 97.5 + fraction * 1.0
+        print(
+            f"Progress: {progress:.1f}% "
+            f"(LLM alignment check: {done}/{batch_total} batches)",
+            flush=True,
+        )
+
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        print("⏰ Quality-check deadline reached before LLM alignment batch.")
+        print("Progress: 98.5% (Quality deadline reached; skipping LLM alignment check)", flush=True)
+        return final_blocks
+
+    results = client.generate_batch(
+        tasks,
+        model,
+        fallback=False,
+        provider=provider,
+        progress_callback=report_alignment_progress,
+        request_timeout=_quality_request_timeout(deadline, cap=180),
+        max_retries=1,
+        batch_timeout=remaining,
+    )
 
     print(f"   📋 Analyzing alignment results from {len(results)} batches...", flush=True)
 
@@ -909,6 +1480,9 @@ If ALL pairs are correctly aligned, output exactly: ALL_ALIGNED"""
           f"Re-translating: {[final_blocks[p]['index'] for p in misaligned_positions]}")
 
     for pos in misaligned_positions:
+        if _deadline_expired(deadline):
+            print("⏰ Quality-check deadline reached during LLM alignment corrections.")
+            break
         b = final_blocks[pos]
         idx = str(b['index'])
         en_src = source_lines.get(idx, "")
@@ -932,12 +1506,21 @@ The fragment below is marked as TARGET BLOCK. Translate ONLY that block's text.
 The PREVIOUS and NEXT blocks are provided for context only \u2014 do NOT translate them and
 do NOT include their content in your translation. The target may be a partial sentence;
 translate exactly that fragment so it aligns with this one subtitle block on the timeline.
+Resolve second-person references against the conversation profile when provided.
+
+{conversation_profile}
 
 {context_str}
 
 Reply with ONLY the Chinese translation of the TARGET BLOCK, nothing else."""
         try:
-            corrected = client.generate_content(strict_prompt, model_name=model)
+            corrected = client.generate_content(
+                strict_prompt,
+                model_name=model,
+                provider=provider,
+                request_timeout=_quality_request_timeout(deadline),
+                max_retries=1,
+            )
             corrected = (corrected or "").strip()
             if corrected and re.search(r"[\u4e00-\u9fff]", corrected):
                 final_blocks[pos]['lines'] = [corrected]
@@ -953,13 +1536,22 @@ Reply with ONLY the Chinese translation of the TARGET BLOCK, nothing else."""
 def clean_untranslated_english(final_blocks: List[Dict], source_lines: Dict[str, str],
                               client, model: str, style: str, verbalizer_snippet: str,
                               humanizer_snippet: str, knowledge_snippet: str,
-                              trans_mode_snippet: str = "") -> List[Dict]:
+                              trans_mode_snippet: str = "", provider=None,
+                              conversation_profile: str = "",
+                              deadline: Optional[float] = None) -> List[Dict]:
     """
     Strip residual untranslated English words from mostly-Chinese blocks (the
     'actually' / 'you know' issue). A block that has CJK but also >=2 lowercase
     English words (excluding proper nouns/acronyms/numbers) is partially
     untranslated and gets re-translated with a no-residual-English instruction.
     """
+    if deadline is None:
+        deadline = _quality_deadline_from_env()
+    if _deadline_expired(deadline):
+        print("⏰ Quality-check deadline reached before residual-English cleanup.")
+        print("Progress: 99.0% (Quality deadline reached; skipping residual-English cleanup)", flush=True)
+        return final_blocks
+
     # Common English filler words that leak through as untranslated.
     filler = set("""actually basically literally basically really just like you know
     so anyway though however well right okay okay yeah yes no oh um ah
@@ -982,19 +1574,33 @@ def clean_untranslated_english(final_blocks: List[Dict], source_lines: Dict[str,
           f"Re-translating: {[idx for _, idx in flagged]}")
 
     for pos, idx in flagged:
+        if _deadline_expired(deadline):
+            print("⏰ Quality-check deadline reached during residual-English corrections.")
+            break
         en_src = source_lines.get(idx, "")
         if not en_src:
             continue
+        context_str = _target_context_string(source_lines, final_blocks, pos)
         clean_prompt = f"""Translate this ONE subtitle fragment into Simplified Chinese.
 The output must be fully Chinese except for proper nouns / acronyms / brand names
 (keep those in English). Do NOT leave common English words like "actually", "you know",
 "so" untranslated. If the fragment is a partial sentence, translate just that part.
+Adjacent blocks are context only; translate only the TARGET BLOCK and resolve
+second-person references against the conversation profile when provided.
 
-FRAGMENT: {en_src}
+{conversation_profile}
+
+{context_str}TARGET BLOCK: {en_src}
 
 Reply with ONLY the Chinese translation."""
         try:
-            corrected = client.generate_content(clean_prompt, model_name=model)
+            corrected = client.generate_content(
+                clean_prompt,
+                model_name=model,
+                provider=provider,
+                request_timeout=_quality_request_timeout(deadline),
+                max_retries=1,
+            )
             corrected = (corrected or "").strip()
             if corrected and re.search(r"[\u4e00-\u9fff]", corrected):
                 final_blocks[pos]['lines'] = [corrected]
@@ -1090,6 +1696,16 @@ def main():
     _cache_ratio = _early_cached_count / len(blocks) if blocks else 0
     _skip_pre_scan = _cache_ratio > 0.5
 
+    conversation_profile = ""
+    if not _skip_pre_scan and any(is_untranslated(block) for block in blocks):
+        conversation_profile = detect_conversation_profile(
+            blocks,
+            client,
+            args.model,
+            provider=provider_enum,
+            video_title=os.path.basename(input_path),
+        )
+
     if args.style == "auto":
         if _skip_pre_scan:
             effective_style = "casual"
@@ -1147,6 +1763,7 @@ def main():
         final_blocks = blocks
     else:
         print(f"🚀 Translating {len(untranslated_blocks)} remaining segments...")
+        processed_blocks: List[Dict] = []
 
         # 2. Process Chunks Concurrently
         tasks = []
@@ -1197,6 +1814,9 @@ def main():
 - Zyphra / Thinking Machines / OpenAI: keep the established company spelling unless a standard Chinese name is explicitly required
 """
         knowledge_snippet = (knowledge_snippet or "") + PREBUILT_GLOSSARY
+        knowledge_snippet = knowledge_snippet + "\n" + LEADER_TITLE_CONSTRAINT
+        if conversation_profile:
+            knowledge_snippet = knowledge_snippet + "\n" + conversation_profile
 
         # Load user-maintained terms.yml glossary (same file used by PostOS).
         # This ensures names like 黄仁勋 and business terms like alpha are
@@ -1252,7 +1872,7 @@ def main():
             prompt = f"""
     You are an expert subtitle translator and editor.
     Translate the following subtitles into Simplified Chinese.
-    The source language may be English, Japanese, or a mix of both.
+    The source language may be English, Japanese, Korean, or a mix of them.
 
     ### STEP 1: VERBALIZATION (Tone & Persona)
     {verbalizer_snippet}...
@@ -1337,15 +1957,7 @@ def main():
                 translated_chunk_blocks = []
 
                 if result_text:
-                    # Parse output logic
-                    translated_map_chunk = {}
-                    for line in result_text.split('\n'):
-                        match = re.match(r'\[(\d+)\]\s*(.*)', line.strip())
-                        if match:
-                            idx = match.group(1)
-                            content = match.group(2).strip()
-                            if content:  # guard: reject empty translations
-                                translated_map_chunk[idx] = content
+                    translated_map_chunk = parse_translated_lines(result_text)
 
                     # Detect missing blocks: LLM returned fewer [ID] lines than input.
                     # Immediately retry the missing blocks with a single-block prompt
@@ -1359,19 +1971,38 @@ def main():
                                 src = " ".join(block['lines']).replace("\n", " ").strip()
                                 if not src:
                                     continue
+                                block_positions = {
+                                    str(source_block['index']): source_pos
+                                    for source_pos, source_block in enumerate(blocks)
+                                }
+                                context_str = _target_context_string(
+                                    source_lines,
+                                    blocks,
+                                    block_positions.get(idx_str, 0),
+                                )
                                 retry_prompt = (f"Translate this ONE subtitle fragment into Simplified Chinese. "
                                                 f"Use natural spoken Chinese, not written prose. "
                                                 f"No translationese. No em-dashes. "
                                                 f"Keep proper nouns/acronyms in English. "
+                                                f"Use adjacent blocks only to resolve references. "
                                                 f"Reply with ONLY one line in this exact format: [{idx_str}] <translation>\n\n"
+                                                f"{conversation_profile}\n\n"
+                                                f"{context_str}"
                                                 f"[{idx_str}] {src}\n")
                                 try:
-                                    retry_out = client.generate_content(retry_prompt, model_name=target_model, provider=provider_enum)
+                                    retry_out = client.generate_content(
+                                        retry_prompt,
+                                        model_name=target_model,
+                                        provider=provider_enum,
+                                        request_timeout=180,
+                                        max_retries=1,
+                                        fallback=True,
+                                    )
                                     if retry_out:
                                         m = re.search(r'\[%s\]\s*(.+)' % re.escape(idx_str), retry_out)
                                         if m:
                                             cn = m.group(1).strip()
-                                            if cn and re.search(r'[\u4e00-\u9fff]', cn):
+                                            if cn and not is_untranslated({"lines": [cn]}):
                                                 translated_map_chunk[idx_str] = cn
                                                 print(f"   ✔ block {idx_str}: single retry succeeded", flush=True)
                                                 continue
@@ -1379,17 +2010,14 @@ def main():
                                 except Exception as e:
                                     print(f"   ✗ block {idx_str}: single retry error {e}", flush=True)
 
-                    # Apply translations; keep original as fallback for missing/empty
-                    for block in chunk:
-                        new_block = block.copy()
-                        idx = str(block['index'])
-                        if idx in translated_map_chunk:
-                            new_block['lines'] = [translated_map_chunk[idx]]
-                        # else: keep original English as fallback (detected by is_untranslated)
-                        translated_chunk_blocks.append(new_block)
+                    translated_chunk_blocks = apply_translated_lines(
+                        chunk, translated_map_chunk
+                    )
                 else:
                     print(f"❌ Chunk {res['index']} failed completely. Will retry in post-processing.")
                     translated_chunk_blocks = chunk  # keep original for retry
+
+                processed_blocks.extend(translated_chunk_blocks)
 
                 # Update Cache (we use translated_map from line 375)
                 for b in translated_chunk_blocks:
@@ -1402,28 +2030,10 @@ def main():
                 # Suppress rapid-fire chunk progress prints to avoid launcher UI jumping
                 print(f"DEBUG: Chunk {res['index'] + 1}/{total_chunks} processed successfully.", flush=True)
 
-            # Rebuild final_blocks from translated chunk results (the loop above
-            # applied translations to translated_chunk_blocks but never merged them
-            # back into final_blocks — this was the bug that caused all 559 segments
-            # to be flagged as "untranslated" and needlessly re-translated).
-            final_blocks = []
-            for res in results:
-                chunk = res['chunk']
-                result_text = res.get('result')
-                if result_text:
-                    t_map = {}
-                    for line in result_text.split('\n'):
-                        m = re.match(r'\[(\d+)\]\s*(.*)', line.strip())
-                        if m and m.group(2).strip():
-                            t_map[m.group(1)] = m.group(2).strip()
-                    for block in chunk:
-                        nb = block.copy()
-                        idx = str(block['index'])
-                        if idx in t_map:
-                            nb['lines'] = [t_map[idx]]
-                        final_blocks.append(nb)
-                else:
-                    final_blocks.extend(chunk)
+            # Merge by ID so single-block retries and cached blocks survive the
+            # rebuild. Re-parsing the raw LLM response here previously discarded
+            # successful retries and caused a large false 96% retry phase.
+            final_blocks = merge_processed_blocks(blocks, processed_blocks)
 
         except Exception as e:
             print(f"❌ Parallel execution failed: {e}")
@@ -1439,7 +2049,8 @@ def main():
         final_blocks = postprocess_retry_loop(
             final_blocks, client, target_model, effective_style,
             verbalizer_snippet, humanizer_snippet, knowledge_snippet, trans_mode_snippet,
-            provider=provider_enum
+            provider=provider_enum,
+            source_lines=source_lines
         )
         # Final Cache update
         for b in final_blocks:
@@ -1456,20 +2067,32 @@ def main():
     # they already passed alignment checks in the previous run. Only run
     # the backstop on freshly translated blocks (the ones NOT in the
     # cache before this run started).
+    quality_deadline = _quality_deadline_from_env()
     if _skip_pre_scan:
-        print(f"⏩ Skipping alignment backstop & residual-English check (cached run).", flush=True)
-        print(f"Progress: 99.0% (Skipping post-processing — cached run)", flush=True)
+        print("⏩ Skipping alignment backstop & residual-English check (cached run).", flush=True)
+        print("Progress: 99.0% (Skipping post-processing — cached run)", flush=True)
     else:
         print(f"Progress: 97.0% (Alignment check & cleanup)", flush=True)
-    final_blocks = detect_misaligned_blocks(
-        final_blocks, source_lines, client, target_model, effective_style,
-        verbalizer_snippet, humanizer_snippet, knowledge_snippet, trans_mode_snippet,
-        provider=provider_enum
-    )
-    final_blocks = clean_untranslated_english(
-        final_blocks, source_lines, client, target_model, effective_style,
-        verbalizer_snippet, humanizer_snippet, knowledge_snippet, trans_mode_snippet
-    )
+        final_blocks = detect_misaligned_blocks(
+            final_blocks, source_lines, client, target_model, effective_style,
+            verbalizer_snippet, humanizer_snippet, knowledge_snippet, trans_mode_snippet,
+            provider=provider_enum,
+            conversation_profile=conversation_profile,
+            deadline=quality_deadline
+        )
+        final_blocks = clean_untranslated_english(
+            final_blocks, source_lines, client, target_model, effective_style,
+            verbalizer_snippet, humanizer_snippet, knowledge_snippet, trans_mode_snippet,
+            provider=provider_enum,
+            conversation_profile=conversation_profile,
+            deadline=quality_deadline
+        )
+        final_blocks = audit_second_person_references(
+            final_blocks, source_lines, client, target_model,
+            conversation_profile=conversation_profile,
+            provider=provider_enum,
+            deadline=quality_deadline
+        )
    # Persist any re-translated blocks from the backstop into the cache.
     for b in final_blocks:
         if not is_untranslated(b):
@@ -1495,16 +2118,14 @@ def main():
     # 5. Final validation: check if there are any untranslated blocks remaining
     untranslated_count = sum(1 for b in final_blocks if is_untranslated(b))
     if untranslated_count > 0:
-        # Soft-degrade: a handful of stuck blocks (typically bare lists of
-        # proper nouns like "CoreWeave and Crusoe and Nebius and ...") can
-        # resist translation across all retries. Failing the entire run over
-        # 1-2 such blocks is worse than keeping the original text for them —
-        # the bilingual merge will still show EN for those fragments. Warn
-        # and continue instead of aborting.
         stuck = [str(b['index']) for b in final_blocks if is_untranslated(b)]
-        print(f"\n⚠️ {untranslated_count} segment(s) could not be translated after all retries "
-              f"(likely bare proper-noun lists): {stuck}. Keeping original text for these; "
-              f"output will have EN for those blocks. Continuing.")
+        print(
+            f"\n❌ Translation failed validation: {untranslated_count} segment(s) "
+            f"still have no Simplified Chinese: {stuck}",
+            flush=True,
+        )
+        print("No .cn.srt output was written. Reset TL to retry these blocks.", flush=True)
+        sys.exit(1)
 
     # 6. Save Output
     if input_path.lower().endswith(".en.srt"):

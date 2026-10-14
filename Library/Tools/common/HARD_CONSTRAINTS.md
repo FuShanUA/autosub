@@ -185,9 +185,16 @@ These are strict media compliance rules. They are mechanically applied by the po
 | Hong Kong / Macao | `(中港\|中澳)` | `内地与香港` | General replacement, manual check required if Macao |
 | Names Protection | `约翰·温费尔特` | `John Wernfeldt` | 禁止翻译人名 |
 
+## 5. Chinese National Leader Naming (Prompt Rule)
+
+- In Chinese output, never use a full personal name for a Chinese national leader.
+- If the source text already provides an official title, preserve that title.
+- If the source text uses only a full personal name, replace it with the formal office title (for example, 习主席).
+- Never invent a title that is not supported by the source or public office.
+
 
 ---
 *Last updated: 2026-03-08*
 
-> **Note**: Declarative LLM style guidance (formerly Section 5) has been moved to
+> **Note**: Declarative LLM style guidance (formerly the old Section 5) has been moved to
 > `/Users/shanfu/cc/Library/Tools/WritingStyle/README.md` — loaded as `WRITING_STYLE_RULES` in `smart_translate.py`.

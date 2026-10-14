@@ -71,6 +71,26 @@ class TestBiliUploadCovers(unittest.TestCase):
             [(self.video, "bilibili", "抽象产品")],
         )
 
+    def test_upload_timeout_cancels_the_underlying_task(self):
+        cancelled = []
+
+        class SlowUploader:
+            async def start(self):
+                try:
+                    await asyncio.sleep(10)
+                except asyncio.CancelledError:
+                    cancelled.append(True)
+                    raise
+
+        with self.assertRaises(TimeoutError):
+            asyncio.run(
+                self.module._start_uploader_with_heartbeat(
+                    SlowUploader(), timeout=0.1
+                )
+            )
+
+        self.assertEqual(cancelled, [True])
+
     def test_upload_stops_before_uploader_when_covers_are_missing(self):
         class FakeApi:
             def __init__(self, *_args, **_kwargs):
