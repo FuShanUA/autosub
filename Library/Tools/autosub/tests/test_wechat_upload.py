@@ -613,6 +613,43 @@ class TestWechatUploadTitle(unittest.TestCase):
 
         self.assertTrue(changed)
 
+    def test_wait_cover_preview_changed_requires_pixel_match(self):
+        states = [
+            [{"src": "new", "naturalWidth": 810, "naturalHeight": 1080}],
+        ]
+        verification_calls = []
+
+        async def fake_cover_wrap_images(page, selector):
+            return states[0]
+
+        async def fake_verify_cover(page, expected, orientation):
+            verification_calls.append((expected, orientation))
+            return len(verification_calls) > 1
+
+        fake_asyncio = SimpleNamespace(sleep=_noop_sleep)
+        with patch.object(
+            self.module, "_cover_wrap_images", fake_cover_wrap_images
+        ), patch.object(
+            self.module, "_verify_cover_preview_matches", fake_verify_cover
+        ), patch.object(self.module, "asyncio", fake_asyncio):
+            changed = asyncio.run(
+                self.module._wait_cover_preview_changed(
+                    object(),
+                    ".vertical-cover-wrap",
+                    "portrait",
+                    {"old"},
+                    timeout=1,
+                    expected_path="/tmp/portrait.jpg",
+                )
+            )
+
+        self.assertTrue(changed)
+        self.assertEqual(len(verification_calls), 2)
+        self.assertEqual(
+            verification_calls[0][0],
+            {"local_path": "/tmp/portrait.jpg"},
+        )
+
     def test_validate_cover_file_rejects_stale_title_marker(self):
         cover = os.path.join(self.temp_dir, "cover.jpg")
         Image.new("RGB", (1080, 1440), (216, 8, 0)).save(cover)
@@ -907,7 +944,7 @@ class TestWechatUploadTitle(unittest.TestCase):
         self.assertEqual(calls, ["share", "share", "portrait"])
         self.assertEqual(set(previews), {"portrait", "share"})
 
-    def test_private_draft_cover_readback_is_warning_not_failure(self):
+    def test_draft_cover_readback_failure_is_failure(self):
         async def fake_open_draft_list(page):
             return True
 
@@ -918,7 +955,7 @@ class TestWechatUploadTitle(unittest.TestCase):
             return True
 
         async def fake_wait(page, timeout=0):
-            raise AssertionError("private draft must not wait for a flaky cover editor")
+            return True
 
         async def fake_verify_fields(page, title, desc):
             return title == "FDE的核心职能：抽象产品" and desc == "本次描述"
@@ -939,28 +976,25 @@ class TestWechatUploadTitle(unittest.TestCase):
                     "FDE的核心职能：抽象产品",
                     "本次描述",
                     expected_covers={"portrait": {}, "share": {}},
-                    strict_covers=False,
                 )
             )
 
-        self.assertTrue(ok)
+        self.assertFalse(ok)
 
-    def test_private_upload_can_save_draft_when_covers_are_unconfirmed(self):
+    def test_upload_rejects_unconfirmed_covers(self):
         async def fake_same_page(*args, **kwargs):
             return False
 
         with patch.object(self.module, "_set_wechat_covers_same_page", fake_same_page):
-            previews = asyncio.run(
-                self.module._set_wechat_covers_for_upload(
-                    object(),
-                    "portrait.jpg",
-                    "share.jpg",
-                    "抽象产品",
-                    require_both=False,
+            with self.assertRaises(RuntimeError):
+                asyncio.run(
+                    self.module._set_wechat_covers_for_upload(
+                        object(),
+                        "portrait.jpg",
+                        "share.jpg",
+                        "抽象产品",
+                    )
                 )
-            )
-
-        self.assertEqual(previews, {})
 
     def test_verify_draft_saved_checks_form_title_and_both_covers(self):
         opened = []

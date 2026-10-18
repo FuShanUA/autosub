@@ -1184,9 +1184,8 @@ async def _verify_draft_saved(
     expected_covers=None,
     known_drafts=None,
     timeout=40,
-    strict_covers=True,
 ):
-    """Confirm a saved draft without treating a private draft's preview as fatal."""
+    """Confirm a saved draft, including both uploaded cover cards."""
     print(">>> 正在到草稿箱核验保存结果...")
     if not await _open_draft_list(page):
         print(">>> 无法打开草稿箱")
@@ -1204,7 +1203,7 @@ async def _verify_draft_saved(
             if not await _open_draft_entry(page, candidates[0]["index"]):
                 print(">>> 保存后无法重新打开这条草稿")
                 return False
-            if expected_covers and strict_covers:
+            if expected_covers:
                 if not await _wait_cover_editor_ready(page):
                     print(">>> 保存后的草稿封面编辑器未就绪")
                     return False
@@ -1215,9 +1214,7 @@ async def _verify_draft_saved(
                     page, expected_covers
                 )
                 if not covers_ok:
-                    if strict_covers:
-                        return False
-                    print(">>> 私发草稿已保存；封面回读未确认，请在发布前人工检查")
+                    return False
             return True
         await asyncio.sleep(2)
     print(f">>> 草稿箱未找到本次新增且描述精确匹配的草稿: {expected_desc[:80]}")
@@ -1462,7 +1459,14 @@ def _validate_cover_file(cover_path, orientation, expected_title):
     return True
 
 
-async def _wait_cover_preview_changed(page, wrap_selector, orientation, before_sources, timeout=20):
+async def _wait_cover_preview_changed(
+    page,
+    wrap_selector,
+    orientation,
+    before_sources,
+    timeout=20,
+    expected_path=None,
+):
     """Wait until the outer form card reflects the uploaded cover."""
     start = time.time()
     last_state = None
@@ -1481,6 +1485,16 @@ async def _wait_cover_preview_changed(page, wrap_selector, orientation, before_s
         ]
         changed = any(item.get("src") not in before_sources for item in loaded)
         if changed and _cover_preview_matches_orientation(loaded, orientation):
+            if expected_path:
+                content_matches = await _verify_cover_preview_matches(
+                    page,
+                    {"local_path": os.path.abspath(expected_path)},
+                    orientation,
+                )
+                if not content_matches:
+                    print(">>> 封面卡片预览已变化，但像素内容未匹配上传封面")
+                    await asyncio.sleep(0.5)
+                    continue
             print(">>> 封面卡片预览已切换为上传封面")
             return True
         await asyncio.sleep(0.5)
@@ -1599,12 +1613,22 @@ async def _upload_wechat_cover_card(page, cover_path, orientation, expected_titl
             return False
 
         if not await _wait_cover_preview_changed(
-            page, wrap_selector, orientation, before_sources, timeout=20
+            page,
+            wrap_selector,
+            orientation,
+            before_sources,
+            timeout=20,
+            expected_path=cover_path,
         ):
             # Some flows show a second crop confirmation after the first save.
             if await _click_visible_button(page, "确认", timeout=2000):
                 if not await _wait_cover_preview_changed(
-                    page, wrap_selector, orientation, before_sources, timeout=15
+                    page,
+                    wrap_selector,
+                    orientation,
+                    before_sources,
+                    timeout=15,
+                    expected_path=cover_path,
                 ):
                     return False
             else:
@@ -1819,9 +1843,9 @@ async def _set_wechat_covers_same_page(
 
 
 async def _set_wechat_covers_for_upload(
-    page, portrait_cover, share_cover, expected_title, require_both=True
+    page, portrait_cover, share_cover, expected_title
 ):
-    """Set covers; private drafts may retain an uploaded video when covers lag."""
+    """Set both cover cards before a draft can be considered complete."""
     if not portrait_cover or not share_cover:
         raise RuntimeError("微信上传需要横竖两张封面，封面生成结果不完整")
     previews = await _set_wechat_covers_same_page(
@@ -1829,9 +1853,7 @@ async def _set_wechat_covers_for_upload(
     )
     incomplete = not previews or not previews.get("portrait") or not previews.get("share")
     if incomplete:
-        if require_both:
-            raise RuntimeError("微信横竖封面未完全设置成功，已停止保存草稿")
-        print(">>> 私发草稿将保存已上传视频；封面未完全确认，请在发布前人工检查")
+        raise RuntimeError("微信横竖封面未完全设置成功，已停止保存草稿")
     return previews or {}
 
 
@@ -2085,7 +2107,6 @@ async def upload_one_video(video_path, title, desc=None, tags=None, is_public=Fa
                         portrait_cover,
                         share_cover,
                         cover_headline,
-                        require_both=is_public,
                     )
 
                     if is_public:
@@ -2126,7 +2147,6 @@ async def upload_one_video(video_path, title, desc=None, tags=None, is_public=Fa
                             desc,
                             expected_covers=cover_previews,
                             known_drafts=known_drafts,
-                            strict_covers=is_public,
                         )
                         if not ok:
                             raise RuntimeError("草稿箱核验失败，未确认保存草稿")
