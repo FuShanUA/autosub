@@ -30,6 +30,8 @@ Library/Tools/autosub/.hw_SS.json
 Library/Tools/autosub/*_state.json
 Library/Tools/autosub/gui_crash_report.txt
 Library/Tools/autosub/gui_debug_*.txt
+/gui_debug_styles.txt
+/gui_debug_text.txt
 Library/Tools/vdown/network_log.txt
 Library/Tools/vdown/screenshot_debug.png
 *_backup*.png
