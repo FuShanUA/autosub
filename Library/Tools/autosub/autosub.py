@@ -136,6 +136,7 @@ VENDOR_MAP = {
 }
 
 import multiprocessing
+import filecmp
 multiprocessing.freeze_support()
 
 # --- Environment Setup (Isolation Logic) ---
@@ -283,10 +284,16 @@ BILI_VIDEO_EXTS = ('.mp4', '.mkv', '.webm', '.mov', '.ts')
 WECHAT_SCRIPT = os.path.join(
     CURRENT_DIR, "wechat-channel-uploader", "scripts", "wechat_upload.py"
 )
-# Keep the existing logged-in profile when the uploader moves into this repo.
+# Login and upload must use the same profile. The visible --login command writes
+# to the uploader's adjacent assets directory by default.
 WECHAT_BROWSER_DATA_DIR = os.environ.get(
     "WECHAT_BROWSER_DATA_DIR",
-    os.path.expanduser("~/.codex/skills/wechat-channel-uploader/assets/browser_data"),
+    os.path.join(
+        CURRENT_DIR,
+        "wechat-channel-uploader",
+        "assets",
+        "browser_data",
+    ),
 )
 os.environ["WECHAT_BROWSER_DATA_DIR"] = WECHAT_BROWSER_DATA_DIR
 SHARED_UPLOAD_TITLE_MAX_CHARS = 16
@@ -879,6 +886,7 @@ def _generate_content_with_timeout(
     provider=None,
     request_timeout=None,
     max_retries=1,
+    disable_thinking=False,
 ):
     """Call metadata LLMs while letting the client apply its timeout policy."""
     kwargs = {
@@ -905,6 +913,16 @@ def _generate_content_with_timeout(
         supports_max_retries = True
     if supports_max_retries:
         kwargs["max_retries"] = max_retries
+    try:
+        signature = inspect.signature(llm_client.generate_content)
+        supports_disable_thinking = "disable_thinking" in signature.parameters or any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        )
+    except (TypeError, ValueError):
+        supports_disable_thinking = True
+    if supports_disable_thinking:
+        kwargs["disable_thinking"] = disable_thinking
     return llm_client.generate_content(prompt, **kwargs)
 
 
@@ -915,6 +933,9 @@ _SHARED_TITLE_BANNED_TERMS = (
 )
 _SHARED_TITLE_ACTION_MARKERS = (
     "谈", "讲", "靠", "用", "做", "让", "成为", "押", "是", "培养",
+    "称", "指", "改", "有", "退场", "进场", "减半", "宣布", "扩展",
+    "把握", "比较", "构建", "赋予", "形成", "消失", "构成", "贯穿",
+    "揭示", "引出", "认知",
     "招", "卖", "买", "建立", "打造", "解决", "守住", "聚焦", "变成", "保护",
     "整合", "引领", "炮轰", "反对", "支持", "梳理", "展示", "迭代", "改造",
     "收购", "讨论", "推掉", "陪", "失去", "离世", "拒绝", "直面", "守",
@@ -927,6 +948,8 @@ _SHARED_TITLE_CONTEXT_MARKERS = (
     "问题", "不做", "不是", "不招", "押注", "才是", "隐私", "一半",
     "被裁", "烂掉",
     "人生", "中年", "上班", "素材库",
+    "AI", "CEO", "核心", "核心业务", "公司", "理论", "现实", "有效",
+    "无用功", "成本", "五倍",
 )
 _PUBLIC_TITLE_STYLE_EXAMPLES = (
     "Palantir才是引领应用层的公司，客户从没见过这种阵势",
@@ -1409,7 +1432,7 @@ def _shared_title_has_quality_issue(title):
         return True
     if any(term in value for term in _SHARED_TITLE_BANNED_TERMS):
         return True
-    if "把" in value or "押注解决" in value:
+    if re.search(r"把(?!握)", value) or "押注解决" in value:
         return True
     if "这个视频" in value or "内容非常丰富" in value:
         return True
@@ -1932,6 +1955,8 @@ def _generate_title_from_description(
         "不要疑问句、悬念句、代词、泛词或营销口吻。"
         "不要市井口语和情绪副词，例如「死活」「简直」。"
         "标题中的事实和术语必须来自字幕。"
+        "标题措辞也必须尽量由字幕原词组成；连接词可以调整，"
+        "不得引入字幕没有的动词或抽象名词。"
         "生成 10 个候选，按编辑质量从高到低排列。"
         "每个候选给出 1-2 条 evidence，必须逐字复制字幕原文，不得改写或加省略号。"
         "只输出 JSON："
@@ -1959,6 +1984,7 @@ def _generate_title_from_description(
                 prompt,
                 model_name,
                 provider=provider,
+                disable_thinking=True,
             )
             _central_claim, candidates = parse_llm_title_candidates(raw)
             subject_aliases = _merge_proper_noun_aliases(
@@ -2031,6 +2057,7 @@ def _generate_structured_title_from_description(
     model_name,
     max_chars,
     source_title=None,
+    provider=None,
 ):
     """Build a budgeted Bilibili title from semantic fields."""
     from subtitle_title import (
@@ -2087,6 +2114,8 @@ def _generate_structured_title_from_description(
         "不要把全片主体缩小成单一客户群体；若同时服务企业和政府，"
         "beneficiary 用「客户」或自然的并列表达。"
         "不要市井口语和情绪副词，例如「死活」「简直」。"
+        "标题措辞必须尽量由字幕原词组成；连接词可以调整，"
+        "不得引入字幕没有的动词或抽象名词。"
         "参考公开B站标题的结构，只学句式，不复制事实。"
         "每个候选给1-2条 evidence，必须逐字复制中文字幕原文。"
         "只输出 JSON："
@@ -2114,6 +2143,8 @@ def _generate_structured_title_from_description(
                 llm_client,
                 prompt,
                 model_name,
+                provider=provider,
+                disable_thinking=True,
             )
             text = str(raw or "").strip()
             text = re.sub(
@@ -2408,7 +2439,7 @@ def _compress_bili_title_for_wechat(
     for clause in clauses:
         body = clause[len(subject):] if subject and clause.startswith(subject) else clause
         without_modifiers = body
-        for modifier in ("死活", "依然", "尽量", "所谓", "基本上", "散落", "各类", "底层"):
+        for modifier in ("死活", "依然", "尽量", "所谓", "基本上", "散落", "各类", "底层", "尽早"):
             without_modifiers = without_modifiers.replace(modifier, "")
         without_conjoined_object = re.sub(
             r"(?:与|和)[\u3400-\u9fff]{1,4}(?=团队|业务|问题|公司)",
@@ -2527,8 +2558,10 @@ def _derive_wechat_title_from_bili_title(
         "B站标题只确定主题边界和必须保留的主体，不是逐字压缩模板。"
         "优先通读字幕，找出同一主线里最具体的冲突、后果、反差或人物立场；"
         "可以选字幕钩子，不得另起主题，也不得换成字幕外的概括。"
-        "英文人名、地名如果节省字符且不造成歧义，优先使用中文通行译名"
-        "或公众熟知的简称、绰号；公司名和产品名通常保留公众拼写。"
+        "英文人名、地名必须优先使用中文通行译名或公众熟知的简称、绰号；"
+        "公司名和产品名通常保留公众拼写。"
+        "视频号标题不得输出英文人名全名；已知人名必须先换成中文简称，"
+        "例如 Alex Karp 写成「卡普」，再计算长度。"
         "不得生造译名或绰号，无法确认时保留英文。"
         "例如 Ben Affleck 可用「本·阿弗莱克」「本阿弗莱克」或「大本」，"
         "并在 subject_aliases 里写明来源拼写。"
@@ -2580,6 +2613,7 @@ def _derive_wechat_title_from_bili_title(
                 prompt,
                 model_name,
                 provider=provider,
+                disable_thinking=True,
             )
             _central_claim, candidates = parse_llm_title_candidates(raw)
             subject_aliases = _merge_proper_noun_aliases(
@@ -2589,6 +2623,11 @@ def _derive_wechat_title_from_bili_title(
             candidate_errors = []
             valid_candidates = []
             for title, evidence in candidates:
+                title = _apply_preferred_title_aliases(
+                    title,
+                    max_chars,
+                    subject_aliases,
+                )
                 title = sanitize_wechat_title(
                     title,
                     max_chars=max(len(str(title)), 1),
@@ -2809,6 +2848,7 @@ def _generate_cover_title_from_full_subtitle(
                 prompt,
                 model_name,
                 provider=provider,
+                disable_thinking=True,
             )
             _central_claim, candidates = parse_llm_title_candidates(raw)
             subject_aliases = _merge_proper_noun_aliases(
@@ -4161,6 +4201,26 @@ def _fallback_bili_title_from_description(description, max_chars):
             safety_title = f"{fragments['subject']}研究员谈AGI安全与产出"
         candidates.append(safety_title)
 
+    first_sentence = re.split(r"[。！？\n]", value, maxsplit=1)[0]
+    contrast_match = re.match(
+        r"^(?:你以为)?(?:爱|喜欢)的是(.+?)，其实是(.+)$",
+        first_sentence,
+    )
+    if contrast_match:
+        subject = contrast_match.group(1).strip("“”\"' 　")
+        object_value = contrast_match.group(2).strip("“”\"' 　")
+        subject = subject.replace("“", "").replace("”", "")
+        object_value = object_value.replace("“", "").replace("”", "")
+        if not subject.endswith("实体"):
+            subject += "实体"
+        contrast_title = f"爱的不是{subject}，而是{object_value}"
+        normalized = normalize_bili_upload_title(
+            contrast_title,
+            max_chars=max_chars,
+        )
+        if normalized:
+            return normalized
+
     compact_value = re.sub(r"\s+", "", value)
     subject = _description_fallback_subject(value)
     if subject and "FDE" in compact_value and "全程负责" in compact_value:
@@ -4180,7 +4240,6 @@ def _fallback_bili_title_from_description(description, max_chars):
         if normalized:
             return normalized
 
-    first_sentence = re.split(r"[。！？\n]", value, maxsplit=1)[0]
     if "教你用好" in first_sentence:
         subject, object_value = first_sentence.split("教你用好", 1)
         teaching_title = f"{subject}讲透{object_value}"
@@ -4252,6 +4311,19 @@ def _fallback_wechat_title_from_description(description, max_chars):
         return ""
 
     fragments = _description_title_fragments(value)
+    subject_match = re.match(r"^([A-Za-z][A-Za-z0-9_-]*)", value)
+    if subject_match and any(
+        marker in value for marker in ("年轻人", "青年人才", "学员")
+    ) and any(
+        marker in value for marker in ("项目", "岗位", "培养", "课程")
+    ):
+        normalized = normalize_shared_upload_title(
+            f"{subject_match.group(1)}培养年轻人才",
+            max_chars=max_chars,
+        )
+        if normalized:
+            return normalized
+
     candidates = []
     if fragments.get("short_subject") and fragments.get("ownership"):
         candidates.append(f"{fragments['short_subject']}用所有权改造企业")
@@ -4318,6 +4390,22 @@ def _fallback_wechat_title_from_bili_title(bili_title, max_chars):
     value = re.sub(r"\s+", " ", str(bili_title or "")).strip()
     value = _apply_preferred_title_aliases(value, max_chars)
     compact_value = re.sub(r"\s+", "", value)
+
+    contrast_match = re.match(
+        r"^爱的不是(.+?)(?:实体)?，而是(.+)$",
+        value,
+    )
+    if contrast_match:
+        candidate = (
+            f"爱的不是{contrast_match.group(1)}，"
+            f"而是{contrast_match.group(2)}"
+        )
+        normalized = normalize_shared_upload_title(
+            candidate,
+            max_chars=max_chars,
+        )
+        if normalized:
+            return normalized
 
     if _is_interview_title_context(value):
         subject = _extract_bili_title_subject(value)
@@ -4647,6 +4735,7 @@ def generate_upload_metadata(
     llm_provider=None,
     include_wechat=True,
     source_title=None,
+    prefer_local_wechat_fallback=False,
 ):
     """Generate Bilibili/WeChat form titles and shared upload metadata.
 
@@ -4742,6 +4831,7 @@ def generate_upload_metadata(
                     prompt,
                     model,
                     provider=provider,
+                    disable_thinking=True,
                 )
                 desc = re.sub(r"\s+", " ", str(desc or "")).strip()
                 issues = _metadata_text_issues(desc, full_sub_text, hardsub_path)
@@ -4818,6 +4908,24 @@ def generate_upload_metadata(
 
     # 2. WeChat form title, derived from the Bilibili title rather than
     # regenerating a separate theme under a tighter character budget.
+    if (
+        include_wechat
+        and prefer_local_wechat_fallback
+        and not meta.get("wechat_title")
+    ):
+        local_retry_title = _fallback_wechat_title_from_description(
+            meta.get("description"),
+            wechat_title_max_chars,
+        )
+        if local_retry_title and not _metadata_title_has_quality_issue(
+            local_retry_title,
+            source_title,
+            bool(sub_text),
+            meta.get("description"),
+        ):
+            meta["wechat_title"] = local_retry_title
+            _log(f">>> [MetaGen] 视频号标题（重试兜底）: {local_retry_title}")
+
     if include_wechat and (
         not meta.get("wechat_title")
         and meta.get("title")
@@ -4901,6 +5009,24 @@ def generate_upload_metadata(
             _log(f">>> [MetaGen] 视频号标题（本地兜底）: {local_wechat_title}")
         else:
             _log("⚠️ [MetaGen] WeChat title generation failed; no local fallback")
+
+    if include_wechat and not meta.get("wechat_title"):
+        compressed_wechat_title = _compress_bili_title_for_wechat(
+            meta.get("title"),
+            wechat_title_max_chars,
+            description=meta.get("description"),
+        )
+        if compressed_wechat_title and not _metadata_title_has_quality_issue(
+            compressed_wechat_title,
+            source_title,
+            bool(sub_text),
+            meta.get("description"),
+        ):
+            meta["wechat_title"] = compressed_wechat_title
+            _log(
+                f">>> [MetaGen] 视频号标题（通用压缩兜底）: "
+                f"{compressed_wechat_title}"
+            )
 
     # 3. Cover title (editorial headline style)
     if not meta.get("cover_title") and sub_text and llm_client:
@@ -5117,6 +5243,7 @@ def prepare_wechat_upload_metadata(
     llm_provider=None,
     on_log=None,
     source_title=None,
+    prefer_local_wechat_fallback=False,
 ):
     """Derive and validate the shorter WeChat form title after Bilibili."""
     _log = on_log or (lambda msg: print(msg, flush=True))
@@ -5129,6 +5256,7 @@ def prepare_wechat_upload_metadata(
         on_log=on_log,
         include_wechat=True,
         source_title=source_title,
+        prefer_local_wechat_fallback=prefer_local_wechat_fallback,
     )
     if not meta:
         _log("❌ [MetaGen] WeChat metadata generation failed; WX upload stopped")
@@ -5387,6 +5515,29 @@ def run_post_processing_uploads(
         _write_upload_marker(workdir, ".bili_uploaded")
     if wechat_result[0]:
         _write_upload_marker(workdir, ".wechat_uploaded")
+
+
+def resolve_upload_targets(args):
+    """Resolve upload destinations from the stage-control flags.
+
+    ``--no-upload`` wins over every destination. An explicit
+    ``--upload-targets`` list overrides the legacy per-platform flags, while
+    omitted targets keep the CLI's existing opt-in upload behavior.
+    """
+    if getattr(args, "no_upload", False):
+        return set()
+    explicit_targets = getattr(args, "upload_targets", None)
+    if explicit_targets:
+        return set(explicit_targets)
+
+    targets = set()
+    if getattr(args, "sync_gdrive", None):
+        targets.add("gdrive")
+    if getattr(args, "bili_upload", False):
+        targets.add("bilibili")
+    if getattr(args, "wechat_upload", False):
+        targets.add("wechat")
+    return targets
 
 
 # --- Robust FFmpeg/ffprobe Detection ---
@@ -5693,13 +5844,61 @@ def transcribe_video(video_path, workdir, model="large-v2", quick=False, multila
         process.wait()
         res = os.path.join(workdir, os.path.splitext(os.path.basename(video_path))[0] + ".srt")
         if os.path.exists(res):
-            en_res = res.replace(".srt", ".en.srt")
-            if not os.path.exists(en_res):
-                shutil.copy2(res, en_res)
-                print(f"✅ Created copy: {os.path.basename(en_res)}")
+            create_language_copy(res)
             return res
         return None
     except: return None
+
+
+LANGUAGE_SUFFIXES = {
+    "zh": "zh",
+    "ko": "kr",
+    "ja": "jp",
+    "en": "en",
+}
+
+
+def detect_srt_language(srt_path):
+    """Detect the dominant language of an SRT from its subtitle text."""
+    try:
+        if srt_utils is not None:
+            blocks = srt_utils.parse_srt(srt_path)
+            text = " ".join(" ".join(block.get("lines", [])) for block in blocks)
+        else:
+            with open(srt_path, "r", encoding="utf-8", errors="ignore") as handle:
+                text = handle.read()
+    except (OSError, UnicodeError):
+        return "en"
+
+    if any(0xAC00 <= ord(char) <= 0xD7AF for char in text):
+        return "ko"
+    if any(0x3040 <= ord(char) <= 0x30FF for char in text):
+        return "ja"
+    cjk_count = sum(1 for char in text if 0x4E00 <= ord(char) <= 0x9FFF)
+    latin_count = sum(1 for char in text if char.isascii() and char.isalpha())
+    return "zh" if cjk_count > latin_count else "en"
+
+
+def create_language_copy(srt_path):
+    """Create a language-tagged source copy using the detected main language."""
+    language = detect_srt_language(srt_path)
+    suffix = LANGUAGE_SUFFIXES.get(language, "en")
+    copy_path = srt_path[:-4] + f".{suffix}.srt" if srt_path.lower().endswith(".srt") else srt_path
+    if copy_path == srt_path:
+        return srt_path
+
+    shutil.copy2(srt_path, copy_path)
+    print(f"✅ Created {language} source copy: {os.path.basename(copy_path)}")
+
+    legacy_en_path = srt_path[:-4] + ".en.srt" if srt_path.lower().endswith(".srt") else None
+    if suffix != "en" and legacy_en_path and os.path.exists(legacy_en_path):
+        try:
+            if filecmp.cmp(srt_path, legacy_en_path, shallow=False):
+                os.remove(legacy_en_path)
+                print(f"🧹 Removed incorrect English copy: {os.path.basename(legacy_en_path)}")
+        except OSError:
+            pass
+    return copy_path
 
 def merge_bilingual(src_srt, zh_srt, main_lang="cn", llm_model=DEFAULTS.get("llm_model", "glm-5.3")):
     print(f"🔀 Smart-Merging into bilingual SRT...")
@@ -6097,8 +6296,25 @@ def main():
     parser.add_argument("--end", help="End time (e.g. 00:03:00 or 180)")
     parser.add_argument("--quality", default="high", choices=["standard", "high", "lossless"], help="Burn quality (standard, high, lossless)")
     parser.add_argument("--upload-only", action="store_true", help="Skip transcription/translation/burn; only upload existing hardsub video to GDrive/Bilibili")
+    parser.add_argument("--skip-transcription", action="store_true", help="Skip transcription and reuse an existing SRT file")
+    parser.add_argument("--skip-translation", action="store_true", help="Skip translation and reuse an existing Chinese SRT file")
+    parser.add_argument("--skip-burn", action="store_true", help="Skip subtitle burning and stop before hardsub generation")
+    parser.add_argument("--no-upload", action="store_true", help="Skip all uploads")
+    parser.add_argument(
+        "--upload-targets",
+        nargs="+",
+        choices=["gdrive", "bilibili", "wechat"],
+        help="Upload destinations; overrides the individual upload flags",
+    )
     parser.add_argument("--multilang", action="store_true", help="Enable per-segment language detection for mixed-language videos")
     args = parser.parse_args()
+
+    upload_targets = resolve_upload_targets(args)
+    if args.upload_only and args.no_upload:
+        parser.error("--upload-only and --no-upload cannot be combined")
+    sync_gdrive_target = args.sync_gdrive
+    if "gdrive" in upload_targets and not sync_gdrive_target:
+        sync_gdrive_target = DEFAULTS.get("sync_gdrive")
 
     if args.cookies_from_browser:
         args.cookies = args.cookies_from_browser
@@ -6225,9 +6441,9 @@ def main():
         print(f"✅ Found hardsub: {os.path.basename(hardsub_path)}", flush=True)
         run_post_processing_uploads(
             workdir,
-            sync_gdrive=getattr(args, 'sync_gdrive', None),
-            bili_upload=getattr(args, 'bili_upload', False),
-            wechat_upload=getattr(args, 'wechat_upload', False),
+            sync_gdrive=sync_gdrive_target if "gdrive" in upload_targets else None,
+            bili_upload="bilibili" in upload_targets,
+            wechat_upload="wechat" in upload_targets,
             headless=args.headless,
             bili_cover_title=getattr(args, 'bili_cover_title', None),
             wechat_cover_title=getattr(args, 'wechat_cover_title', None),
@@ -6345,7 +6561,10 @@ def main():
                 break
     
     if not src_srt:
-        src_srt = transcribe_video(video_path, workdir, args.model, quick=args.quick, multilang=args.multilang)
+        if args.skip_transcription:
+            print("⏭️  Transcription skipped (--skip-transcription); no existing SRT was found")
+        else:
+            src_srt = transcribe_video(video_path, workdir, args.model, quick=args.quick, multilang=args.multilang)
     
     if not src_srt:
         print("❌ Transcription failed")
@@ -6393,6 +6612,8 @@ def main():
                 print(f"⚠️ Acoustic Spellcheck exited with code {sp.returncode}")
         except Exception as e:
             print(f"⚠️ Acoustic Spellcheck failed/skipped: {e}")
+        if src_srt:
+            create_language_copy(src_srt)
 
     # 2. Translation (Sequential)
     zh_srt = None
@@ -6415,6 +6636,9 @@ def main():
                 break
 
     if not zh_srt:
+        if args.skip_translation:
+            print("⏭️  Translation skipped (--skip-translation); no existing Chinese SRT was found")
+            return 0
         print("🌍 Smart-translating...")
         try:
             py_exe = get_python_exe()
@@ -6435,10 +6659,14 @@ def main():
             elif os.path.exists(expected_zh): zh_srt = expected_zh
         except Exception as e:
             print(f"⚠️ Translation step error: {e}")
-    
+
     if not zh_srt:
         print("❌ Translation failed")
         return 1
+
+    if args.skip_burn:
+        print("⏭️  Burn skipped (--skip-burn); no hardsub video was generated")
+        return 0
 
     # 3. Merge & Burn
     final_srt = zh_srt
@@ -6485,9 +6713,9 @@ def main():
     # --- Parallel Post-Processing Uploads ---
     run_post_processing_uploads(
         workdir,
-        sync_gdrive=getattr(args, 'sync_gdrive', None),
-        bili_upload=getattr(args, 'bili_upload', False),
-        wechat_upload=getattr(args, 'wechat_upload', False),
+        sync_gdrive=sync_gdrive_target if "gdrive" in upload_targets else None,
+        bili_upload="bilibili" in upload_targets,
+        wechat_upload="wechat" in upload_targets,
         headless=args.headless,
         bili_cover_title=getattr(args, 'bili_cover_title', None),
         wechat_cover_title=getattr(args, 'wechat_cover_title', None),

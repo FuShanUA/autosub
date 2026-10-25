@@ -2,12 +2,14 @@ import os
 import shutil
 import contextlib
 import io
+import json
+import sys
 import tempfile
 import threading
 import time
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 try:
     from Library.Tools.autosub import smart_translate
@@ -61,6 +63,20 @@ class TranslationDetectionTests(unittest.TestCase):
         self.assertFalse(
             smart_translate.is_untranslated(
                 {"lines": ["所以我做过很多工作：Google、BigQuery、AppScale、Tableau、PowerBI，这些工具"]}
+            )
+        )
+
+    def test_url_in_chinese_translation_is_not_untranslated(self):
+        self.assertFalse(
+            smart_translate.is_untranslated(
+                {"lines": ["使用 Vanta 的公司超过 16000 家，访问 vanta.com/invest 可享优惠。"]}
+            )
+        )
+
+    def test_credit_line_with_english_names_is_not_untranslated(self):
+        self.assertFalse(
+            smart_translate.is_untranslated(
+                {"lines": ["《缔造者》由 Kaleidoscope 和 iHeart 联合出品。本系列由 Walter Isaacson 主持。"]}
             )
         )
 
@@ -130,6 +146,128 @@ class TranslationRebuildTests(unittest.TestCase):
         self.assertEqual(result[1]["lines"], ["第2块中文"])
         self.assertIn("Progress: 96.2%", output.getvalue())
         self.assertIn("Progress: 97.0%", output.getvalue())
+
+
+class SmartTranslateCacheGapPreventionTests(unittest.TestCase):
+    def _make_partial_cache_fixture(self):
+        temp_dir = tempfile.mkdtemp()
+        srt_path = os.path.join(temp_dir, "partial_cache.srt")
+        cache_path = os.path.join(temp_dir, "partial_cache.translation_cache.json")
+        srt_content = """1
+00:00:01,000 --> 00:00:02,000
+Hello one
+
+2
+00:00:02,000 --> 00:00:03,000
+Hello two
+
+3
+00:00:03,000 --> 00:00:04,000
+Hello three
+"""
+        with open(srt_path, "w", encoding="utf-8") as handle:
+            handle.write(srt_content)
+        with open(cache_path, "w", encoding="utf-8") as handle:
+            json.dump({"1": "第一句中文", "2": "第二句中文"}, handle, ensure_ascii=False)
+        return temp_dir, srt_path
+
+    def test_partial_cache_run_only_sends_untranslated_blocks(self):
+        temp_dir, srt_path = self._make_partial_cache_fixture()
+
+        class FakeClient:
+            def __init__(self):
+                self.tasks = None
+
+            def generate_batch(self, tasks, *_args, **_kwargs):
+                self.tasks = tasks
+                return [
+                    {
+                        **task,
+                        "result": "\n".join(
+                            f"[{block['index']}] 第{block['index']}块中文"
+                            for block in task["chunk"]
+                        ),
+                    }
+                    for task in tasks
+                ]
+
+        fake_client = FakeClient()
+        output = io.StringIO()
+        try:
+            with patch.object(smart_translate, "client", fake_client), \
+                 patch.object(
+                     sys,
+                     "argv",
+                     [
+                         "smart_translate.py",
+                         srt_path,
+                         "--model",
+                         "test-model",
+                         "--style",
+                         "auto",
+                         "--chunk-size",
+                         "2",
+                     ],
+                 ), contextlib.redirect_stdout(output):
+                smart_translate.main()
+
+            self.assertEqual(len(fake_client.tasks), 1)
+            self.assertEqual(
+                [block["index"] for block in fake_client.tasks[0]["chunk"]],
+                ["3"],
+            )
+            self.assertTrue(
+                os.path.isfile(os.path.join(temp_dir, "partial_cache.cn.srt"))
+            )
+            self.assertIn("Untranslated Blocks: 1 -> 1 Chunks", output.getvalue())
+            self.assertIn("PREVIOUS BLOCK", fake_client.tasks[0]["prompt"])
+        finally:
+            shutil.rmtree(temp_dir)
+
+    def test_all_failed_batch_falls_back_to_single_block_retry(self):
+        temp_dir, srt_path = self._make_partial_cache_fixture()
+
+        class FakeClient:
+            def __init__(self):
+                self.batch_calls = 0
+                self.single_calls = 0
+
+            def generate_batch(self, tasks, *_args, **_kwargs):
+                self.batch_calls += 1
+                return [{**task, "result": None, "error": "batch_timeout"} for task in tasks]
+
+            def generate_content(self, *_args, **_kwargs):
+                self.single_calls += 1
+                return "[3] 这是单条兜底中文"
+
+        fake_client = FakeClient()
+        output = io.StringIO()
+        try:
+            with patch.object(smart_translate, "client", fake_client), \
+                 patch.object(
+                     sys,
+                     "argv",
+                     [
+                         "smart_translate.py",
+                         srt_path,
+                         "--model",
+                         "test-model",
+                         "--style",
+                         "auto",
+                         "--chunk-size",
+                         "2",
+                     ],
+                 ), contextlib.redirect_stdout(output):
+                smart_translate.main()
+
+            self.assertGreaterEqual(fake_client.batch_calls, 1)
+            self.assertGreaterEqual(fake_client.single_calls, 1)
+            self.assertTrue(
+                os.path.isfile(os.path.join(temp_dir, "partial_cache.cn.srt"))
+            )
+            self.assertIn("Falling back to smaller retries", output.getvalue())
+        finally:
+            shutil.rmtree(temp_dir)
 
     def test_postprocess_scales_deadline_and_enables_model_fallback(self):
         class FakeClient:
@@ -606,8 +744,10 @@ class QualityDeadlineTests(unittest.TestCase):
         class FakeClient:
             def __init__(self):
                 self.kwargs = None
+                self.tasks = None
 
-            def generate_batch(self, _tasks, _model, **kwargs):
+            def generate_batch(self, tasks, _model, **kwargs):
+                self.tasks = tasks
                 self.kwargs = kwargs
                 return [{"result": "ALL_ALIGNED"}]
 
@@ -635,6 +775,11 @@ class QualityDeadlineTests(unittest.TestCase):
         self.assertLessEqual(client.kwargs["request_timeout"], 60)
         self.assertGreater(client.kwargs["batch_timeout"], 0)
         self.assertLessEqual(client.kwargs["batch_timeout"], 60)
+        self.assertEqual(len(client.tasks), 1)
+        prompt = client.tasks[0]["prompt"]
+        self.assertIn("PREVIOUS EN", prompt)
+        self.assertIn("NEXT EN", prompt)
+        self.assertIn("If the CN translates an adjacent block's content better", prompt)
 
     def test_residual_english_cleanup_forwards_remaining_deadline(self):
         class FakeClient:

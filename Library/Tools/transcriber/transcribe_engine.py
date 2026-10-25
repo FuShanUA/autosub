@@ -16,6 +16,11 @@ import io
 import traceback
 
 try:
+    import wordninja
+except ImportError:
+    wordninja = None
+
+try:
     from faster_whisper import WhisperModel # type: ignore
 except ImportError:
     import site
@@ -28,6 +33,12 @@ try:
     from mlx_engine import transcribe_mlx, is_apple_silicon, HAS_MLX
 except ImportError:
     HAS_MLX = False
+
+try:
+    from opencc import OpenCC
+    _T2S_CONVERTER = OpenCC("t2s")
+except ImportError:
+    _T2S_CONVERTER = None
 
 # Try to import pyannote.audio for speaker diarization
 HAS_PYANNOTE = False
@@ -104,6 +115,754 @@ def detect_content_type(segments_list):
 # present in the video prevents this.
 ALLOWED_LANGS = {'ja', 'en', 'zh'}
 
+ASR_FRAGMENT_FIXES = {
+    "a iaging": "AI Agent",
+    "a i agent fde": "AI Agent FDE",
+    "a i agent": "AI Agent",
+    "a i reception list": "AI receptionist",
+    "voicea i": "voice AI",
+    "usinga i": "using AI",
+    "agent iccore": "agentic core",
+    "lmwork flow": "LLM workflow",
+    "kuberne tesinfra": "Kubernetes infra",
+    "accent ure mackenzie": "Accenture、McKinsey",
+    "ceo c to": "CEO、CTO",
+    "low - h anging fruit": "low-hanging fruit",
+    "codex pie": "Codex CLI",
+    "cha it pc": "ChatGPT",
+    "a to a": "A2A",
+    "lesson learn": "lessons learned",
+    "makehard decision": "make hard decisions",
+    "makehard decisions": "make hard decisions",
+    "gpc 3. 5 devin 7": "GPT 3.5 Devin 7",
+    "Bu ild business": "build business",
+    "F DE": "FDE",
+    "F DPM": "FDPM",
+    "AI 18 F DE": "AI FDE",
+    "For ward Dep loy ed Product Engineer": "Forward Deployed Product Engineer",
+    "Open AI": "OpenAI",
+    "S OP IC": "Anthropic",
+    "S ARP IC": "Anthropic",
+    "Pal ant ir": "Palantir",
+    "P ent ier": "Palantir",
+    "Pan 恩切": "Palantir",
+    "Go ogle": "Google",
+    "Mac ken zie": "McKinsey",
+    "Qu esta": "Cresta",
+    "Qu est": "Cresta",
+    "C resta": "Cresta",
+    "Cry stal": "Cresta",
+    "V in cent": "Vincent",
+    "V in ston": "Vincent",
+    "W inson": "Winston",
+    "W in ston": "Winston",
+    "W inter": "Winston",
+    "Ge off": "Jeff",
+    "J oey": "Joey",
+    "Jo ey": "Joey",
+    "J ob": "Job",
+    "J ob in": "Job",
+    "Ge orge": "George",
+    "V ent us": "Ventus",
+    "A 16 Z": "a16z",
+    "A IR": "AIR",
+    "S now fl ake": "Snowflake",
+    "Sp unk": "Splunk",
+    "I BM": "IBM",
+    "Az ure": "Azure",
+    "A WS": "AWS",
+    "Bad lock": "Bedrock",
+    "A st ral Pack": "Mistral",
+    "Ti mi": "Mistral",
+    "S kill": "Skill",
+    "T ouch DP": "GPT",
+    "F ound er": "Founder",
+    "F ound er Mode": "Founder Mode",
+    "F und ing engineer": "Founding Engineer",
+    "En ter prise": "Enterprise",
+    "S aaS": "SaaS",
+    "S AP": "SAP",
+    "S ales force": "Salesforce",
+    "S ales now": "ServiceNow",
+    "sales now": "ServiceNow",
+    "A gent": "Agent",
+    "A gents": "Agents",
+    "ag ent": "agent",
+    "ag ents": "agents",
+    "Del ta": "Delta",
+    "Al pha": "Alpha",
+    "E cho": "Echo",
+    "H ead": "Head",
+    "Co - F ound er": "Co-Founder",
+    "H IP AA": "HIPAA",
+    "ret rie val": "retrieval",
+    "em bed ding": "embedding",
+    "mem ory": "memory",
+    "cont ext engineering": "context engineering",
+    "gard er ial": "guardrail",
+    "T TS": "TTS",
+    "C II": "CLI",
+    "C UI": "CLI",
+    "W APT": "FDE",
+    "t oken": "token",
+    "ann ounce": "announce",
+    "te am": "team",
+    "B ridge the G ap": "bridge the gap",
+    "D ata Engineering": "Data Engineering",
+    "Sec urity": "Security",
+    "Mag ical": "Magical",
+    "prof essional service": "professional service",
+    "prom pt": "prompt",
+    "aut om ation": "automation",
+    "ch all eng ing": "challenging",
+    "L ucky": "Lucky",
+    "mic ro management": "micro management",
+    "c oding": "coding",
+    "v end or": "vendor",
+    "Web inar": "Webinar",
+    "co - host": "co-host",
+    "F ocus On": "Focus On",
+    "engine er": "engineer",
+    "man ager": "manager",
+    "Man ager": "Manager",
+    "tim eline": "timeline",
+    "del iver": "deliver",
+    "S ize": "Size",
+    "off er": "offer",
+    "OpenAI And ro id": "OpenAI Android",
+    "Ty pe Script": "TypeScript",
+    "mile stone": "milestone",
+    "depend ency": "dependency",
+    "AI TeamM ates": "AI Teammates",
+    "know ledge base": "knowledge base",
+    "guard rail": "guardrail",
+    "U AT": "UAT",
+    "D ata Sci ent ist": "Data Scientist",
+    "F ly And": "Frontend",
+    "Fly And": "Frontend",
+    "custom er": "customer",
+    "stake holder": "stakeholder",
+    "me et": "meet",
+    "S olution": "Solution",
+    "Un it est": "Unit test",
+    "C it izenTest": "CitizenTest",
+    "special ty care": "specialty care",
+    "Vict or": "Victor",
+    "agent ic": "agentic",
+    "h arness": "harness",
+    "wardDe ploy Product Manager": "Forward Deploy Product Manager",
+    "out come": "outcome",
+    "Pay out": "Payout",
+    "C - level": "C-level",
+    "bud get": "budget",
+    "up sell": "upsell",
+    "data break": "Databricks",
+    "platform wise": "platform-wise",
+    "inst ruction": "instruction",
+    "Engine er": "Engineer",
+    "G it Hub": "GitHub",
+    "For ceTech": "Force Tech",
+    "s ession": "session",
+    "C TO": "CTO",
+    "CEO C TO": "CEO CTO",
+    "weekly meet up": "weekly meetup",
+    "CIUD engineer": "CI/CD engineer",
+    "out compete": "outcompete",
+    "trade off": "trade-off",
+    "矽谷": "硅谷",
+}
+
+COMMON_LATIN_TOKENS = {
+    "ai", "agent", "agents", "api", "aws", "azure", "bedrock", "big",
+    "care", "case", "ceo", "cloud", "code", "codex", "cto", "data",
+    "demo", "engineer", "engineering", "fde", "fdpm", "focus", "founder",
+    "full", "health", "late", "management", "micro", "mode", "native",
+    "openai", "palantir", "research", "rest", "skill", "soft", "splunk",
+    "stack", "stage", "team", "test", "use", "ventus", "on", "and",
+    "the", "of", "to", "in", "for", "with", "as", "at", "by", "or",
+    "be", "is", "are", "it", "its", "this", "that", "from", "not",
+    "we", "you", "they", "our", "out", "up", "off", "over", "under",
+    "all", "any", "can", "will", "just", "now", "new", "one", "two",
+    "get", "got", "let", "may", "say", "see", "she", "he", "his",
+    "her", "them", "their", "there", "then", "than", "when", "where",
+    "why", "how", "who", "what", "which", "while", "about", "after",
+    "before", "again", "once", "here", "some", "such", "only", "own",
+    "same", "too", "very", "should", "because", "into", "through",
+    "during", "above", "below", "between", "other", "most", "more",
+    "few", "both", "each", "been", "were", "have", "has", "had",
+    "does", "did", "doing", "a", "an", "i", "me", "my", "so", "if",
+    "no", "yes", "ok",
+    "offer", "gap", "onsite", "swift", "gpu", "mcp", "uat", "kpi",
+    "compete", "scientist",
+}
+
+PRESERVE_LATIN_RUNS = {
+    "AI Agent FDE",
+    "AI receptionist",
+    "AI architect",
+    "AI builders",
+    "AI engine",
+    "AI transformation",
+    "enterprise AI",
+    "grounded AI",
+    "voice AI",
+    "using AI",
+    "agentic core",
+    "LLM workflow",
+    "Kubernetes infra",
+    "low-hanging fruit",
+    "Codex CLI",
+    "ChatGPT",
+    "A2A",
+    "lessons learned",
+    "make hard decisions",
+    "AI native",
+    "AI agent",
+    "AI Agent",
+    "AI agents",
+    "AI FDE",
+    "AI Research",
+    "AI Engineer",
+    "AI coding",
+    "AI coding AI",
+    "AI Teammates",
+    "build business",
+    "top down",
+    "web coding",
+}
+
+WORD_NINJA_DISPLAYS = {
+    "anthropic": "Anthropic",
+    "vincent": "Vincent",
+    "ventusai": "Ventus AI",
+    "cofounder": "Co-Founder",
+    "palantir": "Palantir",
+    "rollingai": "Rolling AI",
+    "openai": "OpenAI",
+    "openaianthropic": "OpenAI Anthropic",
+    "fde": "FDE",
+    "mbb": "MBB",
+    "vce": "VC",
+    "sop": "SOP",
+    "saas": "SaaS",
+    "btc": "BTC",
+    "mbti": "MBTI",
+    "enfp": "ENFP",
+    "p2p": "P2P",
+    "agentharness": "Agent Harness",
+    "businessbuilder": "Business Builder",
+    "forwarddeployed": "Forward Deployed",
+    "applicationai": "application AI",
+    "koji": "Koji",
+    "platinum": "Platinum",
+    "onboarding": "onboarding",
+    "input": "input",
+    "bottomup": "bottom up",
+    "shadow": "shadow",
+    "agent": "agent",
+    "engineering": "engineering",
+    "taste": "taste",
+    "feeling": "feeling",
+    "calculate": "calculate",
+    "lead": "lead",
+    "sense": "sense",
+    "judgment": "judgment",
+    "upside": "upside",
+    "exactly": "exactly",
+    "problemsolver": "problem solver",
+    "token": "token",
+    "enabler": "enabler",
+    "battle": "battle",
+    "resultasaservice": "result as a service",
+    "mercer": "Mercer",
+    "essential": "essential",
+    "owner": "owner",
+    "software": "software",
+    "infra": "infra",
+    "gpc35devin7": "GPT 3.5 Devin 7",
+    "paperwork": "paperwork",
+}
+
+
+PRESERVE_ENGLISH_TOKENS = {
+    "palantir", "tribeca", "staples", "meritocracy", "fellowship",
+    "westport", "connecticut", "sahana", "crawford", "ezra", "schwartz",
+    "isaac", "elia", "ohio", "penn", "bay", "york",
+}
+
+ENGLISH_SPACING_FIXES = (
+    (r"\bpalant ir\b", "Palantir"),
+    (r"\bise it\b", "is it"),
+    (r"\bis e it\b", "is it"),
+    (r"\bihope were main colleagues\b", "I hope we remain colleagues"),
+    (r"\bidea 2 action\b", "idea to action"),
+    (r"\biwould beat\b", "I would be at"),
+    (r"\bbetakinga\b", "be taking a"),
+    (r"\bbetaking\b", "be taking"),
+    (r"\bbeatpenn\b", "be at Penn"),
+    (r"\bisawagroup\b", "I saw a group"),
+    (r"\blikennorth\b", "like north"),
+    (r"\bahalf\b", "a half"),
+    (r"\bgoto\b", "go to"),
+    (r"\bhighschool\b", "high school"),
+    (r"\bknowhow\b", "know how"),
+    (r"\bnoone\b", "no one"),
+    (r"\bthankyou\b", "thank you"),
+    (r"\bthusfar\b", "thus far"),
+    (r"\bwhata i\b", "what AI"),
+    (r"\bwhata\b", "what a"),
+    (r"\blikeboom\b", "like boom"),
+    (r"\bfailquick\b", "fail quick"),
+    (r"\bpalantirandi\b", "Palantir and I"),
+    (r"\bpalantiris\b", "Palantir is"),
+)
+
+
+_SPEAKER_LABEL_NAME_WORD = (
+    r"(?!And\b|But\b|The\b|Well\b|Okay\b|So\b|Yeah\b|Wait\b|"
+    r"What(?:'s)?\b|You\b|It(?:'s)?\b|I\b|Mrs\.?\b|Mr\.?\b|Ms\.?\b|Dr\.?\b)"
+    r"[A-Z][a-z][A-Za-z'’-]*"
+)
+_SPEAKER_LABEL_RE = re.compile(
+    r"(?P<label>"
+    rf"{_SPEAKER_LABEL_NAME_WORD}(?:\s+{_SPEAKER_LABEL_NAME_WORD}){{1,2}}"
+    r")"
+    r"(?P<suffix>(?:,\s*(?:Jr\.?|Sr\.?|II|III))?)"
+    r"(?P<sep>\s*:\s*|\s+)",
+)
+
+
+def _remove_speaker_labels(value: str, speaker_names=None) -> str:
+    """Remove Whisper's inserted speaker labels from English transcript text."""
+    value = str(value or "")
+    if not value:
+        return value
+
+    pieces = []
+    cursor = 0
+    for match in _SPEAKER_LABEL_RE.finditer(value):
+        remainder_start = match.end()
+        remainder = value[remainder_start:]
+        separator = match.group("sep") or ""
+        if ":" not in separator and not (remainder and remainder[0].isupper()):
+            continue
+        pieces.append(value[cursor:match.start("label")])
+        cursor = remainder_start
+
+    if cursor != 0:
+        pieces.append(value[cursor:])
+        value = re.sub(r"\s+", " ", "".join(pieces)).strip()
+
+    if speaker_names:
+        for name in speaker_names:
+            value = re.sub(
+                rf"(?<=,)\s*{re.escape(name)}\s*,\s*",
+                " ",
+                value,
+            )
+            value = re.sub(rf"^\s*{re.escape(name)}\s*,\s*", "", value)
+    return value
+
+
+def _repeated_speaker_label_first_names(segments_list):
+    """Find first names from repeated pseudo speaker labels.
+
+    Whisper sometimes inserts a full pseudo label in several segments and later
+    uses only its first name as a vocative. Repeated full labels provide enough
+    evidence to remove that later vocative without hard-coding a name.
+    """
+    label_counts = {}
+    for segment in segments_list:
+        value = str(get_v(segment, "text", "") or "")
+        for match in _SPEAKER_LABEL_RE.finditer(value):
+            remainder = value[match.end():]
+            separator = match.group("sep") or ""
+            if ":" not in separator and not (remainder and remainder[0].isupper()):
+                continue
+            label = match.group("label")
+            label_counts[label] = label_counts.get(label, 0) + 1
+
+    return {
+        label.split()[0]
+        for label, count in label_counts.items()
+        if count >= 2
+    }
+
+
+def _restore_english_spacing(value: str) -> str:
+    """Restore spaces lost by Whisper in English word tokens."""
+    if not value:
+        return value
+
+    for pattern, replacement in ENGLISH_SPACING_FIXES:
+        value = re.sub(pattern, replacement, value, flags=re.IGNORECASE)
+
+    value = re.sub(
+        r"(?i)\b([a-z]+(?:'|’)(?:s|re|ve|ll|d|m|t))([a-z]{2,})\b",
+        r"\1 \2",
+        value,
+    )
+    value = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", value)
+
+    if wordninja is None:
+        return value
+
+    repaired_tokens = []
+    for raw_token in value.split():
+        match = re.match(r"^([^A-Za-z0-9]*)(.*?)([^A-Za-z0-9]*)$", raw_token)
+        if not match:
+            repaired_tokens.append(raw_token)
+            continue
+        prefix, core, suffix = match.groups()
+        compact = re.sub(r"[^A-Za-z0-9]", "", core)
+        if (
+            not compact
+            or compact.lower() in PRESERVE_ENGLISH_TOKENS
+            or "'" in core
+            or "’" in core
+        ):
+            repaired_tokens.append(raw_token)
+            continue
+
+        split = wordninja.split(compact)
+        should_split = len(split) > 1 and (
+            compact[0].islower()
+            or (compact[:1] == "I" and split[0].lower() == "i")
+        )
+        if not should_split:
+            repaired_tokens.append(raw_token)
+            continue
+
+        if compact[:1] == "I":
+            split[0] = "I"
+        elif compact[:1].isupper() and split:
+            split[0] = split[0].capitalize()
+        repaired_tokens.append(prefix + " ".join(split) + suffix)
+
+    value = " ".join(repaired_tokens)
+    value = re.sub(r"(?<![A-Za-z])a i(?![A-Za-z])", "AI", value, flags=re.IGNORECASE)
+    value = re.sub(r"(?<![A-Za-z])i(?![A-Za-z])", "I", value)
+    return value
+
+
+def _contains_kana(text: str) -> bool:
+    return any(0x3040 <= ord(char) <= 0x30FF for char in text)
+
+
+def _contains_hangul(text: str) -> bool:
+    return any(0xAC00 <= ord(char) <= 0xD7AF for char in text)
+
+
+def _contains_cjk_ideograph(text: str) -> bool:
+    return any(0x4E00 <= ord(char) <= 0x9FFF for char in text)
+
+
+def detect_primary_language(segments_list):
+    """Return the dominant transcript language from text and explicit labels."""
+    if not segments_list:
+        return "en"
+
+    explicit = {}
+    text = ""
+    for segment in segments_list:
+        segment_text = str(get_v(segment, "text", "") or "")
+        text += segment_text + " "
+        lang = get_v(segment, "lang", None)
+        if lang:
+            explicit[lang] = explicit.get(lang, 0) + max(1.0, len(segment_text))
+
+    if explicit:
+        return max(explicit, key=explicit.get)
+    if _contains_hangul(text):
+        return "ko"
+    if _contains_kana(text):
+        return "ja"
+    cjk_count = sum(1 for char in text if 0x4E00 <= ord(char) <= 0x9FFF)
+    latin_count = sum(1 for char in text if char.isascii() and char.isalpha())
+    return "zh" if cjk_count > latin_count else "en"
+
+
+def normalize_transcript_text(
+    text,
+    simplify_chinese=True,
+    normalize_latin_runs=True,
+    speaker_names=None,
+):
+    """Normalize ASR output for Chinese subtitles and mixed-language terms."""
+    value = str(text or "").strip()
+    if not value:
+        return value
+
+    if not simplify_chinese:
+        value = _remove_speaker_labels(value, speaker_names=speaker_names)
+
+    if simplify_chinese and _T2S_CONVERTER is not None and _contains_cjk_ideograph(value) and not _contains_kana(value):
+        value = _T2S_CONVERTER.convert(value)
+
+    value = re.sub(r"\s+", " ", value)
+
+    for wrong, correct in sorted(ASR_FRAGMENT_FIXES.items(), key=lambda item: len(item[0]), reverse=True):
+        if wrong in value:
+            value = value.replace(wrong, correct)
+
+    value = value.replace(" - ", "-")
+
+    value = re.sub(
+        r"(?<![A-Za-z])a i(?![A-Za-z])",
+        "AI",
+        value,
+        flags=re.IGNORECASE,
+    )
+
+    def _normalize_latin_run(match):
+        run = match.group(0)
+        if run in PRESERVE_LATIN_RUNS:
+            return run
+        if wordninja is None:
+            return run
+        compact = re.sub(r"[^A-Za-z0-9]", "", run).lower()
+        if compact in WORD_NINJA_DISPLAYS:
+            return WORD_NINJA_DISPLAYS[compact]
+        split = wordninja.split(compact)
+        if [token.lower() for token in run.split()] == split:
+            return run
+        return " ".join(split)
+
+    if normalize_latin_runs:
+        value = re.sub(
+            r"(?<![A-Za-z0-9])[A-Za-z][A-Za-z0-9-]*(?: [A-Za-z0-9][A-Za-z0-9-]*)+(?![A-Za-z0-9])",
+            _normalize_latin_run,
+            value,
+        )
+
+    if not normalize_latin_runs:
+        return _restore_english_spacing(value).strip()
+
+    def _is_fragment(token):
+        clean = re.sub(r"[^A-Za-z0-9]", "", token)
+        if not clean or clean.isdigit():
+            return False
+        if clean.lower() in COMMON_LATIN_TOKENS:
+            return False
+        return len(clean) <= 5
+
+    def _merge_latin_run(match):
+        if match.group(0) in PRESERVE_LATIN_RUNS:
+            return match.group(0)
+        tokens = match.group(0).split(" ")
+        merged = []
+        index = 0
+
+        def _should_merge(left, right):
+            left_clean = re.sub(r"[^A-Za-z0-9]", "", left)
+            right_clean = re.sub(r"[^A-Za-z0-9]", "", right)
+            if not left_clean or not right_clean:
+                return False
+            return (
+                (_is_fragment(left) and _is_fragment(right))
+                or (len(left_clean) == 1 and _is_fragment(right))
+                or (len(right_clean) == 1 and _is_fragment(left))
+            )
+
+        while index < len(tokens):
+            token = tokens[index]
+            if index + 1 < len(tokens) and _should_merge(token, tokens[index + 1]):
+                combined = token + tokens[index + 1]
+                index += 1
+                while index + 1 < len(tokens) and _should_merge(combined, tokens[index + 1]):
+                    combined += tokens[index + 1]
+                    index += 1
+                merged.append(combined)
+                index += 1
+                continue
+            merged.append(token)
+            index += 1
+        return " ".join(merged)
+
+    value = re.sub(
+        r"(?<![A-Za-z0-9])[A-Za-z][A-Za-z0-9-]*(?: [A-Za-z][A-Za-z0-9-]*)+(?![A-Za-z0-9])",
+        _merge_latin_run,
+        value,
+    )
+
+    if not simplify_chinese:
+        value = _restore_english_spacing(value)
+
+    cjk = r"[\u3400-\u4DBF\u4E00-\u9FFF\u3000-\u303F\uFF00-\uFFEF]"
+    latin = r"[A-Za-z0-9]"
+    value = re.sub(rf"({cjk})\s+({latin})", r"\1\2", value)
+    value = re.sub(rf"({latin})\s+({cjk})", r"\1\2", value)
+    value = re.sub(rf"({cjk})\s+({cjk})", r"\1\2", value)
+    return value.strip()
+
+
+def _realignment_tokens(text):
+    """Split normalized text at CJK/Latin boundaries while keeping punctuation."""
+    tokens = []
+    current = ""
+    previous_kind = None
+
+    def _kind(char):
+        if 0x3400 <= ord(char) <= 0x4DBF or 0x4E00 <= ord(char) <= 0x9FFF:
+            return "cjk"
+        if char.isascii() and (char.isalnum() or char in "-_"):
+            return "latin"
+        return "other"
+
+    for char in str(text or ""):
+        if char.isspace():
+            if current:
+                tokens.append(current)
+                current = ""
+                previous_kind = None
+            continue
+
+        kind = _kind(char)
+        if (
+            current
+            and previous_kind in ("cjk", "latin")
+            and kind in ("cjk", "latin")
+            and kind != previous_kind
+        ):
+            tokens.append(current)
+            current = ""
+
+        current += char
+        if kind in ("cjk", "latin"):
+            previous_kind = kind
+
+    if current:
+        tokens.append(current)
+    combined = []
+    index = 0
+    while index < len(tokens):
+        if (
+            index + 1 < len(tokens)
+            and tokens[index].casefold() == "ai"
+            and tokens[index + 1].casefold() == "agent"
+        ):
+            combined.append(tokens[index] + " " + tokens[index + 1])
+            index += 2
+            continue
+        combined.append(tokens[index])
+        index += 1
+    return combined
+
+
+def _realign_segment_words(segment):
+    """Restore display words after Whisper splits mixed-language terms.
+
+    Faster-whisper can emit ``J + ove`` or ``C + rest + a`` as word tokens while
+    keeping the correct spelling in segment.text. Chunking later joins those
+    word tokens with spaces, producing fragments such as ``J ove``. Align the
+    raw word timestamps to normalized display tokens so timing is preserved
+    without inheriting the tokenizer's subword boundaries.
+    """
+    text = str(get_v(segment, "text", "") or "").strip()
+    words = segment.get("words", []) if isinstance(segment, dict) else None
+    if not text or not words:
+        return
+
+    raw_compact = "".join(
+        re.sub(r"\s+", "", str(get_v(word, "word", "") or "")).casefold()
+        for word in words
+    )
+    text_compact = re.sub(r"\s+", "", text).casefold()
+    display_tokens = _realignment_tokens(text)
+    if not raw_compact or not display_tokens or raw_compact != text_compact:
+        segment_start = get_v(segment, "start", 0)
+        segment_end = get_v(segment, "end", segment_start)
+        duration = max(0.0, segment_end - segment_start)
+        total_len = sum(len(re.sub(r"\s+", "", token)) for token in display_tokens)
+        if total_len <= 0:
+            return
+
+        synthetic = []
+        consumed = 0
+        for token in display_tokens:
+            token_len = len(re.sub(r"\s+", "", token))
+            start = segment_start + duration * (consumed / total_len)
+            end = segment_start + duration * ((consumed + token_len) / total_len)
+            synthetic.append({"start": start, "end": end, "word": token})
+            consumed += token_len
+        segment["words"] = synthetic
+        return
+
+    realigned = []
+    raw_index = 0
+
+    for token in display_tokens:
+        token_len = len(re.sub(r"\s+", "", token))
+        consumed = 0
+        group = []
+
+        while raw_index < len(words) and consumed < token_len:
+            raw_word = words[raw_index]
+            raw_text = str(get_v(raw_word, "word", "") or "")
+            raw_len = len(re.sub(r"\s+", "", raw_text))
+            if raw_len == 0:
+                raw_index += 1
+                continue
+
+            group.append(raw_word)
+            consumed += raw_len
+            raw_index += 1
+
+        if not group:
+            continue
+
+        first = dict(group[0])
+        first["word"] = token
+        first["start"] = get_v(group[0], "start")
+        first["end"] = get_v(group[-1], "end")
+        realigned.append(first)
+
+    if realigned:
+        segment["words"] = realigned
+
+
+def normalize_segments_for_output(segments_list):
+    language = detect_primary_language(segments_list)
+    simplify = language == "zh"
+    speaker_names = _repeated_speaker_label_first_names(segments_list)
+    for segment in segments_list:
+        segment["text"] = normalize_transcript_text(
+            segment.get("text", ""),
+            simplify_chinese=simplify,
+            normalize_latin_runs=(language != "en"),
+            speaker_names=speaker_names,
+        )
+        _realign_segment_words(segment)
+    return language, segments_list
+
+
+def normalize_chunk_boundaries(chunks):
+    """Fix ASR terms that were split across adjacent subtitle blocks."""
+    for i in range(len(chunks) - 1):
+        tail = str(get_v(chunks[i], "text", "") or "")
+        head = str(get_v(chunks[i + 1], "text", "") or "")
+        if not tail or not head:
+            continue
+        combined = tail + " " + head
+        boundary = len(tail)
+        for wrong, correct in sorted(ASR_FRAGMENT_FIXES.items(), key=lambda item: len(item[0]), reverse=True):
+            start = combined.find(wrong)
+            if start < 0:
+                continue
+            end = start + len(wrong)
+            if not (start < boundary and end > boundary):
+                continue
+            prefix = combined[:start]
+            suffix = combined[end:]
+            chunks[i].text = (prefix + correct).strip()
+            if suffix.strip():
+                chunks[i + 1].text = suffix.strip()
+            else:
+                chunks[i].end = chunks[i + 1].end
+                del chunks[i + 1]
+            break
+    return chunks
+
 def _clamp_language(lang):
     """Clamp detected language to the allowed set. Falls back to 'en' for
     anything exotic (Welsh, Portuguese, etc.) to prevent hallucinations."""
@@ -177,11 +936,14 @@ def chunk_segments(segments_list, content_type=None):
             return bool(ch) and (0x3000 <= ord(ch) <= 0x9FFF or 0xFF00 <= ord(ch) <= 0xFFEF)
         if _is_cjk(last_char) or _is_cjk(first_char):
             return t1 + t2
-        # Don't insert space between single English letters — they are
-        # likely split acronym tokens (e.g. "F" + "D" + "E" = "FDE",
-        # not "F D E"). Whisper splits acronyms into single-char tokens
-        # when transcribing Japanese with word_timestamps=True.
-        if len(t2.strip()) == 1 and t2.strip().isalpha() and last_char.isalpha():
+        # Only join runs of single-letter tokens. A lone English article or
+        # pronoun ("is a", "and I") must keep its space.
+        if (
+            len(t1.strip()) == 1
+            and len(t2.strip()) == 1
+            and t1.strip().isalpha()
+            and t2.strip().isalpha()
+        ):
             return t1 + t2
         return t1 + ' ' + t2
 
@@ -262,6 +1024,53 @@ def get_duration(file_path):
                 return float(h) * 3600 + float(m) * 60 + float(s)
     except: pass
     return 0
+
+
+def _extract_audio_chunk(file_path, start, duration):
+    """Extract a real WAV chunk for long-video transcription.
+
+    ``clip_timestamps`` can make faster-whisper silently skip audio inside a
+    clip range. Extracting the exact range with ffmpeg first avoids that
+    failure mode while still keeping transcription resumable.
+    """
+    import tempfile
+
+    handle, wav_path = tempfile.mkstemp(suffix=".wav", prefix="autosub_chunk_")
+    os.close(handle)
+    cmd = [
+        FFMPEG_EXE,
+        "-y",
+        "-ss",
+        f"{float(start):.3f}",
+        "-t",
+        f"{float(duration):.3f}",
+        "-i",
+        file_path,
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-f",
+        "wav",
+        wav_path,
+    ]
+    try:
+        subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+            timeout=max(60, int(duration) + 30),
+        )
+        return wav_path
+    except (subprocess.SubprocessError, OSError):
+        try:
+            os.remove(wav_path)
+        except OSError:
+            pass
+        return None
+
 
 def show_notification(title, message):
     try: 
@@ -678,6 +1487,7 @@ def main():
     parser.add_argument("--quick", action="store_true", help="Experimental: Quick Transcribe (YouTube Subs + LLM)")
     parser.add_argument("--language", default=None, help="Source language code (e.g. ja, en, zh). Auto-detect if omitted.")
     parser.add_argument("--multilang", action="store_true", help="Enable per-segment language detection for mixed-language videos")
+    parser.add_argument("--rebuild-only", action="store_true", help="Rebuild SRT from transcribe_state.json without transcribing")
     args = parser.parse_args()
 
     file_path = os.path.abspath(args.file)
@@ -799,7 +1609,11 @@ def main():
             print(f"🌐 Multi-language detection enabled (per-segment auto-detect, condition_on_previous_text=False)")
 
         # --- High-level Skip: If already finished, don't even start the engine ---
-        if total_duration > 0 and clip_start >= total_duration - 1.0:
+        if args.rebuild_only:
+            print("♻️ Rebuilding SRT from the existing checkpoint.", flush=True)
+            segments = []
+            skip_loop_progress = True
+        elif total_duration > 0 and clip_start >= total_duration - 1.0:
             print(f"✅ Transcription already completed ({clip_start:.1f}s / {total_duration:.1f}s). Skipping to output.", flush=True)
             segments = []
         else:
@@ -832,17 +1646,35 @@ def main():
                 chunk_start = float(clip_start)
                 while chunk_start < total_duration:
                     chunk_end = min(chunk_start + CHUNK_SEC, total_duration)
-                    chunk_kwargs = dict(kwargs)
-                    chunk_kwargs.pop("clip_timestamps", None)
-                    chunk_kwargs["clip_timestamps"] = [float(chunk_start), float(chunk_end)]
-                    chunk_kwargs.pop("vad_filter", None)
-                    chunk_kwargs["vad_filter"] = False
+                    chunk_duration = chunk_end - chunk_start
+                    wav_path = _extract_audio_chunk(
+                        file_path,
+                        chunk_start,
+                        chunk_duration,
+                    )
+                    if not wav_path:
+                        raise RuntimeError(
+                            f"ffmpeg failed to extract audio chunk "
+                            f"{chunk_start:.0f}-{chunk_end:.0f}s"
+                        )
                     pct = round((chunk_start / total_duration) * 100, 1)
                     print(f"Progress: {pct}% (Transcribing {chunk_start:.0f}-{chunk_end:.0f}s)", flush=True)
-                    seg_iter, info = model.transcribe(file_path, **chunk_kwargs)
+                    chunk_kwargs = dict(kwargs)
+                    chunk_kwargs.pop("clip_timestamps", None)
+                    chunk_kwargs.pop("vad_filter", None)
+                    chunk_kwargs["vad_filter"] = True
+                    # Each WAV chunk already starts fresh. Carrying prior text
+                    # inside a long chunk can inject unrelated speaker names.
+                    chunk_kwargs["condition_on_previous_text"] = False
+                    seg_iter, info = model.transcribe(wav_path, **chunk_kwargs)
                     # Iterate generator one segment at a time so each segment
                     # is checkpointed immediately (enables resume + progress).
                     for s in seg_iter:
+                        s.start += chunk_start
+                        s.end += chunk_start
+                        for word in s.words or []:
+                            word.start += chunk_start
+                            word.end += chunk_start
                         segments.append(s)
                         segments_list.append(serialize_segment(s))
                         s_end = getattr(s, 'end', 0) or 0
@@ -852,6 +1684,7 @@ def main():
                         if len(segments_list) % 2 == 0:
                             save_checkpoint(checkpoint_path, segments_list)
                     save_checkpoint(checkpoint_path, segments_list)
+                    os.remove(wav_path)
                     chunk_start = chunk_end
                 skip_loop_progress = True
             else:
@@ -900,9 +1733,16 @@ def main():
             print(f"Progress: 100.0% (Transcription finished successfully)", flush=True)
         if not detected_style: detected_style = detect_content_type(segments_list)
 
+        primary_language, segments_list = normalize_segments_for_output(segments_list)
+        save_checkpoint(checkpoint_path, segments_list)
+        print(f"🌐 Primary transcript language: {primary_language}")
+
         srt_path = os.path.join(output_dir, os.path.splitext(os.path.basename(file_path))[0] + ".srt")
         with open(srt_path, "w", encoding="utf-8") as f:
-            for i, segment in enumerate(chunk_segments(segments_list, detected_style)):
+            output_chunks = normalize_chunk_boundaries(
+                list(chunk_segments(segments_list, detected_style))
+            )
+            for i, segment in enumerate(output_chunks):
                 def fmt(t):
                     if t is None: t = 0
                     h, m, s, ms = int(t//3600), int((t%3600)//60), int(t%60), int((t%1)*1000)

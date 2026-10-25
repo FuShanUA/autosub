@@ -3,7 +3,7 @@
     "output_dir": "",
     "vendor": "Alibaba (Bailian)",
     "llm_vendor": "Alibaba (Bailian)",
-    "llm_model": "glm-5.3",
+    "llm_model": "glm-5.2",
     "trans_mode": "balanced",
     "quality": "high",
     "layout": "bilingual",
@@ -21,11 +21,16 @@
     "quick": false,
     "multilang": false,
     "remove_ads": false,
+    "ad_detector": "auto",
+    "ad_cut_mode": "auto",
     "sync_gdrive": "18iAFFSuHQmZlxVN0dri1Gbje9SmpS96f",
     "gdrive_enabled": true,
+    "transcription_enabled": true,
+    "translation_enabled": true,
+    "upload_enabled": true,
     "wechat_enabled": true,
     "wechat_public": false,
     "vendor_default_models": {
-        "Alibaba (Bailian)": "glm-5.3"
+        "Alibaba (Bailian)": "glm-5.2"
     }
 }

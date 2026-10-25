@@ -13,4 +13,8 @@ google-auth-oauthlib
 tqdm
 psutil
 playwright
+customtkinter
+ttkbootstrap
+opencc-python-reimplemented
+wordninja
 pyobjc-framework-cocoa; sys_platform == "darwin"

@@ -850,6 +850,11 @@ def is_untranslated(block: Dict) -> bool:
         # legitimately retain a short Korean proper noun).
         if korean_chars and korean_chars > chinese_chars:
             return True
+        # Credit lines can retain several English names plus one mixed-case
+        # brand such as iHeart. Once the Chinese body is substantial, that is
+        # a translation, not an untranslated source block.
+        if chinese_chars >= 8 and len(non_proper_english) <= 1:
+            return False
         # Partially translated: mostly English with a few Chinese chars
         # (typically from terminology pre-replacement that injected Chinese).
         # Check both absolute count AND ratio: if English words outnumber CJK
@@ -857,7 +862,10 @@ def is_untranslated(block: Dict) -> bool:
         if (
             english_words >= 3
             and not (not non_proper_english and chinese_chars >= 2)
-            and (chinese_chars < english_words or english_chars_ratio(text) > 0.6)
+            and (
+                chinese_chars < english_words
+                or english_chars_ratio_excluding_urls(text) > 0.6
+            )
         ):
             return True
         return False
@@ -878,6 +886,18 @@ def english_chars_ratio(text: str) -> float:
     if not alpha:
         return 0.0
     return sum(1 for c in alpha if ord(c) < 128) / len(alpha)
+
+
+_URL_OR_DOMAIN_RE = re.compile(
+    r"\b(?:https?://|www\.)?[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}"
+    r"(?:/[^\s，。；）)]*)?",
+    re.IGNORECASE,
+)
+
+
+def english_chars_ratio_excluding_urls(text: str) -> float:
+    """Measure ordinary English without counting URLs or domain names."""
+    return english_chars_ratio(_URL_OR_DOMAIN_RE.sub(" ", text))
 
 
 def parse_translated_lines(result_text: str) -> Dict[str, str]:
@@ -1374,7 +1394,9 @@ def _llm_alignment_check(final_blocks: List[Dict], source_lines: Dict[str, str],
         print("Progress: 98.5% (Quality deadline reached; skipping LLM alignment check)", flush=True)
         return final_blocks
 
-    BATCH_SIZE = 10
+    # Smaller batches plus adjacent-source context make block-shift errors
+    # much easier for the model to see than a long list of isolated pairs.
+    BATCH_SIZE = 5
     total = len(final_blocks)
     tasks = []
 
@@ -1386,11 +1408,13 @@ def _llm_alignment_check(final_blocks: List[Dict], source_lines: Dict[str, str],
             idx = str(b['index'])
             en = source_lines.get(idx, " ".join(b.get('lines', [])))
             cn = " ".join(b.get('lines', []))
+            prev_en = source_lines.get(str(final_blocks[i + j - 1]['index']), "") if i + j > 0 else ""
+            next_en = source_lines.get(str(final_blocks[i + j + 1]['index']), "") if i + j + 1 < len(final_blocks) else ""
             # Skip blocks that are still untranslated English (no CJK)
             if not re.search(r'[\u4e00-\u9fff]', cn):
-                pairs_str += f"[{seq}] EN: {en}\n    CN: [UNTRANSLATED]\n"
+                pairs_str += f"[{seq}] PREVIOUS EN: {prev_en}\n    EN: {en}\n    NEXT EN: {next_en}\n    CN: [UNTRANSLATED]\n"
             else:
-                pairs_str += f"[{seq}] EN: {en}\n    CN: {cn}\n"
+                pairs_str += f"[{seq}] PREVIOUS EN: {prev_en}\n    EN: {en}\n    NEXT EN: {next_en}\n    CN: {cn}\n"
 
         prompt = f"""You are a bilingual subtitle alignment checker. For each pair below,
 determine if the Chinese (CN) translation corresponds to the English (EN) source text.
@@ -1406,7 +1430,10 @@ than the EN - for example:
   - The CN seems to be translating the NEXT or PREVIOUS block's English instead of its own
   - The CN and EN share no common meaning at all
 
-Be conservative: when in doubt, consider it aligned. Only flag obvious mismatches.
+Be conservative about wording differences, but do NOT be conservative about block order.
+For every pair, compare the CN with its own EN and with the PREVIOUS/NEXT EN.
+If the CN translates an adjacent block's content better than its own EN, flag it.
+Also flag a run of pairs where the CN is consistently one block ahead or behind.
 
 Pairs:
 {pairs_str}
@@ -1736,9 +1763,6 @@ def main():
     else:
         print("   No ad segments detected.")
 
-    total_chunks = math.ceil(len(blocks) / args.chunk_size)
-    print(f"   Total Blocks: {len(blocks)} -> {total_chunks} Chunks")
-
     translated_map = {}
     if os.path.exists(cache_path):
         try:
@@ -1768,7 +1792,8 @@ def main():
         # 2. Process Chunks Concurrently
         tasks = []
         chunk_size = args.chunk_size
-        num_untranslated_chunks = math.ceil(len(untranslated_blocks) / chunk_size)
+        total_chunks = math.ceil(len(untranslated_blocks) / chunk_size)
+        print(f"   Untranslated Blocks: {len(untranslated_blocks)} -> {total_chunks} Chunks")
 
     # Initialize default snippets for safety
     target_model = args.model
@@ -1855,19 +1880,30 @@ def main():
     - Focus on sense-for-sense paraphrasing. Explain metaphors and add cultural/contextual background if it helps the domestic audience understand the subtext.
     """
 
-        print(f"📦 Preparing {total_chunks} chunks for parallel processing...")
-
         tasks = []
+        chunks_with_untranslated = 0
+        block_positions = {
+            str(block["index"]): position
+            for position, block in enumerate(blocks)
+        }
         for i in range(total_chunks):
             start = i * args.chunk_size
-            end = min((i + 1) * args.chunk_size, len(blocks))
-            chunk = blocks[start:end]
+            end = min((i + 1) * args.chunk_size, len(untranslated_blocks))
+            chunk = untranslated_blocks[start:end]
+            chunks_with_untranslated += 1
 
             # Construct Prompt string here in main loop to be thread-safe/independent
             input_text = ""
             for block in chunk:
                 text = " ".join(block['lines']).replace("\n", " ").strip()
                 input_text += f"[{block['index']}] {text}\n"
+
+            context_text = ""
+            for block in chunk:
+                position = block_positions.get(str(block["index"]), 0)
+                context_text += _target_context_string(
+                    source_lines, blocks, position
+                )
 
             prompt = f"""
     You are an expert subtitle translator and editor.
@@ -1890,6 +1926,7 @@ def main():
     ### STEP 4: CONTEXT AWARENESS
     INPUT BLOCK:
     {input_text}
+            {context_text}
 
     ### OUTPUT FORMAT:
     [ID] Translated Text
@@ -1900,6 +1937,10 @@ def main():
                 'chunk': chunk,
                 'prompt': prompt
             })
+        print(
+            f"📦 Preparing {chunks_with_untranslated}/{total_chunks} chunk(s) "
+            "that still contain untranslated blocks..."
+        )
 
         # Execute Batch
         try:
@@ -1942,10 +1983,9 @@ def main():
                 err_detail = errors[0][:200] if errors else "No error details captured."
                 print(
                     f"\n❌ FATAL: All {len(results)} translation chunks failed — "
-                    f"LLM provider is unreachable. Aborting.\n   Error: {err_detail}",
+                    f"LLM provider is unreachable. Falling back to smaller retries.\n   Error: {err_detail}",
                     flush=True,
                 )
-                sys.exit(1)
 
             # Sort results by index to ensure correct subtitle order
             results.sort(key=lambda x: x['index'])

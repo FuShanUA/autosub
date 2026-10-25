@@ -16,6 +16,7 @@ from rich.console import Console
 from rich.prompt import Prompt, Confirm
 from rich.table import Table
 from rich.panel import Panel
+from rich.text import Text
 from rich import box
 from rich.cells import cell_len
 
@@ -118,7 +119,15 @@ INITIAL_COOKIES_PATH = discover_initial_cookies()
 # CRITICAL: Use the exact same python executable that is running this launcher
 PYTHON_EXE = sys.executable
 
-console = Console()
+def _rich_environ():
+    """Give Rich a usable TERM so dumb-terminal fallback does not lock 80 columns."""
+    env = dict(os.environ)
+    if env.get("TERM") in (None, "", "dumb"):
+        env["TERM"] = "xterm-256color"
+    return env
+
+
+console = Console(_environ=_rich_environ())
 
 # Set AppUserModelID for taskbar icon grouping
 if sys.platform == "win32":
@@ -153,9 +162,30 @@ _ZERO_WIDTH_RE = re.compile(
     r'[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFE00-\uFE0F\u200D\u00AD]'
 )
 
+_TITLE_REPLACEMENTS = {
+    '\u2014': '--',
+    '\u2013': '-',
+    '\u2018': "'",
+    '\u2019': "'",
+    '\u201c': '"',
+    '\u201d': '"',
+    '\u2026': '...',
+}
+
+_ANSI_ESCAPE_RE = re.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')
+
+_CONTROL_CHARS_RE = re.compile(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]')
+
 def sanitize_title(s: str) -> str:
-    """Strip zero-width and formatting characters that break grid alignment."""
-    return _ZERO_WIDTH_RE.sub('', str(s))
+    """Normalize display text so terminal and Rich agree on its width."""
+    s = _ANSI_ESCAPE_RE.sub('', str(s))
+    s = _ZERO_WIDTH_RE.sub('', str(s))
+    s = _CONTROL_CHARS_RE.sub('', s)
+    s = re.sub(r'\s+', ' ', s).strip()
+    for old, new in _TITLE_REPLACEMENTS.items():
+        s = s.replace(old, new)
+    return s
+
 
 def cjk_display_width(s: str) -> int:
     """Calculate terminal display width using rich's cell_len.
@@ -1111,8 +1141,48 @@ def process_folder_mode(folder_path: str):
     console.print("\n[bold yellow]请选择重处理范围：[/]")
     console.print("  [bold]1.[/] 重新翻译+烧制+上传 [dim](删除翻译字幕、硬字幕视频、所有标记)[/]")
     console.print("  [bold]2.[/] 仅重新上传        [dim](保留硬字幕视频，重新上传)[/]")
-    reset_choice = Prompt.ask("\n您的选择", choices=["1", "2"], default="1")
-    full_reset = (reset_choice == "1")
+    console.print("  [bold]3.[/] 修复英文空格+重翻译+烧制+上传 [dim](先从 checkpoint 重建英文 SRT)[/]")
+    reset_choice = Prompt.ask("\n您的选择", choices=["1", "2", "3"], default="3")
+    full_reset = reset_choice in ("1", "3")
+    repair_english = reset_choice == "3"
+
+    if repair_english:
+        transcriber = os.path.join(TOOLS_DIR, "transcriber", "transcribe_engine.py")
+        if not os.path.exists(transcriber):
+            console.print(f"[bold red]❌ 未找到转写引擎: {transcriber}[/]")
+            input("\n按回车键退出...")
+            return
+        console.print("\n[bold cyan]♻️ 正在从 checkpoint 重建英文 SRT...[/]")
+        for i, (entry, sub_path, vid, srt, files, meta) in enumerate(found_tasks, 1):
+            checkpoint = os.path.join(sub_path, "transcribe_state.json")
+            if not os.path.exists(checkpoint):
+                console.print(f"[bold red]❌ [{i}/{len(found_tasks)}] {entry} 缺少 transcribe_state.json[/]")
+                input("\n按回车键退出...")
+                return
+            cmd = [
+                PYTHON_EXE,
+                transcriber,
+                os.path.join(sub_path, vid),
+                "--output", sub_path,
+                "--no-gui",
+                "--language", "en",
+                "--rebuild-only",
+            ]
+            console.print(f"[cyan]{i}/{len(found_tasks)}[/] [bold]{entry}[/]")
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            if result.returncode != 0:
+                console.print(f"[bold red]❌ 重建失败: {entry}[/]")
+                console.print(result.stdout[-2000:])
+                input("\n按回车键退出...")
+                return
+        console.print("[bold green]✅ 英文 SRT 重建完成。[/]")
 
     cleared = {"srt": 0, "ass": 0, "hardsub": 0, "markers": 0}
     for entry, sub_path, vid, srt, files, meta in found_tasks:

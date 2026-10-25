@@ -8,6 +8,7 @@ AutoSub 是一款专业的“零点击”自动化工具，旨在实现视频下
 - **Whisper 转录**：基于 `faster-whisper` 实现高精度的英文语音转识别。
 - **LLM 智能翻译**：利用 Gemini (Flash/Pro), DeepSeek, 硅基流动 (Silicon Flow), 智谱 (GLM), 或 OpenAI 进行上下文感知翻译，并内置“去 AI 味”的人性化润色规则。
 - **专业字幕压制**：一键生成带有双语布局和专业样式盒（Vector-Box）的硬字幕视频。
+- **环节控制**：默认端到端执行，也可单独关闭转录、翻译或上传，并选择 Google Drive、Bilibili 或微信视频号。
 - **动态模型探测**：自动发现并列出各厂商最新的 AI 模型。
 - **项目隔离**：支持自定义项目根目录 (Project Root)，让视频素材与字幕文件保持整洁独立。
 - **图形界面与命令行**：提供直观的 GUI 界面及强大的 CLI 自动化支持。
@@ -48,6 +49,11 @@ python Library\Tools\autosub\autosub_gui.py
 4. **使用方法**：
    - **GUI**：在“Cookies”栏点击“选择...”，加载该文件。
    - **CLI**: Append `--cookies "path/to/cookies.txt"` to your command.
+
+### 3. 环节控制
+默认仍按“下载、转录、翻译、压制、上传”完整执行。需要跳过某个环节时：
+- **GUI**：在“任务与环节”页取消勾选“转录”“翻译”或“上传”，上传目标在“输出与上传”页选择。
+- **CLI**：使用 `--skip-transcription`、`--skip-translation` 或 `--no-upload`；上传目标可用 `--upload-targets gdrive bilibili wechat` 指定。
 
 ## ⚠️ 常见问题与解决方案 (Troubleshooting)
 

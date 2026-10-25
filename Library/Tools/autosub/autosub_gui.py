@@ -9,6 +9,9 @@ import json
 import re
 import psutil
 from datetime import datetime
+from PIL import Image, ImageTk
+import customtkinter as ctk
+from ttkbootstrap.style import Style
 
 class ProcessTree:
     """Manages cross-platform process suspension and termination."""
@@ -52,6 +55,9 @@ if COMMON_DIR not in sys.path:
 AUTOSUB_SCRIPT = os.path.join(CURRENT_DIR, "autosub.py")
 SETTINGS_FILE = os.path.join(CURRENT_DIR, "settings.json")
 DEFAULTS_FILE = os.path.join(CURRENT_DIR, "defaults.json")
+HISTORY_FILE = os.path.join(
+    os.path.expanduser("~"), ".autosub", "history.json"
+)
 DEFAULTS = {}
 if os.path.exists(DEFAULTS_FILE):
     try:
@@ -236,6 +242,51 @@ def scan_task_history(base_dir, limit=300):
     return records[:limit]
 
 
+def load_history_index(path=None):
+    """Load the persistent history index used across app updates."""
+    path = path or HISTORY_FILE
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return [record for record in data if isinstance(record, dict)]
+
+
+def save_history_index(records, path=None):
+    """Persist history records in a stable user-level location."""
+    path = path or HISTORY_FILE
+    directory = os.path.dirname(path)
+    try:
+        os.makedirs(directory, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(records, handle, indent=2, ensure_ascii=False)
+    except OSError:
+        pass
+
+
+def merge_history_records(*record_groups):
+    """Merge disk scans and the persistent index by workdir."""
+    merged = {}
+    for records in record_groups:
+        for record in records:
+            workdir = str(record.get("workdir") or "")
+            if not workdir:
+                continue
+            previous = merged.get(workdir)
+            if previous is None or str(record.get("updated_at") or "") >= str(
+                previous.get("updated_at") or ""
+            ):
+                merged[workdir] = record
+    return sorted(
+        merged.values(),
+        key=lambda item: str(item.get("updated_at") or ""),
+        reverse=True,
+    )
+
+
 def find_history_record_for_input(records, input_value):
     """Match a saved input to its project record."""
     value = str(input_value or "").strip()
@@ -301,11 +352,31 @@ class AutoSubGUI:
     bili_season_var: tk.StringVar
     wechat_enabled_var: tk.BooleanVar
     wechat_public_var: tk.BooleanVar
+    transcription_enabled_var: tk.BooleanVar
+    translation_enabled_var: tk.BooleanVar
+    burn_enabled_var: tk.BooleanVar
+    upload_enabled_var: tk.BooleanVar
+
+    WORKFLOW_STAGE_RANGES = {
+        "download": (0.0, 0.10),
+        "transcription": (0.10, 0.45),
+        "translation": (0.45, 0.80),
+        "burn": (0.80, 0.95),
+    }
+    PROGRESS_STAGE_MARKERS = {
+        "download": ("🎬 Downloading",),
+        "transcription": ("🎙️ Transcribing",),
+        "translation": ("🌍 Smart-translating",),
+        "burn": ("🔥 Burning subtitles",),
+    }
 
     def __init__(self, root):
         self.root = root
         self.root.title("AutoSub Pro - 自动视频字幕生成工具")
-        self.root.geometry("1020x500")
+        self.root.geometry("1720x1020")
+        self.root.minsize(1600, 940)
+        ctk.set_appearance_mode("light")
+        ctk.set_default_color_theme("blue")
 
         # Set Window Icon
         icon_name = "autosub_gui_neon.png" if sys.platform == "darwin" else "autosub.ico"
@@ -319,8 +390,9 @@ class AutoSubGUI:
                     self.root.iconbitmap(icon_path)
             except: pass
 
-        self.ui_font = ("PingFang SC", 12) if sys.platform == "darwin" else ("Microsoft YaHei", 10)
-        self.log_font = ("Menlo", 11) if sys.platform == "darwin" else ("Consolas", 10)
+        self.ui_font = ("PingFang SC", 13) if sys.platform == "darwin" else ("Microsoft YaHei", 11)
+        self.log_font = ("Menlo", 12) if sys.platform == "darwin" else ("Consolas", 11)
+        self._configure_theme()
 
         # Vendor Map to LLMProvider Enum values
         self.vendor_map = {
@@ -360,6 +432,9 @@ class AutoSubGUI:
         self.last_was_progress = False
         self.is_paused = False
         self.task_history = []
+        self.progress_stage = None
+        self.progress_stage_start = 0.0
+        self.progress_stage_end = 1.0
 
         self.setup_ui()
         self.restore_pending_input()
@@ -387,7 +462,11 @@ class AutoSubGUI:
             "cn_size": "60", "en_size": "36",
             "cn_color": "Gold", "en_color": "White",
             "bg_box": True,
-            "sync_gdrive": "18iAFFSuHQmZlxVN0dri1Gbje9SmpS96f", "gdrive_enabled": True
+            "sync_gdrive": "18iAFFSuHQmZlxVN0dri1Gbje9SmpS96f", "gdrive_enabled": True,
+            "transcription_enabled": True,
+            "translation_enabled": True,
+            "burn_enabled": True,
+            "upload_enabled": True,
         }
 
         # Try loading from existing settings
@@ -407,44 +486,92 @@ class AutoSubGUI:
         return defaults
 
     def setup_ui(self):
-        self.main_container = ttk.Frame(self.root, padding=10)
-        self.main_container.pack(fill="both", expand=True)
+        self.shell = ctk.CTkFrame(self.root, corner_radius=0, fg_color="#F5F5F7")
+        self.shell.pack(fill="both", expand=True)
 
-        # Create Notebook (Tabbed Interface) for compact and adaptive layout
-        self.notebook = ttk.Notebook(self.main_container)
-        self.notebook.pack(fill="both", expand=True, pady=5)
+        self.main_area = ctk.CTkFrame(self.shell, corner_radius=0, fg_color="#F5F5F7")
+        self.main_area.pack(fill="both", expand=True)
 
-        # Create Tab Frames
-        self.tab1 = ttk.Frame(self.notebook, padding=10)
-        self.tab2 = ttk.Frame(self.notebook, padding=10)
-        self.tab3 = ttk.Frame(self.notebook, padding=10)
-        self.tab4 = ttk.Frame(self.notebook, padding=10)
+        self.header = ctk.CTkFrame(self.main_area, height=76, corner_radius=0, fg_color="#FFFFFF")
+        self.header.pack(side="top", fill="x")
+        self.header.pack_propagate(False)
+        self._build_header()
+        ctk.CTkFrame(self.main_area, height=1, corner_radius=0, fg_color="#E5E5EA").pack(fill="x")
 
-        self.notebook.add(self.tab1, text=" 任务配置 ")
-        self.notebook.add(self.tab2, text=" 字幕样式 ")
-        self.notebook.add(self.tab3, text=" 执行日志 ")
-        self.notebook.add(self.tab4, text=" 处理历史 ")
+        self.body = ctk.CTkFrame(self.main_area, corner_radius=0, fg_color="#F5F5F7")
+        self.body.pack(fill="both", expand=True, padx=18, pady=(16, 10))
+
+        self.notebook = ctk.CTkTabview(
+            self.body,
+            corner_radius=10,
+            border_width=1,
+            border_color="#D9D9DE",
+            fg_color="#FFFFFF",
+            segmented_button_fg_color="#E9E9EB",
+            segmented_button_selected_color="#D6E4FF",
+            segmented_button_selected_hover_color="#C7D9FF",
+            segmented_button_unselected_color="#FFFFFF",
+            segmented_button_unselected_hover_color="#F2F2F7",
+            segmented_button_font=(self.ui_font[0], 14, "bold"),
+            text_color="#1D1D1F",
+            anchor="w",
+        )
+        self.notebook.pack(fill="both", expand=True)
+
+        self.notebook.add("任务")
+        self.notebook.add("输出")
+        self.notebook.add("日志")
+        self.notebook.add("历史")
+        self.tab1 = self.notebook.tab("任务")
+        self.tab2 = self.notebook.tab("输出")
+        self.tab3 = self.notebook.tab("日志")
+        self.tab4 = self.notebook.tab("历史")
+        self.notebook.set("任务")
 
         # 1. Input Section (Parent: tab1)
-        f1 = ttk.LabelFrame(self.tab1, text=" 输入源 ", padding=10)
-        f1.pack(fill="x", pady=5)
+        f1 = self._section(self.tab1, "输入源")
+        f1.pack(fill="x", pady=(0, 12))
         self.create_entry_row(f1, "视频/URL:", "input_var", 0, self.browse_video)
         
         # Cookies Row (Dropdown + Entry)
-        ttk.Label(f1, text="Cookies:").grid(row=1, column=0, sticky="w", pady=2)
+        ctk.CTkLabel(f1, text="Cookies:").grid(row=1, column=0, sticky="w", pady=2)
         self.cookies_var = tk.StringVar(value=str(self.settings.get("cookies", "")))
-        self.cookies_combo = ttk.Combobox(f1, textvariable=self.cookies_var, width=63)
-        self.cookies_combo['values'] = ("None", "chrome", "safari", "firefox", "edge")
+        self.cookies_combo = self._combo(
+            f1,
+            variable=self.cookies_var,
+            values=["None", "chrome", "safari", "firefox", "edge"],
+            width=420,
+        )
         self.cookies_combo.grid(row=1, column=1, padx=5)
-        ttk.Button(f1, text="选择...", command=self.browse_cookies).grid(row=1, column=2)
+        self._button(f1, "选择...", self.browse_cookies).grid(row=1, column=2)
 
         self.create_entry_row(f1, "项目根目录:", "output_dir_var", 2, self.browse_folder)
 
-        # 2. Basic Settings (Parent: tab1)
-        f2 = ttk.LabelFrame(self.tab1, text=" 基础设置 ", padding=10)
-        f2.pack(fill="x", pady=5)
+        # 1.5 Execution Stages (Parent: tab1)
+        stage_frame = self._section(self.tab1, "执行环节")
+        stage_frame.pack(fill="x", pady=(0, 12))
+        self.transcription_enabled_var = tk.BooleanVar(
+            value=bool(self.settings.get("transcription_enabled", True))
+        )
+        self._checkbox(stage_frame, "转录", self.transcription_enabled_var).grid(row=0, column=0, sticky="w", padx=5)
+        self.translation_enabled_var = tk.BooleanVar(
+            value=bool(self.settings.get("translation_enabled", True))
+        )
+        self._checkbox(stage_frame, "翻译", self.translation_enabled_var).grid(row=0, column=1, sticky="w", padx=5)
+        self.burn_enabled_var = tk.BooleanVar(
+            value=bool(self.settings.get("burn_enabled", True))
+        )
+        self._checkbox(stage_frame, "烧制", self.burn_enabled_var).grid(row=0, column=2, sticky="w", padx=5)
+        self.upload_enabled_var = tk.BooleanVar(
+            value=bool(self.settings.get("upload_enabled", True))
+        )
+        self._checkbox(stage_frame, "上传", self.upload_enabled_var).grid(row=0, column=3, sticky="w", padx=5)
 
-        ttk.Label(f2, text="模型厂商:").grid(row=0, column=0, sticky="w")
+        # 2. Basic Settings (Parent: tab1)
+        f2 = self._section(self.tab1, "模型与处理")
+        f2.pack(fill="x", pady=(0, 12))
+
+        ctk.CTkLabel(f2, text="模型厂商:").grid(row=0, column=0, sticky="w")
         current_vendor = str(
             self.settings.get("llm_vendor", self.settings.get("vendor", ""))
         )
@@ -453,66 +580,66 @@ class AutoSubGUI:
             current_vendor = "Alibaba (Bailian)"
             
         self.vendor_var = tk.StringVar(value=current_vendor)
-        self.vendor_combo = ttk.Combobox(f2, textvariable=self.vendor_var, values=vendors, state="readonly", width=18)
+        self.vendor_combo = self._combo(f2, variable=self.vendor_var, values=vendors, state="readonly", width=260)
         self.vendor_combo.grid(row=0, column=1, sticky="w", padx=5)
         self.vendor_combo.bind("<<ComboboxSelected>>", self.on_vendor_change)
 
-        ttk.Label(f2, text="选择模型:").grid(row=0, column=2, sticky="w", padx=10)
+        ctk.CTkLabel(f2, text="选择模型:").grid(row=0, column=2, sticky="w", padx=10)
         self.llm_model_var = tk.StringVar(value=str(self.settings.get("llm_model", "")))
-        self.llm_combo = ttk.Combobox(f2, textvariable=self.llm_model_var, width=30)
+        self.llm_combo = self._combo(f2, variable=self.llm_model_var, width=360)
         self.llm_combo.grid(row=0, column=3, sticky="w")
         self.llm_combo.bind("<<ComboboxSelected>>", self.on_model_select)
-        ttk.Button(f2, text="设为默认", width=8, command=self.set_llm_model_default).grid(row=0, column=4, padx=5)
+        self._button(f2, "设为默认", self.set_llm_model_default, width=100).grid(row=0, column=4, padx=5)
 
-        self.api_key_label = ttk.Label(f2, text="API Key:")
+        self.api_key_label = ctk.CTkLabel(f2, text="API Key:")
         self.api_key_label.grid(row=1, column=0, sticky="w", pady=5)
         self.api_key_var = tk.StringVar()
-        self.api_key_entry = ttk.Entry(f2, textvariable=self.api_key_var, show="*", width=35)
+        self.api_key_entry = self._entry(f2, textvariable=self.api_key_var, show="*", width=360)
         self.api_key_entry.grid(row=1, column=1, columnspan=2, sticky="w", padx=5)
         self.api_key_entry.bind("<FocusOut>", lambda e: self.on_vendor_change(None))
-        ttk.Button(f2, text="保存该密钥", width=10, command=self.save_api_key).grid(row=1, column=3, sticky="w")
-        ttk.Button(f2, text="测试连接", width=10, command=self.test_connection).grid(row=1, column=4, padx=5)
+        self._button(f2, "保存该密钥", self.save_api_key, width=110).grid(row=1, column=3, sticky="w")
+        self._button(f2, "测试连接", self.test_connection, width=110).grid(row=1, column=4, padx=5)
 
-        ttk.Label(f2, text="转录模型:").grid(row=2, column=0, sticky="w")
+        ctk.CTkLabel(f2, text="转录模型:").grid(row=2, column=0, sticky="w")
         self.whisper_var = tk.StringVar(value=str(self.settings.get("model", "")))
-        ttk.Combobox(f2, textvariable=self.whisper_var, values=["large-v3", "large-v2", "medium", "small"], width=18).grid(row=2, column=1, sticky="w", padx=5)
+        self._combo(f2, variable=self.whisper_var, values=["large-v3", "large-v2", "medium", "small"], width=240).grid(row=2, column=1, sticky="w", padx=5)
 
-        ttk.Label(f2, text="内容语气:").grid(row=2, column=2, sticky="w", padx=10)
+        ctk.CTkLabel(f2, text="内容语气:").grid(row=2, column=2, sticky="w", padx=10)
         self.style_var = tk.StringVar(value=str(self.settings.get("style", "auto")))
-        ttk.Combobox(f2, textvariable=self.style_var, values=["auto", "casual", "formal", "edgy"], width=22).grid(row=2, column=3, sticky="w")
+        self._combo(f2, variable=self.style_var, values=["auto", "casual", "formal", "edgy"], width=240).grid(row=2, column=3, sticky="w")
 
-        ttk.Label(f2, text="翻译策略:").grid(row=3, column=0, sticky="w", pady=5)
+        ctk.CTkLabel(f2, text="翻译策略:").grid(row=3, column=0, sticky="w", pady=5)
         self.trans_mode_var = tk.StringVar(value=str(self.settings.get("trans_mode", "balanced")))
-        ttk.Combobox(f2, textvariable=self.trans_mode_var, values=["balanced", "paraphrase"], width=18).grid(row=3, column=1, sticky="w", padx=5)
+        self._combo(f2, variable=self.trans_mode_var, values=["balanced", "paraphrase"], width=240).grid(row=3, column=1, sticky="w", padx=5)
 
-        ttk.Label(f2, text="压制画质:").grid(row=3, column=2, sticky="w", padx=10)
+        ctk.CTkLabel(f2, text="压制画质:").grid(row=3, column=2, sticky="w", padx=10)
         self.quality_var = tk.StringVar(value=str(self.settings.get("quality", "high")))
-        ttk.Combobox(f2, textvariable=self.quality_var, values=["standard", "high", "lossless"], width=22).grid(row=3, column=3, sticky="w")
+        self._combo(f2, variable=self.quality_var, values=["standard", "high", "lossless"], width=240).grid(row=3, column=3, sticky="w")
 
         self.quick_var = tk.BooleanVar(value=bool(self.settings.get("quick", False)))
-        ttk.Checkbutton(f2, text="快捷转录（大模型/网页视频实验性）", variable=self.quick_var).grid(row=4, column=0, columnspan=2, sticky="w", pady=5)
+        self._checkbox(f2, "快捷转录（大模型/网页视频实验性）", self.quick_var).grid(row=4, column=0, columnspan=2, sticky="w", pady=5)
         self.remove_ads_var = tk.BooleanVar(value=bool(self.settings.get("remove_ads", False)))
-        ttk.Checkbutton(f2, text="剪除广告片段", variable=self.remove_ads_var).grid(row=4, column=2, columnspan=2, sticky="w", pady=5)
+        self._checkbox(f2, "剪除广告片段", self.remove_ads_var).grid(row=4, column=2, columnspan=2, sticky="w", pady=5)
 
-        ttk.Label(f2, text="广告检测:").grid(row=5, column=0, sticky="w", pady=5)
+        ctk.CTkLabel(f2, text="广告检测:").grid(row=5, column=0, sticky="w", pady=5)
         self.ad_detector_var = tk.StringVar(value=str(self.settings.get("ad_detector", "auto")))
-        ttk.Combobox(
-            f2, textvariable=self.ad_detector_var,
-            values=["auto", "visual", "llm"], state="readonly", width=18,
+        self._combo(
+            f2, variable=self.ad_detector_var,
+            values=["auto", "visual", "llm"], state="readonly", width=240,
         ).grid(row=5, column=1, sticky="w", padx=5)
-        ttk.Label(f2, text="剪切方式:").grid(row=5, column=2, sticky="w", padx=10)
+        ctk.CTkLabel(f2, text="剪切方式:").grid(row=5, column=2, sticky="w", padx=10)
         self.ad_cut_mode_var = tk.StringVar(value=str(self.settings.get("ad_cut_mode", "auto")))
-        ttk.Combobox(
-            f2, textvariable=self.ad_cut_mode_var,
-            values=["auto", "precise", "legacy"], state="readonly", width=18,
+        self._combo(
+            f2, variable=self.ad_cut_mode_var,
+            values=["auto", "precise", "legacy"], state="readonly", width=240,
         ).grid(row=5, column=3, sticky="w")
 
         self.multilang_var = tk.BooleanVar(value=bool(self.settings.get("multilang", False)))
-        ttk.Checkbutton(f2, text="多语言检测（混合语言视频自动分段检测）", variable=self.multilang_var).grid(row=6, column=0, columnspan=4, sticky="w", pady=5)
+        self._checkbox(f2, "多语言检测（混合语言视频自动分段检测）", self.multilang_var).grid(row=6, column=0, columnspan=4, sticky="w", pady=5)
 
         # 3. Subtitle Style (Parent: tab2)
-        f3 = ttk.LabelFrame(self.tab2, text=" 字幕样式 ", padding=10)
-        f3.pack(fill="x", pady=5)
+        f3 = self._section(self.tab2, "字幕样式")
+        f3.pack(fill="x", pady=(0, 12))
         self.create_style_row(f3, "布局模式:", "layout_var", ["bilingual", "cn", "en"], "首选语言:", "main_lang_var", ["cn", "en"], 0)
         self.create_style_row(f3, "中文样式:", "cn_font_var", ["STKaiti", "PingFang SC"], "字号:", "cn_size_var", None, 1)
         self.create_style_row(f3, "英文样式:", "en_font_var", ["Arial", "Calibri"], "字号:", "en_size_var", None, 2)
@@ -520,24 +647,24 @@ class AutoSubGUI:
         self.create_style_row(f3, "中文颜色:", "cn_color_var", ["Gold", "White", "Yellow"], "原语言颜色:", "en_color_var", ["White", "Gold", "Gray"], 4)
 
         self.bg_box_var = tk.BooleanVar(value=bool(self.settings.get("bg_box", True)))
-        ttk.Checkbutton(f3, text="启用背景框", variable=self.bg_box_var).grid(row=5, column=0, columnspan=2, sticky="w", pady=5)
+        self._checkbox(f3, "启用背景框", self.bg_box_var).grid(row=5, column=0, columnspan=2, sticky="w", pady=5)
 
         # 4. Cloud Sync (Parent: tab2)
-        f4 = ttk.LabelFrame(self.tab2, text=" 云端同步 ", padding=10)
-        f4.pack(fill="x", pady=5)
+        f4 = self._section(self.tab2, "Google Drive")
+        f4.pack(fill="x", pady=(0, 12))
         self.gdrive_enabled_var = tk.BooleanVar(value=bool(self.settings.get("gdrive_enabled", True)))
-        ttk.Checkbutton(f4, text="自动同步到 Google Drive", variable=self.gdrive_enabled_var).grid(row=0, column=0, sticky="w")
-        ttk.Label(f4, text="文件夹 ID:").grid(row=0, column=1, padx=10)
+        self._checkbox(f4, "自动同步到 Google Drive", self.gdrive_enabled_var).grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(f4, text="文件夹 ID:").grid(row=0, column=1, padx=10)
         self.sync_gdrive_var = tk.StringVar(value=str(self.settings.get("sync_gdrive", "")))
-        ttk.Entry(f4, textvariable=self.sync_gdrive_var, width=35).grid(row=0, column=2, padx=5)
+        self._entry(f4, textvariable=self.sync_gdrive_var, width=360).grid(row=0, column=2, padx=5)
 
         # 4.5 Bilibili Sync (Parent: tab2)
-        f4_5 = ttk.LabelFrame(self.tab2, text=" Bilibili 同步 ", padding=10)
-        f4_5.pack(fill="x", pady=5)
+        f4_5 = self._section(self.tab2, "Bilibili")
+        f4_5.pack(fill="x", pady=(0, 12))
         self.bili_enabled_var = tk.BooleanVar(value=bool(self.settings.get("bili_enabled", True)))
-        ttk.Checkbutton(f4_5, text="默认上传到 Bilibili", variable=self.bili_enabled_var).grid(row=0, column=0, sticky="w", pady=2)
+        self._checkbox(f4_5, "默认上传到 Bilibili", self.bili_enabled_var).grid(row=0, column=0, sticky="w", pady=2)
         
-        ttk.Label(f4_5, text="分区:").grid(row=0, column=1, padx=10, pady=2, sticky="e")
+        ctk.CTkLabel(f4_5, text="分区:").grid(row=0, column=1, padx=10, pady=2, sticky="e")
         self.bili_tid_var = tk.StringVar(value=str(self.settings.get("bili_tid", "智能识别 (Auto)")))
         bili_partitions = [
             "智能识别 (Auto)",
@@ -553,57 +680,82 @@ class AutoSubGUI:
             "资讯-热点 (212)",
             "生活-日常 (21)"
         ]
-        ttk.Combobox(f4_5, textvariable=self.bili_tid_var, values=bili_partitions, width=18).grid(row=0, column=2, padx=5, pady=2, sticky="w")
+        self._combo(f4_5, variable=self.bili_tid_var, values=bili_partitions, width=300).grid(row=0, column=2, padx=5, pady=2, sticky="w")
         
-        ttk.Label(f4_5, text="标签 (逗号/顿号分隔):").grid(row=1, column=0, padx=10, pady=2, sticky="e")
+        ctk.CTkLabel(f4_5, text="标签 (逗号/顿号分隔):").grid(row=1, column=0, padx=10, pady=2, sticky="e")
         self.bili_tags_var = tk.StringVar(value="")  # Tags: dynamically generated per upload, not persisted
-        ttk.Entry(f4_5, textvariable=self.bili_tags_var, width=30).grid(row=1, column=1, columnspan=2, padx=5, pady=2, sticky="w")
+        self._entry(f4_5, textvariable=self.bili_tags_var, width=360).grid(row=1, column=1, columnspan=2, padx=5, pady=2, sticky="w")
         
-        ttk.Label(f4_5, text="合集名称 (新建/选择):").grid(row=2, column=0, padx=10, pady=2, sticky="e")
+        ctk.CTkLabel(f4_5, text="合集名称 (新建/选择):").grid(row=2, column=0, padx=10, pady=2, sticky="e")
         self.bili_season_var = tk.StringVar(value=str(self.settings.get("bili_season", "")))
-        ttk.Entry(f4_5, textvariable=self.bili_season_var, width=30).grid(row=2, column=1, columnspan=2, padx=5, pady=2, sticky="w")
+        self._entry(f4_5, textvariable=self.bili_season_var, width=360).grid(row=2, column=1, columnspan=2, padx=5, pady=2, sticky="w")
 
         # 4.6 WeChat Channels Sync (Parent: tab2)
-        f4_6 = ttk.LabelFrame(self.tab2, text=" 微信视频号同步 ", padding=10)
-        f4_6.pack(fill="x", pady=5)
+        f4_6 = self._section(self.tab2, "微信视频号")
+        f4_6.pack(fill="x", pady=(0, 12))
         self.wechat_enabled_var = tk.BooleanVar(value=bool(self.settings.get("wechat_enabled", False)))
-        ttk.Checkbutton(f4_6, text="上传到微信视频号", variable=self.wechat_enabled_var).grid(row=0, column=0, sticky="w", pady=2)
+        self._checkbox(f4_6, "上传到微信视频号", self.wechat_enabled_var).grid(row=0, column=0, sticky="w", pady=2)
         self.wechat_public_var = tk.BooleanVar(value=bool(self.settings.get("wechat_public", False)))
-        ttk.Checkbutton(f4_6, text="公开发布（不勾选则保存草稿）", variable=self.wechat_public_var).grid(row=0, column=1, padx=15, sticky="w", pady=2)
-        ttk.Label(f4_6, text="封面标题 (留空自动):").grid(row=1, column=0, padx=10, pady=2, sticky="e")
+        self._checkbox(f4_6, "公开发布（不勾选则保存草稿）", self.wechat_public_var).grid(row=0, column=1, padx=15, sticky="w", pady=2)
+        ctk.CTkLabel(f4_6, text="封面标题 (留空自动):").grid(row=1, column=0, padx=10, pady=2, sticky="e")
         self.wechat_cover_title_var = tk.StringVar(value="")
-        ttk.Entry(f4_6, textvariable=self.wechat_cover_title_var, width=64).grid(
+        self._entry(f4_6, textvariable=self.wechat_cover_title_var, width=420).grid(
             row=1, column=1, columnspan=2, padx=5, pady=2, sticky="ew"
         )
         f4_6.columnconfigure(1, weight=1)
         f4_6.columnconfigure(2, weight=1)
 
         # 5. Log Area (Parent: tab3)
-        f5 = ttk.LabelFrame(self.tab3, text=" 日志与进度 ", padding=10)
-        f5.pack(fill="both", expand=True, pady=5)
+        f5 = self._section(self.tab3, "执行状态", expand=True)
+        f5.pack(fill="both", expand=True)
         self.progress_var = tk.DoubleVar(value=0)
-        self.progress_bar = ttk.Progressbar(f5, variable=self.progress_var, maximum=100)
+        self.progress_bar = ctk.CTkProgressBar(
+            f5,
+            variable=self.progress_var,
+            height=8,
+            corner_radius=4,
+            fg_color="#E5E5EA",
+            progress_color="#007AFF",
+        )
         self.progress_bar.pack(fill="x", pady=5)
-        self.status_label = ttk.Label(f5, text="等待任务...")
+        self.status_label = ctk.CTkLabel(f5, text="等待任务...", text_color="#86868B")
         self.status_label.pack(pady=2)
-        log_frame = ttk.Frame(f5)
+        log_frame = ctk.CTkFrame(f5, fg_color="transparent")
         log_frame.pack(fill="both", expand=True)
-        self.log_scrollbar = ttk.Scrollbar(log_frame, command=lambda *a: self.log_text.yview(*a))
+        self.log_scrollbar = ctk.CTkScrollbar(
+            log_frame,
+            command=lambda *a: self.log_text.yview(*a),
+            corner_radius=4,
+            fg_color="#F5F5F7",
+            button_color="#C7C7CC",
+            button_hover_color="#AEAEB2",
+        )
         self.log_scrollbar.pack(side="right", fill="y")
-        self.log_text = tk.Text(log_frame, height=10, state="disabled", font=self.log_font, bg="#ffffff", padx=5, pady=5, yscrollcommand=lambda *a: self.log_scrollbar.set(*a))
+        self.log_text = ctk.CTkTextbox(
+            log_frame,
+            height=420,
+            font=self.log_font,
+            corner_radius=8,
+            fg_color="#FFFFFF",
+            text_color="#1D1D1F",
+            border_width=1,
+            border_color="#E5E5EA",
+            yscrollcommand=lambda *a: self.log_scrollbar.set(*a),
+        )
+        self.log_text.configure(state="disabled")
         self.log_text.pack(side="left", fill="both", expand=True)
 
         # 5.5 Task History (Parent: tab4)
-        history_frame = ttk.Frame(self.tab4)
+        history_frame = ctk.CTkFrame(self.tab4, fg_color="transparent")
         history_frame.pack(fill="both", expand=True)
-        history_toolbar = ttk.Frame(history_frame)
+        history_toolbar = ctk.CTkFrame(history_frame, fg_color="transparent")
         history_toolbar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
-        ttk.Button(
+        self._button(
             history_toolbar,
             text="刷新",
             command=self.refresh_history,
         ).pack(side="left", padx=(0, 5))
-        ttk.Button(
+        self._button(
             history_toolbar,
             text="载入选中输入",
             command=self.load_selected_history_input,
@@ -655,46 +807,205 @@ class AutoSubGUI:
         self.history_tree.bind("<Double-1>", lambda _event: self.load_selected_history_input())
         self.refresh_history()
 
-        # 6. Controls (Parent: root)
-        f6 = ttk.Frame(self.root, padding=10)
-        f6.pack(fill="x", side="bottom")
-        ttk.Button(f6, text="退出", command=self.root.destroy).pack(side="left", padx=5)
-        ttk.Button(f6, text="保存设置", command=self.save_settings).pack(side="left", padx=5)
-        ttk.Button(f6, text="剪切广告", command=self.cut_ads_now).pack(side="left", padx=5)
-        self.stop_btn = ttk.Button(f6, text="中止", state="disabled", command=self.stop_process)
-        self.stop_btn.pack(side="right", padx=5)
-        self.pause_btn = ttk.Button(f6, text="暂停", state="disabled", command=self.toggle_pause)
-        self.pause_btn.pack(side="right", padx=5)
-        self.start_btn = ttk.Button(f6, text="开始处理", command=self.start_process)
-        self.start_btn.pack(side="right", padx=5)
-        self.upload_btn = ttk.Button(f6, text="只上传", command=self.start_upload_only)
-        self.upload_btn.pack(side="right", padx=5)
+        self.footer = ctk.CTkFrame(self.main_area, height=70, corner_radius=0, fg_color="#FFFFFF")
+        ctk.CTkFrame(self.main_area, height=1, corner_radius=0, fg_color="#E5E5EA").pack(fill="x")
+        self.footer.pack(side="bottom", fill="x")
+        self.footer.pack_propagate(False)
+        self._build_footer()
 
-        # Adjust window height dynamically based on the tallest tab content
-        self.root.update_idletasks()
-        req_height = self.root.winfo_reqheight()
-        self.root.geometry(f"1020x{req_height + 10}")
+    def _configure_theme(self):
+        ctk.set_widget_scaling(1.0)
+        style = Style(theme="litera")
+        style.configure(
+            "Treeview",
+            background="#FFFFFF",
+            fieldbackground="#FFFFFF",
+            foreground="#1D1D1F",
+            rowheight=34,
+            borderwidth=0,
+        )
+        style.configure(
+            "Treeview.Heading",
+            background="#F5F5F7",
+            foreground="#86868B",
+            padding=(10, 8),
+            borderwidth=0,
+        )
+        style.map(
+            "Treeview",
+            background=[("selected", "#E8F0FF")],
+            foreground=[("selected", "#007AFF")],
+        )
+
+    def _build_header(self):
+        logo_path = os.path.join(CURRENT_DIR, "assets", "autosub_v9.png")
+        if os.path.exists(logo_path):
+            try:
+                logo = Image.open(logo_path).convert("RGBA").resize((40, 40), Image.LANCZOS)
+                self.header_logo = ImageTk.PhotoImage(logo)
+                ctk.CTkLabel(self.header, image=self.header_logo, text="").pack(side="left", padx=(20, 12))
+            except Exception:
+                pass
+
+        title_box = ctk.CTkFrame(self.header, fg_color="transparent")
+        title_box.pack(side="left", fill="y", pady=14)
+        ctk.CTkLabel(title_box, text="AutoSub Pro", text_color="#1D1D1F", font=(self.ui_font[0], 17, "bold")).pack(anchor="w")
+        ctk.CTkLabel(title_box, text="视频字幕流水线", text_color="#86868B", font=(self.ui_font[0], 11)).pack(anchor="w")
+
+        self.header_status = ctk.CTkLabel(
+            self.header,
+            text="空闲",
+            fg_color="#E8F0FF",
+            text_color="#007AFF",
+            padx=12,
+            pady=5,
+            font=(self.ui_font[0], 10, "bold"),
+        )
+        self.header_status.pack(side="right", padx=20)
+
+    def _build_footer(self):
+        left = ctk.CTkFrame(self.footer, fg_color="transparent")
+        left.pack(side="left", fill="y", padx=18, pady=14)
+        self._button(left, "保存设置", self.save_settings).pack(side="left", padx=(0, 8))
+        self._button(left, "剪切广告", self.cut_ads_now).pack(side="left", padx=(0, 8))
+        self._button(left, "退出", self.root.destroy).pack(side="left")
+
+        right = ctk.CTkFrame(self.footer, fg_color="transparent")
+        right.pack(side="right", fill="y", padx=18, pady=14)
+        self.stop_btn = self._button(right, "中止", self.stop_process, danger=True, state="disabled")
+        self.stop_btn.pack(side="right", padx=(8, 0))
+        self.pause_btn = self._button(right, "暂停", self.toggle_pause, state="disabled")
+        self.pause_btn.pack(side="right", padx=8)
+        self.upload_btn = self._button(right, "只上传", self.start_upload_only)
+        self.upload_btn.pack(side="right", padx=8)
+        self.start_btn = self._button(right, "开始处理", self.start_process, primary=True)
+        self.start_btn.pack(side="right", padx=8)
+
+    def _section(self, parent, title, expand=False):
+        frame = ctk.CTkFrame(
+            parent,
+            corner_radius=12,
+            fg_color="#FFFFFF",
+            border_width=1,
+            border_color="#E5E5EA",
+        )
+        frame.pack(fill="both", expand=expand, pady=(0, 12))
+        ctk.CTkLabel(frame, text=title, text_color="#1D1D1F", font=(self.ui_font[0], self.ui_font[1], "bold")).pack(anchor="w", pady=(0, 8))
+        ctk.CTkFrame(frame, height=1, corner_radius=0, fg_color="#E5E5EA").pack(fill="x", pady=(0, 12))
+        content = ctk.CTkFrame(frame, fg_color="transparent")
+        content.pack(fill="both", expand=True)
+        return content
+
+    def _checkbox(self, parent, text, variable):
+        return ctk.CTkCheckBox(
+            parent,
+            text=text,
+            variable=variable,
+            checkbox_width=22,
+            checkbox_height=22,
+            corner_radius=6,
+            border_width=1,
+            fg_color="#007AFF",
+            hover_color="#0066D6",
+            border_color="#D2D2D7",
+            checkmark_color="#FFFFFF",
+            text_color="#1D1D1F",
+            font=self.ui_font,
+        )
+
+    def _entry(self, parent, **kwargs):
+        defaults = {
+            "corner_radius": 8,
+            "border_width": 1,
+            "border_color": "#D2D2D7",
+            "fg_color": "#FFFFFF",
+            "text_color": "#1D1D1F",
+            "height": 34,
+            "font": self.ui_font,
+        }
+        defaults.update(kwargs)
+        return ctk.CTkEntry(parent, **defaults)
+
+    def _combo(self, parent, **kwargs):
+        defaults = {
+            "corner_radius": 8,
+            "border_width": 1,
+            "border_color": "#D2D2D7",
+            "fg_color": "#FFFFFF",
+            "text_color": "#1D1D1F",
+            "height": 34,
+            "button_color": "#E5E5EA",
+            "button_hover_color": "#D2D2D7",
+            "dropdown_fg_color": "#FFFFFF",
+            "dropdown_hover_color": "#E8E8ED",
+            "dropdown_text_color": "#1D1D1F",
+            "font": self.ui_font,
+            "dropdown_font": self.ui_font,
+        }
+        defaults.update(kwargs)
+        return ctk.CTkComboBox(parent, **defaults)
+
+    def _button(self, parent, text, command, primary=False, danger=False, **kwargs):
+        defaults = {
+            "corner_radius": 8,
+            "height": 34,
+            "text_color": "#1D1D1F",
+            "fg_color": "#FFFFFF",
+            "hover_color": "#E8E8ED",
+            "border_width": 1,
+            "border_color": "#D2D2D7",
+            "font": self.ui_font,
+        }
+        if primary:
+            defaults.update({
+                "fg_color": "#007AFF",
+                "hover_color": "#0066D6",
+                "text_color": "#FFFFFF",
+                "border_width": 0,
+            })
+        if danger:
+            defaults.update({
+                "fg_color": "#FF3B30",
+                "hover_color": "#D70015",
+                "text_color": "#FFFFFF",
+                "border_width": 0,
+            })
+        defaults.update(kwargs)
+        return ctk.CTkButton(parent, text=text, command=command, **defaults)
 
     def create_entry_row(self, p, l, v, r, c):
-        ttk.Label(p, text=l).grid(row=r, column=0, sticky="w", pady=2)
+        ctk.CTkLabel(p, text=l).grid(row=r, column=0, sticky="w", pady=2)
         var = tk.StringVar(value=str(self.settings.get(v.replace("_var", ""), "")))
         setattr(self, v, var)
-        ttk.Entry(p, textvariable=var, width=65).grid(row=r, column=1, padx=5)
-        ttk.Button(p, text="选择...", command=c).grid(row=r, column=2)
+        self._entry(p, textvariable=var, width=420).grid(row=r, column=1, padx=5)
+        self._button(p, "选择...", c).grid(row=r, column=2)
 
     def create_style_row(self, p, l1, v1, val1, l2, v2, val2, r):
-        ttk.Label(p, text=l1).grid(row=r, column=0, sticky="w")
+        ctk.CTkLabel(p, text=l1).grid(row=r, column=0, sticky="w")
         var1 = tk.StringVar(value=str(self.settings.get(v1.replace("_var", ""), "")))
         setattr(self, v1, var1)
-        if val1: ttk.Combobox(p, textvariable=var1, values=val1, width=22).grid(row=r, column=1, sticky="w", padx=5)
-        else: ttk.Entry(p, textvariable=var1, width=24).grid(row=r, column=1, sticky="w", padx=5)
-        ttk.Label(p, text=l2).grid(row=r, column=2, sticky="w", padx=10)
+        if val1: self._combo(p, variable=var1, values=val1, width=240).grid(row=r, column=1, sticky="w", padx=5)
+        else: self._entry(p, textvariable=var1, width=240).grid(row=r, column=1, sticky="w", padx=5)
+        ctk.CTkLabel(p, text=l2).grid(row=r, column=2, sticky="w", padx=10)
         var2 = tk.StringVar(value=str(self.settings.get(v2.replace("_var", ""), "")))
         setattr(self, v2, var2)
-        if val2: ttk.Combobox(p, textvariable=var2, values=val2, width=22).grid(row=r, column=3, sticky="w", padx=5)
-        else: ttk.Entry(p, textvariable=var2, width=24).grid(row=r, column=3, sticky="w", padx=5)
+        if val2: self._combo(p, variable=var2, values=val2, width=240).grid(row=r, column=3, sticky="w", padx=5)
+        else: self._entry(p, textvariable=var2, width=240).grid(row=r, column=3, sticky="w", padx=5)
+
+    def _pipeline_stage_flags(self):
+        """Return CLI flags for stages disabled in the GUI."""
+        flags = []
+        if not self.transcription_enabled_var.get():
+            flags.append("--skip-transcription")
+        if not self.translation_enabled_var.get():
+            flags.append("--skip-translation")
+        if not self.burn_enabled_var.get():
+            flags.append("--skip-burn")
+        return flags
 
     def _history_requirements(self):
+        if not self.upload_enabled_var.get():
+            return []
         requirements = []
         if self.gdrive_enabled_var.get():
             requirements.append("GDrive")
@@ -745,22 +1056,29 @@ class AutoSubGUI:
             self._persist_input_value(str(input_video))
 
     def refresh_history(self):
-        base_dirs = [BASE_OUTPUT_DIR]
+        base_dirs = [
+            BASE_OUTPUT_DIR,
+            os.path.join(CURRENT_DIR, "Projects"),
+            os.path.join(
+                os.path.dirname(os.path.dirname(os.path.dirname(CURRENT_DIR))),
+                "Projects",
+            ),
+        ]
         custom_output = self.output_dir_var.get().strip()
         if custom_output:
             custom_output = os.path.abspath(custom_output)
-            if custom_output != BASE_OUTPUT_DIR:
-                base_dirs.append(custom_output)
+            base_dirs.append(custom_output)
+        base_dirs = list(dict.fromkeys(base_dirs))
 
-        records_by_workdir = {}
+        scanned_records = []
         for base_dir in base_dirs:
-            for record in scan_task_history(base_dir):
-                records_by_workdir[record["workdir"]] = record
-        self.task_history = sorted(
-            records_by_workdir.values(),
-            key=lambda item: item["updated_at"],
-            reverse=True,
-        )
+            scanned_records.extend(scan_task_history(base_dir))
+
+        self.task_history = merge_history_records(
+            load_history_index(),
+            scanned_records,
+        )[:300]
+        save_history_index(self.task_history)
 
         self.history_tree.delete(*self.history_tree.get_children())
         for record in self.task_history:
@@ -841,7 +1159,7 @@ class AutoSubGUI:
     def update_key_editor(self, vendor_name, env_key):
         self.key_editor_vendor = vendor_name
         self.key_editor_env_key = env_key
-        self.api_key_label.config(text=f"API Key ({vendor_name}):")
+        self.api_key_label.configure(text=f"API Key ({vendor_name}):")
         self.update_api_key_ui()
 
     def save_api_key(self):
@@ -919,7 +1237,7 @@ class AutoSubGUI:
             provider = LLMProvider(v_id_str)
 
             # Show loading state
-            self.root.after(0, lambda: self.llm_combo.config(values=["正在获取模型列表..."]))
+            self.root.after(0, lambda: self.llm_combo.configure(values=["正在获取模型列表..."]))
             self.root.after(0, lambda: self.llm_model_var.set("正在获取..."))
 
             client = LLMClient()
@@ -930,7 +1248,7 @@ class AutoSubGUI:
 
             models = client.list_models_by_provider(provider)
             if models:
-                self.root.after(0, lambda: self.llm_combo.config(values=models))
+                self.root.after(0, lambda: self.llm_combo.configure(values=models))
                 
                 # Check default model linkage
                 default_model = self.vendor_default_models.get(v_name)
@@ -939,14 +1257,14 @@ class AutoSubGUI:
                 elif self.llm_model_var.get() not in models:
                     self.root.after(0, lambda: self.llm_model_var.set(models[0]))
             else:
-                self.root.after(0, lambda: self.llm_combo.config(values=["未发现可用模型"]))
+                self.root.after(0, lambda: self.llm_combo.configure(values=["未发现可用模型"]))
                 self.root.after(0, lambda: self.llm_model_var.set("无模型"))
                 self.root.after(0, lambda: self.log(f"⚠️ 厂商 {v_name} 未返回任何模型，请检查 API Key 或网络"))
         except Exception as e:
             import traceback
             err_msg = f"获取模型失败 ({v_name}): {str(e)}"
             self.root.after(0, lambda: self.log(f"❌ {err_msg}"))
-            self.root.after(0, lambda: self.llm_combo.config(values=["获取失败"]))
+            self.root.after(0, lambda: self.llm_combo.configure(values=["获取失败"]))
             self.root.after(0, lambda: self.llm_model_var.set("错误"))
             print(traceback.format_exc())
 
@@ -990,7 +1308,7 @@ class AutoSubGUI:
             self.root.after(0, lambda es=err_str: self.log(f"❌ 测试过程出错: {es}"))
 
     def log(self, msg):
-        self.log_text.config(state="normal")
+        self.log_text.configure(state="normal")
         is_p = "Progress:" in msg or "%" in msg
         if is_p and self.last_was_progress: self.log_text.delete("end-2l", "end-1c")
         # Smart scroll: only jump to bottom if user is already near the bottom.
@@ -998,11 +1316,68 @@ class AutoSubGUI:
         self.log_text.insert("end", msg + "\n")
         if at_bottom:
             self.log_text.see("end")
-        self.log_text.config(state="disabled")
+        self.log_text.configure(state="disabled")
         self.last_was_progress = is_p
-        m = re.search(r"(\d+(\.\d+)?)%", msg)
-        if m: self.progress_var.set(float(m.group(1)))
-        if any(e in msg for e in ["🎬", "🎙️", "🌍", "🔥"]): self.status_label.config(text=msg.strip())
+        self._update_progress_from_log(msg)
+        if any(e in msg for e in ["🎬", "🎙️", "🌍", "🔥"]): self.status_label.configure(text=msg.strip())
+
+    def _reset_progress(self, stage=None):
+        self.progress_stage = None
+        self.progress_stage_start = 0.0
+        self.progress_stage_end = 1.0
+        self.progress_var.set(0.0)
+        if stage:
+            self._enter_progress_stage(stage)
+
+    def _enter_progress_stage(self, stage):
+        current = min(1.0, max(0.0, float(self.progress_var.get())))
+        if stage == "upload":
+            start, end = current, 1.0
+        else:
+            fixed_start, fixed_end = self.WORKFLOW_STAGE_RANGES[stage]
+            start = max(current, fixed_start)
+            end = max(fixed_end, start)
+        self.progress_stage = stage
+        self.progress_stage_start = start
+        self.progress_stage_end = end
+        self.progress_var.set(start)
+
+    def _set_stage_progress(self, percent):
+        if self.progress_stage is None:
+            return
+        stage_percent = min(100.0, max(0.0, float(percent)))
+        overall = self.progress_stage_start + (
+            self.progress_stage_end - self.progress_stage_start
+        ) * stage_percent / 100.0
+        current = min(1.0, max(0.0, float(self.progress_var.get())))
+        if overall >= current:
+            self.progress_var.set(overall)
+
+    def _update_upload_progress(self, percent):
+        if self.progress_stage != "upload":
+            self._enter_progress_stage("upload")
+        self._set_stage_progress(percent)
+
+    def _update_progress_from_log(self, msg):
+        message = str(msg)
+        for stage, markers in self.PROGRESS_STAGE_MARKERS.items():
+            if any(marker in message for marker in markers):
+                self._enter_progress_stage(stage)
+                return
+        if "开始上传" in message:
+            self._enter_progress_stage("upload")
+            return
+        if "✅ 全部完成" in message:
+            self.progress_var.set(1.0)
+            return
+
+        match = re.search(
+            r"(?:Progress:\s*|\[download\]\s+)(\d+(?:\.\d+)?)%",
+            message,
+            re.IGNORECASE,
+        )
+        if match:
+            self._set_stage_progress(float(match.group(1)))
 
     def _register_process(self, proc):
         with self._process_lock:
@@ -1027,17 +1402,13 @@ class AutoSubGUI:
         v = self.input_var.get().strip()
         if not v: return messagebox.showwarning("警告", "请输入视频 URL 或文件")
         
-        # Switch to the Execution Logs tab automatically
-        try:
-            self.notebook.select(self.tab3)
-        except Exception:
-            pass
+        self.notebook.set("日志")
 
         # Reset UI state
-        self.start_btn.config(state="disabled"); self.stop_btn.config(state="normal")
-        self.progress_var.set(0)
-        self.status_label.config(text="🚀 正在启动任务...")
-        self.log_text.config(state="normal"); self.log_text.delete(1.0, tk.END); self.log_text.config(state="disabled")
+        self.start_btn.configure(state="disabled"); self.stop_btn.configure(state="normal")
+        self._reset_progress()
+        self.status_label.configure(text="🚀 正在启动任务...")
+        self.log_text.configure(state="normal"); self.log_text.delete(1.0, tk.END); self.log_text.configure(state="disabled")
         
         # Ensure any previous process is truly gone
         for proc in self._running_processes():
@@ -1058,6 +1429,7 @@ class AutoSubGUI:
             py_exe = venv_py
         cmd = [py_exe, AUTOSUB_SCRIPT, v, "--headless"]
         cmd.extend(["--model", self.whisper_var.get(), "--llm-model", self.llm_model_var.get()])
+        cmd.extend(self._pipeline_stage_flags())
         v_id_str = self.vendor_map.get(self.vendor_var.get(), "")
         if v_id_str:
             cmd.extend(["--llm-provider", v_id_str])
@@ -1088,17 +1460,14 @@ class AutoSubGUI:
         v = self.input_var.get().strip()
         if not v: return messagebox.showwarning("警告", "请输入视频 URL 或文件路径（用于定位项目目录）")
 
-        try:
-            self.notebook.select(self.tab3)
-        except Exception:
-            pass
+        self.notebook.set("日志")
 
-        self.start_btn.config(state="disabled")
-        self.upload_btn.config(state="disabled")
-        self.stop_btn.config(state="normal")
-        self.progress_var.set(0)
-        self.status_label.config(text="📤 正在准备上传...")
-        self.log_text.config(state="normal"); self.log_text.delete(1.0, tk.END); self.log_text.config(state="disabled")
+        self.start_btn.configure(state="disabled")
+        self.upload_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+        self._reset_progress(stage="upload")
+        self.status_label.configure(text="📤 正在准备上传...")
+        self.log_text.configure(state="normal"); self.log_text.delete(1.0, tk.END); self.log_text.configure(state="disabled")
         self._upload_abort.clear()
 
         py_exe = sys.executable
@@ -1121,6 +1490,12 @@ class AutoSubGUI:
 
     def run_worker(self, cmd, input_video, output_dir, gdrive_folder="", py_exe=None):
         import glob
+        upload_enabled = bool(
+            getattr(self, "upload_enabled_var", None)
+            and self.upload_enabled_var.get()
+        )
+        if not upload_enabled:
+            gdrive_folder = ""
         # Post-pipeline upload logs are opened after the real project workdir is
         # resolved. A local input may live in Downloads while autosub.py copies
         # and burns the video under Projects.
@@ -1140,14 +1515,14 @@ class AutoSubGUI:
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', bufsize=1)
             self._register_process(proc)
-            self.root.after(0, lambda: self.pause_btn.config(state="normal"))
+            self.root.after(0, lambda: self.pause_btn.configure(state="normal"))
             if proc.stdout:
                 for line in proc.stdout: self.root.after(0, self.log, line.strip())
             ret_code = proc.wait()
             # Keep the pause/stop controls alive for GD/BI/WX post-processing.
             self._unregister_process(proc)
             if ret_code != 0:
-                self.root.after(0, lambda r=ret_code: self.status_label.config(text="❌ 失败"))
+                self.root.after(0, lambda r=ret_code: self.status_label.configure(text="❌ 失败"))
             else:
                 # --- Parallel post-processing uploads ---
                 # GDrive sync and Bilibili upload only READ the finished hardsub
@@ -1273,9 +1648,7 @@ class AutoSubGUI:
                     def on_progress(pct):
                         self.root.after(
                             0,
-                            lambda p=pct: self.status_label.config(
-                                text=f"📤 {label} {p:.0f}%"
-                            ),
+                            lambda p=pct: self._update_upload_progress(p),
                         )
 
                     def register_upload_process(child):
@@ -1351,7 +1724,7 @@ class AutoSubGUI:
                 def start_upload_job(label, ucmd, marker):
                     self.root.after(
                         0,
-                        lambda: self.status_label.config(text=f"📤 {label} 上传中..."),
+                        lambda: self.status_label.configure(text=f"📤 {label} 上传中..."),
                     )
                     thread = threading.Thread(
                         target=run_upload,
@@ -1361,10 +1734,10 @@ class AutoSubGUI:
                     upload_threads.append(thread)
                     thread.start()
 
-                bili_pending = self.bili_enabled_var.get() and not (
+                bili_pending = upload_enabled and self.bili_enabled_var.get() and not (
                     sync_dir and os.path.exists(os.path.join(sync_dir, ".bili_uploaded"))
                 )
-                wechat_pending = self.wechat_enabled_var.get() and not (
+                wechat_pending = upload_enabled and self.wechat_enabled_var.get() and not (
                     sync_dir and os.path.exists(os.path.join(sync_dir, ".wechat_uploaded"))
                 )
                 if not ad_removal_ok:
@@ -1413,7 +1786,7 @@ class AutoSubGUI:
                     from autosub import prepare_bili_upload_metadata
                     self.root.after(
                         0,
-                        lambda: self.status_label.config(
+                        lambda: self.status_label.configure(
                             text="🧠 [MG] 生成B站标题和摘要..."
                         ),
                     )
@@ -1453,7 +1826,7 @@ class AutoSubGUI:
                             _persist(f"⚠️ 找不到 GDrive 同步脚本或凭证，跳过 Drive 同步: {sync_script}")
                 # 2) Bilibili upload (cmd built by the canonical autosub.build_bili_cmd,
                 #    shared with the CLI and batch engine)
-                if self.bili_enabled_var.get():
+                if upload_enabled and self.bili_enabled_var.get():
                     if sync_dir and os.path.exists(os.path.join(sync_dir, ".bili_uploaded")):
                         _persist("📱 [Bilibili] 已上传过 (跳过)")
                     elif not bili_pending:
@@ -1497,7 +1870,7 @@ class AutoSubGUI:
                     from autosub import prepare_wechat_upload_metadata
                     self.root.after(
                         0,
-                        lambda: self.status_label.config(
+                        lambda: self.status_label.configure(
                             text="🧠 [MG] 生成微信标题..."
                         ),
                     )
@@ -1513,7 +1886,7 @@ class AutoSubGUI:
                         wechat_pending = False
                         metadata_failures.append("💬 [WeChat]")
                 # 3) WeChat Channels upload (default: draft; public requires explicit checkbox)
-                if self.wechat_enabled_var.get():
+                if upload_enabled and self.wechat_enabled_var.get():
                     if sync_dir and os.path.exists(os.path.join(sync_dir, ".wechat_uploaded")):
                         _persist("💬 [WeChat] 已上传过 (跳过)")
                     elif not wechat_pending:
@@ -1545,7 +1918,9 @@ class AutoSubGUI:
                                 _persist("⚠️ 微信视频号上传命令构建失败。")
                             else:
                                 _persist("⚠️ 未找到生成的 hardsub 视频文件，跳过微信视频号上传。")
-                if upload_threads:
+                if not upload_enabled:
+                    _persist("⏭️ 上传阶段已关闭")
+                elif upload_threads:
                     for upload_thread in upload_threads:
                         upload_thread.join()
                 else:
@@ -1555,10 +1930,10 @@ class AutoSubGUI:
                 ]
                 if failed_uploads:
                     _persist("⚠️ 上传未全部完成: " + ", ".join(failed_uploads))
-                    self.root.after(0, lambda: self.status_label.config(text="⚠️ 部分上传失败"))
+                    self.root.after(0, lambda: self.status_label.configure(text="⚠️ 部分上传失败"))
                 else:
                     _persist("✅ 全部完成！")
-                    self.root.after(0, lambda: self.status_label.config(text="✅ 完成！"))
+                    self.root.after(0, lambda: self.status_label.configure(text="✅ 完成！"))
         except Exception as e:
             _persist(f"错误: {str(e)}")
             self.root.after(0, self.log, f"错误: {str(e)}")
@@ -1567,10 +1942,10 @@ class AutoSubGUI:
                 try: _log_file.close()
                 except: pass
             self._prune_finished_processes()
-            self.root.after(0, lambda: self.start_btn.config(state="normal"))
-            self.root.after(0, lambda: self.upload_btn.config(state="normal"))
-            self.root.after(0, lambda: self.stop_btn.config(state="disabled"))
-            self.root.after(0, lambda: self.pause_btn.config(state="disabled", text="暂停 (Pause)"))
+            self.root.after(0, lambda: self.start_btn.configure(state="normal"))
+            self.root.after(0, lambda: self.upload_btn.configure(state="normal"))
+            self.root.after(0, lambda: self.stop_btn.configure(state="disabled"))
+            self.root.after(0, lambda: self.pause_btn.configure(state="disabled", text="暂停"))
             self.root.after(0, self.refresh_history)
             self.root.after(0, lambda: self._update_input_after_run(input_video))
             self._upload_abort.clear()
@@ -1587,7 +1962,7 @@ class AutoSubGUI:
             ]
             if resumed:
                 self.is_paused = False
-                self.root.after(0, lambda: self.pause_btn.config(text="暂停 (Pause)"))
+                self.root.after(0, lambda: self.pause_btn.configure(text="暂停"))
                 self.root.after(
                     0,
                     lambda count=len(resumed): self.log(f"▶️ 已继续 {count} 个进程"),
@@ -1600,7 +1975,7 @@ class AutoSubGUI:
             ]
             if suspended:
                 self.is_paused = True
-                self.root.after(0, lambda: self.pause_btn.config(text="继续 (Resume)"))
+                self.root.after(0, lambda: self.pause_btn.configure(text="继续"))
                 self.root.after(
                     0,
                     lambda count=len(suspended): self.log(f"⏸️ 已暂停 {count} 个进程"),
@@ -1610,6 +1985,7 @@ class AutoSubGUI:
 
     def stop_process(self):
         self._upload_abort.set()
+        self._reset_progress()
         processes = self._running_processes()
         if processes:
             try:
@@ -1622,11 +1998,11 @@ class AutoSubGUI:
                 0,
                 lambda count=len(processes): self.log(f"⛔ 已停止 {count} 个进程"),
             )
-        self.root.after(0, lambda: self.status_label.config(text="已停止"))
-        self.root.after(0, lambda: self.start_btn.config(state="normal"))
-        self.root.after(0, lambda: self.upload_btn.config(state="normal"))
-        self.root.after(0, lambda: self.stop_btn.config(state="disabled"))
-        self.root.after(0, lambda: self.pause_btn.config(state="disabled", text="暂停 (Pause)"))
+        self.root.after(0, lambda: self.status_label.configure(text="已停止"))
+        self.root.after(0, lambda: self.start_btn.configure(state="normal"))
+        self.root.after(0, lambda: self.upload_btn.configure(state="normal"))
+        self.root.after(0, lambda: self.stop_btn.configure(state="disabled"))
+        self.root.after(0, lambda: self.pause_btn.configure(state="disabled", text="暂停"))
         self.is_paused = False
 
 
@@ -1648,9 +2024,9 @@ class AutoSubGUI:
             self.notebook.select(self.tab3)
         except Exception:
             pass
-        self.progress_var.set(0)
-        self.status_label.config(text="📺 正在识别并剪除广告片段...")
-        self.log_text.config(state="normal"); self.log_text.delete(1.0, tk.END); self.log_text.config(state="disabled")
+        self._reset_progress()
+        self.status_label.configure(text="📺 正在识别并剪除广告片段...")
+        self.log_text.configure(state="normal"); self.log_text.delete(1.0, tk.END); self.log_text.configure(state="disabled")
         py_exe = sys.executable
         venv_py = os.path.join(CURRENT_DIR, ".venv", "bin", "python" if sys.platform != "win32" else "python.exe")
         if os.path.exists(venv_py):
@@ -1666,8 +2042,8 @@ class AutoSubGUI:
             "--cut-mode", self.ad_cut_mode_var.get(),
         ]
         print(f"📺 [GUI] Launching remove_ads: {' '.join(cmd)}")
-        self.start_btn.config(state="disabled")
-        self.stop_btn.config(state="normal")
+        self.start_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
         threading.Thread(target=self._remove_ads_worker, args=(cmd,), daemon=True).start()
 
     def _remove_ads_worker(self, cmd):
@@ -1675,24 +2051,24 @@ class AutoSubGUI:
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', bufsize=1)
             self._register_process(proc)
-            self.root.after(0, lambda: self.pause_btn.config(state="normal"))
+            self.root.after(0, lambda: self.pause_btn.configure(state="normal"))
             if proc.stdout:
                 for line in proc.stdout:
                     self.root.after(0, self.log, line.strip())
             ret = proc.wait()
             if ret == 0:
-                self.root.after(0, lambda: self.status_label.config(text="✅ 广告剪除完成"))
+                self.root.after(0, lambda: self.status_label.configure(text="✅ 广告剪除完成"))
             else:
-                self.root.after(0, lambda: self.status_label.config(text="❌ 广告剪除失败"))
+                self.root.after(0, lambda: self.status_label.configure(text="❌ 广告剪除失败"))
         except Exception as e:
             self.root.after(0, lambda: self.log(f"❌ 广告剪除异常: {e}"))
         finally:
             if proc is not None:
                 self._unregister_process(proc)
             self._prune_finished_processes()
-            self.root.after(0, lambda: self.start_btn.config(state="normal"))
-            self.root.after(0, lambda: self.stop_btn.config(state="disabled"))
-            self.root.after(0, lambda: self.pause_btn.config(state="disabled", text="暂停 (Pause)"))
+            self.root.after(0, lambda: self.start_btn.configure(state="normal"))
+            self.root.after(0, lambda: self.stop_btn.configure(state="disabled"))
+            self.root.after(0, lambda: self.pause_btn.configure(state="disabled", text="暂停"))
 
     def save_settings(self):
         data = {
@@ -1722,6 +2098,10 @@ class AutoSubGUI:
             "ad_cut_mode": self.ad_cut_mode_var.get(),
             "sync_gdrive": self.sync_gdrive_var.get(),
             "gdrive_enabled": self.gdrive_enabled_var.get(),
+            "transcription_enabled": self.transcription_enabled_var.get(),
+            "translation_enabled": self.translation_enabled_var.get(),
+            "burn_enabled": self.burn_enabled_var.get(),
+            "upload_enabled": self.upload_enabled_var.get(),
             "wechat_enabled": self.wechat_enabled_var.get(),
             "wechat_public": self.wechat_public_var.get(),
             "vendor_default_models": self.vendor_default_models

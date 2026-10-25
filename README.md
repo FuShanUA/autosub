@@ -10,6 +10,7 @@ AutoSub is a professional, "zero-click" workflow to download, transcribe, transl
 - **Whisper Transcription**: Uses `faster-whisper` for high-accuracy English transcription.
 - **LLM Translation**: Context-aware translation using Gemini (Flash/Pro), DeepSeek, Silicon Flow, Zhipu (GLM), or OpenAI, with humanized style rules.
 - **Professional Styling**: One-click generation of hard-subbed videos with bilingual layouts and vector-box styles.
+- **Stage Control**: Runs end to end by default, and can optionally skip transcription, translation, or upload, with Google Drive, Bilibili, and WeChat Channels as upload destinations.
 - **Dynamic Model Discovery**: Automatically discovers the latest models from API providers.
 - **Portable Workspaces**: Supports isolated Project Root directories to keep video assets and subtitles neatly organized.
 - **GUI & CLI**: User-friendly interface or powerful command-line automation.
@@ -50,6 +51,11 @@ If you encounter YouTube bot detection or need to download Bilibili premium cont
 4. **Usage**:
    - **GUI**: Click "Browse..." in the "Cookies" row to load the file.
    - **CLI**: Append `--cookies "path/to/cookies.txt"` to your command.
+
+### 3. Stage Control
+The default workflow still runs download, transcription, translation, burning, and upload. To skip a stage:
+- **GUI**: Uncheck "Transcription", "Translation", or "Upload" on the "Task & Stages" tab; choose upload destinations on the "Output & Upload" tab.
+- **CLI**: Use `--skip-transcription`, `--skip-translation`, or `--no-upload`; specify destinations with `--upload-targets gdrive bilibili wechat`.
 
 ## ⚠️ Troubleshooting
 
