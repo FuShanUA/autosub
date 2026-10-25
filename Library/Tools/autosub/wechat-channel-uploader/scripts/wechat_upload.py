@@ -1615,6 +1615,45 @@ async def _save_cover_dialog_debug(page, tag="confirm"):
         pass
 
 
+async def _click_uploaded_cover_thumb(page):
+    """Click the dialog's 上传封面 thumbnail to make it the crop source.
+
+    WeChat does not always switch the croppie source after the file input is
+    set; a person would click the uploaded thumbnail under the key-frame
+    slider. Do the same so the crop canvas shows our image.
+    """
+    try:
+        return await page.evaluate(
+            """() => {
+                const root = document.querySelector('wujie-app')?.shadowRoot?.querySelector('html') || document;
+                const visible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    if (style.display === 'none' || style.visibility === 'hidden') return false;
+                    const rect = el.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                };
+                const wrappers = Array.from(
+                    root.querySelectorAll('.edit-cover-dialog-container .weui-desktop-dialog__wrp')
+                ).filter(visible);
+                const scope = wrappers.length ? wrappers[wrappers.length - 1] : null;
+                if (!scope) return false;
+                const labels = Array.from(scope.querySelectorAll('.text-wrap'))
+                    .filter((el) => (el.textContent || '').trim() === '上传封面');
+                for (const label of labels) {
+                    const target = label.parentElement;
+                    if (target && visible(target)) {
+                        target.click();
+                        return true;
+                    }
+                }
+                return false;
+            }"""
+        )
+    except Exception:
+        return False
+
+
 async def _cover_dialog_canvas_matches(page, cover_path, threshold=45.0):
     """Whether the crop canvas already shows our uploaded cover.
 
@@ -2012,12 +2051,20 @@ async def _upload_wechat_cover_card(page, cover_path, orientation, expected_titl
         # to actually show our cover, reopening the dialog once if needed.
         async def _wait_canvas_shows_cover(seconds):
             deadline = time.time() + seconds
+            last_thumb_click = 0.0
             while time.time() < deadline:
                 if await _cover_dialog_canvas_matches(page, cover_path):
                     return True
+                # A person would click the uploaded thumbnail to make it the
+                # crop source; do the same while waiting for WeChat to catch up.
+                if time.time() - last_thumb_click >= 10:
+                    last_thumb_click = time.time()
+                    if await _click_uploaded_cover_thumb(page):
+                        print(">>> 已点击弹层内的上传封面缩略图")
                 await asyncio.sleep(2)
             return False
 
+        await _click_uploaded_cover_thumb(page)
         canvas_ok = await _wait_canvas_shows_cover(180)
         if not canvas_ok:
             print(">>> 裁剪画布仍未切换到上传封面，关闭弹层重开一次")
@@ -2030,6 +2077,7 @@ async def _upload_wechat_cover_card(page, cover_path, orientation, expected_titl
             except Exception:
                 print(">>> 重开封面编辑弹层失败")
                 return False
+            await _click_uploaded_cover_thumb(page)
             canvas_ok = await _wait_canvas_shows_cover(180)
         if not canvas_ok:
             print(">>> 裁剪画布始终未切换到上传封面，放弃本次封面设置以保留现有封面")
