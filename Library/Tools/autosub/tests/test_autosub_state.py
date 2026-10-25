@@ -101,7 +101,10 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         gui.current_processes = [FakeProcess(101), FakeProcess(202)]
         gui._process_lock = threading.Lock()
         gui.is_paused = False
-        gui.pause_btn = SimpleNamespace(config=lambda **_kwargs: None)
+        pause_texts = []
+        gui.pause_btn = SimpleNamespace(
+            configure=lambda **kwargs: pause_texts.append(kwargs.get("text"))
+        )
         logs = []
         gui.log = logs.append
 
@@ -117,6 +120,55 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
 
         self.assertIn("⏸️ 已暂停 2 个进程", logs)
         self.assertIn("▶️ 已继续 2 个进程", logs)
+        self.assertEqual(pause_texts, ["继续", "暂停"])
+
+    def test_gui_progress_maps_stage_percent_to_normalized_bar(self):
+        """A stage's 100% must not fill the whole workflow bar."""
+        import autosub_gui
+        from autosub_gui import AutoSubGUI
+
+        class FakeProgressVar:
+            def __init__(self):
+                self.value = 0.0
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = float(value)
+
+        gui = AutoSubGUI.__new__(AutoSubGUI)
+        gui.progress_var = FakeProgressVar()
+        gui.progress_stage = None
+        gui.progress_stage_start = 0.0
+        gui.progress_stage_end = 1.0
+
+        gui._update_progress_from_log("🎬 Downloading https://example.com/video...")
+        gui._update_progress_from_log("Progress: 100.0%")
+        self.assertAlmostEqual(gui.progress_var.get(), 0.10)
+
+        gui._update_progress_from_log("🎙️ Transcribing video.mp4...")
+        gui._update_progress_from_log("Progress: 50.0%")
+        self.assertAlmostEqual(gui.progress_var.get(), 0.275)
+
+        gui._update_progress_from_log("🌍 Smart-translating...")
+        gui._update_progress_from_log("Progress: 100.0%")
+        self.assertAlmostEqual(gui.progress_var.get(), 0.80)
+
+        gui._update_progress_from_log("🔥 Burning subtitles...")
+        gui._update_progress_from_log("Progress: 100.0%")
+        self.assertAlmostEqual(gui.progress_var.get(), 0.95)
+
+        gui._update_progress_from_log("📤 [Bilibili] 开始上传...")
+        gui._update_upload_progress(50.0)
+        self.assertAlmostEqual(gui.progress_var.get(), 0.975)
+
+        gui._update_progress_from_log("✅ 全部完成！")
+        self.assertEqual(gui.progress_var.get(), 1.0)
+
+        gui._reset_progress(stage="upload")
+        gui._update_progress_from_log("覆盖率 90%，不是进度行")
+        self.assertEqual(gui.progress_var.get(), 0.0)
 
     def test_upload_only_leaves_platform_uploads_to_worker(self):
         """Upload-only must not let autosub.py bypass ad removal and job setup."""
@@ -125,14 +177,15 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         gui = autosub_gui.AutoSubGUI.__new__(autosub_gui.AutoSubGUI)
         gui.root = SimpleNamespace(after=lambda _delay, callback: callback())
         gui._upload_abort = threading.Event()
-        gui.notebook = SimpleNamespace(select=lambda: None)
-        gui.start_btn = SimpleNamespace(config=lambda **_kwargs: None)
-        gui.upload_btn = SimpleNamespace(config=lambda **_kwargs: None)
-        gui.stop_btn = SimpleNamespace(config=lambda **_kwargs: None)
-        gui.progress_var = SimpleNamespace(set=lambda _value: None)
-        gui.status_label = SimpleNamespace(config=lambda **_kwargs: None)
+        notebook_calls = []
+        gui.notebook = SimpleNamespace(set=notebook_calls.append)
+        gui.start_btn = SimpleNamespace(configure=lambda **_kwargs: None)
+        gui.upload_btn = SimpleNamespace(configure=lambda **_kwargs: None)
+        gui.stop_btn = SimpleNamespace(configure=lambda **_kwargs: None)
+        gui.progress_var = SimpleNamespace(get=lambda: 0.0, set=lambda _value: None)
+        gui.status_label = SimpleNamespace(configure=lambda **_kwargs: None)
         gui.log_text = SimpleNamespace(
-            config=lambda **_kwargs: None,
+            configure=lambda **_kwargs: None,
             delete=lambda *_args: None,
         )
         gui.input_var = SimpleNamespace(get=lambda: "video.mp4")
@@ -153,11 +206,178 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
 
         cmd = mock_thread.call_args.kwargs["args"][0]
         mock_persist.assert_called_once_with("video.mp4")
+        self.assertEqual(notebook_calls, ["日志"])
         self.assertIn("--upload-only", cmd)
         self.assertNotIn("--sync-gdrive", cmd)
         self.assertNotIn("--bili-upload", cmd)
         self.assertNotIn("--wechat-upload", cmd)
         self.assertNotIn("--wechat-public", cmd)
+
+    def test_start_process_switches_to_log_tab(self):
+        """Starting the main pipeline must immediately show the log page."""
+        import autosub_gui
+
+        gui = autosub_gui.AutoSubGUI.__new__(autosub_gui.AutoSubGUI)
+        gui.root = SimpleNamespace(after=lambda _delay, callback: callback())
+        gui.input_var = SimpleNamespace(get=lambda: "video.mp4")
+        notebook_calls = []
+        gui.notebook = SimpleNamespace(set=notebook_calls.append)
+        gui.start_btn = SimpleNamespace(configure=lambda **_kwargs: None)
+        gui.stop_btn = SimpleNamespace(configure=lambda **_kwargs: None)
+        gui.progress_var = SimpleNamespace(set=lambda _value: None)
+        gui.status_label = SimpleNamespace(configure=lambda **_kwargs: None)
+        gui.log_text = SimpleNamespace(
+            configure=lambda **_kwargs: None,
+            delete=lambda *_args: None,
+        )
+        gui.current_processes = []
+        gui._process_lock = threading.Lock()
+        gui._upload_abort = threading.Event()
+        gui.trans_mode_var = SimpleNamespace(get=lambda: "balanced")
+        gui.style_var = SimpleNamespace(get=lambda: "auto")
+        gui.whisper_var = SimpleNamespace(get=lambda: "large-v2")
+        gui.llm_model_var = SimpleNamespace(get=lambda: "qwen3.7-max")
+        gui.transcription_enabled_var = SimpleNamespace(get=lambda: True)
+        gui.translation_enabled_var = SimpleNamespace(get=lambda: True)
+        gui.burn_enabled_var = SimpleNamespace(get=lambda: True)
+        gui.vendor_var = SimpleNamespace(get=lambda: "Alibaba (Bailian)")
+        gui.vendor_map = {"Alibaba (Bailian)": "dashscope"}
+        gui.quality_var = SimpleNamespace(get=lambda: "high")
+        gui.layout_var = SimpleNamespace(get=lambda: "bilingual")
+        gui.main_lang_var = SimpleNamespace(get=lambda: "cn")
+        gui.cn_font_var = SimpleNamespace(get=lambda: "STKaiti")
+        gui.en_font_var = SimpleNamespace(get=lambda: "Arial")
+        gui.jp_font_var = SimpleNamespace(get=lambda: "Hiragino Maru Gothic ProN")
+        gui.cn_size_var = SimpleNamespace(get=lambda: "60")
+        gui.en_size_var = SimpleNamespace(get=lambda: "36")
+        gui.jp_size_var = SimpleNamespace(get=lambda: "36")
+        gui.bg_box_var = SimpleNamespace(get=lambda: True)
+        gui.quick_var = SimpleNamespace(get=lambda: False)
+        gui.multilang_var = SimpleNamespace(get=lambda: False)
+        gui.cookies_var = SimpleNamespace(get=lambda: "")
+        gui.output_dir_var = SimpleNamespace(get=lambda: "")
+        gui.sync_gdrive_var = SimpleNamespace(get=lambda: "")
+        gui.gdrive_enabled_var = SimpleNamespace(get=lambda: False)
+        gui._persist_input_value = MagicMock()
+
+        with patch.object(autosub_gui.threading, "Thread") as mock_thread:
+            mock_thread.return_value = SimpleNamespace(start=lambda: None)
+            gui.start_process()
+
+        self.assertEqual(notebook_calls, ["日志"])
+        self.assertEqual(mock_thread.call_count, 1)
+
+    def test_start_process_passes_skip_burn_flag(self):
+        """Unchecked burn stage must reach the CLI command."""
+        import autosub_gui
+
+        gui = autosub_gui.AutoSubGUI.__new__(autosub_gui.AutoSubGUI)
+        gui.root = SimpleNamespace(after=lambda _delay, callback: callback())
+        gui.input_var = SimpleNamespace(get=lambda: "video.mp4")
+        gui.notebook = SimpleNamespace(set=lambda _value: None)
+        gui.start_btn = SimpleNamespace(configure=lambda **_kwargs: None)
+        gui.stop_btn = SimpleNamespace(configure=lambda **_kwargs: None)
+        gui.progress_var = SimpleNamespace(set=lambda _value: None)
+        gui.status_label = SimpleNamespace(configure=lambda **_kwargs: None)
+        gui.log_text = SimpleNamespace(
+            configure=lambda **_kwargs: None,
+            delete=lambda *_args: None,
+        )
+        gui.current_processes = []
+        gui._process_lock = threading.Lock()
+        gui._upload_abort = threading.Event()
+        gui.trans_mode_var = SimpleNamespace(get=lambda: "balanced")
+        gui.style_var = SimpleNamespace(get=lambda: "auto")
+        gui.whisper_var = SimpleNamespace(get=lambda: "large-v2")
+        gui.llm_model_var = SimpleNamespace(get=lambda: "qwen3.7-max")
+        gui.transcription_enabled_var = SimpleNamespace(get=lambda: True)
+        gui.translation_enabled_var = SimpleNamespace(get=lambda: True)
+        gui.burn_enabled_var = SimpleNamespace(get=lambda: False)
+        gui.vendor_var = SimpleNamespace(get=lambda: "Alibaba (Bailian)")
+        gui.vendor_map = {"Alibaba (Bailian)": "dashscope"}
+        gui.quality_var = SimpleNamespace(get=lambda: "high")
+        gui.layout_var = SimpleNamespace(get=lambda: "bilingual")
+        gui.main_lang_var = SimpleNamespace(get=lambda: "cn")
+        gui.cn_font_var = SimpleNamespace(get=lambda: "STKaiti")
+        gui.en_font_var = SimpleNamespace(get=lambda: "Arial")
+        gui.jp_font_var = SimpleNamespace(get=lambda: "Hiragino Maru Gothic ProN")
+        gui.cn_size_var = SimpleNamespace(get=lambda: "60")
+        gui.en_size_var = SimpleNamespace(get=lambda: "36")
+        gui.jp_size_var = SimpleNamespace(get=lambda: "36")
+        gui.bg_box_var = SimpleNamespace(get=lambda: True)
+        gui.quick_var = SimpleNamespace(get=lambda: False)
+        gui.multilang_var = SimpleNamespace(get=lambda: False)
+        gui.cookies_var = SimpleNamespace(get=lambda: "")
+        gui.output_dir_var = SimpleNamespace(get=lambda: "")
+        gui.sync_gdrive_var = SimpleNamespace(get=lambda: "")
+        gui.gdrive_enabled_var = SimpleNamespace(get=lambda: False)
+        gui._persist_input_value = lambda _value: None
+
+        with patch.object(autosub_gui.threading, "Thread") as mock_thread:
+            mock_thread.return_value = SimpleNamespace(start=lambda: None)
+            gui.start_process()
+
+        cmd = mock_thread.call_args.kwargs["args"][0]
+        self.assertIn("--skip-burn", cmd)
+
+    def test_resolve_upload_targets_prefers_explicit_list(self):
+        """Explicit upload targets should override the legacy flags."""
+        args = SimpleNamespace(
+            no_upload=False,
+            upload_targets=["gdrive", "wechat"],
+            sync_gdrive="folder",
+            bili_upload=True,
+            wechat_upload=False,
+        )
+        self.assertEqual(
+            autosub.resolve_upload_targets(args),
+            {"gdrive", "wechat"},
+        )
+
+    def test_resolve_upload_targets_no_upload_wins(self):
+        """--no-upload must disable every destination."""
+        args = SimpleNamespace(
+            no_upload=True,
+            upload_targets=["gdrive", "bilibili", "wechat"],
+            sync_gdrive="folder",
+            bili_upload=True,
+            wechat_upload=True,
+        )
+        self.assertEqual(autosub.resolve_upload_targets(args), set())
+
+    def test_gui_stage_flags_skip_disabled_stages(self):
+        """Unchecked GUI stages must map to the CLI skip flags."""
+        import autosub_gui
+
+        gui = autosub_gui.AutoSubGUI.__new__(autosub_gui.AutoSubGUI)
+        gui.transcription_enabled_var = SimpleNamespace(get=lambda: False)
+        gui.translation_enabled_var = SimpleNamespace(get=lambda: True)
+        gui.burn_enabled_var = SimpleNamespace(get=lambda: True)
+        self.assertEqual(
+            gui._pipeline_stage_flags(),
+            ["--skip-transcription"],
+        )
+
+    def test_gui_stage_flags_skip_burn(self):
+        """Unchecked burn stage must map to --skip-burn."""
+        import autosub_gui
+
+        gui = autosub_gui.AutoSubGUI.__new__(autosub_gui.AutoSubGUI)
+        gui.transcription_enabled_var = SimpleNamespace(get=lambda: True)
+        gui.translation_enabled_var = SimpleNamespace(get=lambda: True)
+        gui.burn_enabled_var = SimpleNamespace(get=lambda: False)
+        self.assertIn("--skip-burn", gui._pipeline_stage_flags())
+
+    def test_history_requirements_ignore_uploads_when_disabled(self):
+        """A disabled upload stage must not keep completed tasks pending."""
+        import autosub_gui
+
+        gui = autosub_gui.AutoSubGUI.__new__(autosub_gui.AutoSubGUI)
+        gui.upload_enabled_var = SimpleNamespace(get=lambda: False)
+        gui.gdrive_enabled_var = SimpleNamespace(get=lambda: True)
+        gui.bili_enabled_var = SimpleNamespace(get=lambda: True)
+        gui.wechat_enabled_var = SimpleNamespace(get=lambda: True)
+        self.assertEqual(gui._history_requirements(), [])
 
     def test_scan_task_history_reads_disk_stage_truth(self):
         """History must report outputs and upload markers from each project."""
@@ -217,6 +437,32 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         self.assertEqual(partial["status"], "本地完成，上传未完成")
         self.assertEqual(partial["missing"], ["GDrive", "B站", "微信"])
         self.assertEqual(failed["status"], "未生成字幕和压制视频")
+
+    def test_history_index_survives_app_update(self):
+        """History records persist outside the app's install directory."""
+        import autosub_gui
+
+        path = os.path.join(self.temp_dir, "history.json")
+        record = {
+            "workdir": "/moved/project",
+            "name": "Moved Project",
+            "source": "https://example.com/moved",
+            "updated_at": "2026-10-16 12:00",
+            "status": "全部完成",
+            "completed": ["字幕", "压制"],
+            "missing": [],
+        }
+
+        autosub_gui.save_history_index([record], path)
+        loaded = autosub_gui.load_history_index(path)
+        merged = autosub_gui.merge_history_records(
+            loaded,
+            [{"workdir": "/new/project", "updated_at": "2026-10-16 11:00"}],
+        )
+
+        self.assertEqual(loaded, [record])
+        self.assertEqual(merged[0], record)
+        self.assertEqual(len(merged), 2)
 
     def test_startup_input_keeps_only_unfinished_work(self):
         """A completed saved task clears the input; unfinished work remains."""
@@ -563,6 +809,85 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         self.assertEqual(task.status, "完成")
         for stage, val in task.pcts.items():
             self.assertEqual(val, 100.0)
+
+    def test_disk_truth_does_not_promote_partial_download(self):
+        """A merged partial MP4 must stay in DL until it matches remote duration."""
+        workdir = os.path.join(self.temp_dir, "partial_download")
+        os.makedirs(workdir)
+        source = os.path.join(workdir, "source.mp4")
+        with open(source, "wb") as handle:
+            handle.write(b"A" * (2 * 1024 * 1024))
+
+        task = SubTask(
+            uid=7,
+            url="http://test.com",
+            title="Partial Video",
+            vid_id="partial",
+            status="排队中 (DL)",
+            duration="25:45",
+            workdir=workdir,
+            pcts={"DL": 65.3, "TR": 0.0, "TL": 0.0, "MR": 0.0, "BR": 0.0, "GD": 0.0},
+        )
+        engine = BatchEngine(output_dir=self.temp_dir, sub_dir_name="project_1")
+
+        with patch.object(BatchEngine, "get_duration", return_value="16:52"):
+            engine.disk_truth(task)
+
+        self.assertEqual(task.status, "排队中 (DL)")
+        self.assertEqual(task.pcts["DL"], 65.5)
+        self.assertIn("源视频时长不完整", task.error)
+        self.assertFalse(os.path.exists(source))
+        backups = [
+            entry for entry in os.listdir(workdir)
+            if entry.startswith(".invalid-partial-run-")
+        ]
+        self.assertEqual(len(backups), 1)
+        self.assertTrue(
+            os.path.exists(os.path.join(workdir, backups[0], "source.mp4"))
+        )
+
+    def test_partial_source_can_be_quarantined_for_retry(self):
+        """Incomplete merged downloads move to the .part namespace before retry."""
+        workdir = os.path.join(self.temp_dir, "quarantine_partial")
+        os.makedirs(workdir)
+        source = os.path.join(workdir, "source.mp4")
+        with open(source, "wb") as handle:
+            handle.write(b"partial")
+
+        engine = BatchEngine(output_dir=self.temp_dir, sub_dir_name="project_1")
+        partial = engine.quarantine_partial_source(source)
+
+        self.assertFalse(os.path.exists(source))
+        self.assertTrue(os.path.exists(partial))
+        self.assertTrue(partial.endswith(".part"))
+
+    def test_completed_partial_download_requires_manual_reset(self):
+        """A completed task built from a partial source must not auto re-upload."""
+        workdir = os.path.join(self.temp_dir, "completed_partial")
+        os.makedirs(workdir)
+        source = os.path.join(workdir, "source.mp4")
+        with open(source, "wb") as handle:
+            handle.write(b"A" * (2 * 1024 * 1024))
+
+        task = SubTask(
+            uid=8,
+            url="http://test.com",
+            title="Completed Partial",
+            vid_id="completed-partial",
+            status="完成",
+            duration="25:45",
+            workdir=workdir,
+            pcts={"DL": 100.0, "TR": 100.0, "TL": 100.0, "MR": 100.0, "BR": 100.0, "GD": 100.0},
+        )
+        engine = BatchEngine(output_dir=self.temp_dir, sub_dir_name="project_1")
+
+        with patch.object(BatchEngine, "get_duration", return_value="16:52"):
+            engine.disk_truth(task)
+
+        self.assertEqual(task.status, "失败 (DL)")
+        self.assertIn("人工重置", task.error)
+        self.assertTrue(os.path.exists(source))
+        self.assertEqual(task.pcts["DL"], 65.5)
 
     def test_disk_truth_missing_burn_complete_auto_repair(self):
         """If workdir contains _hardsub.mp4 (>1MB) but lacks .burn_complete, it should auto-repair and set status to Completed."""
@@ -1603,8 +1928,260 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         mock_wechat.assert_not_called()
         self.assertEqual(task.status, "失败 (WX)")
         self.assertEqual(task.retries, 0)
+        self.assertTrue(task.wx_metadata_failed)
         self.assertTrue(os.path.exists(os.path.join(workdir, ".bili_uploaded")))
         self.assertFalse(os.path.exists(os.path.join(workdir, ".wechat_uploaded")))
+
+    def test_reset_after_wechat_metadata_failure_targets_wx_only(self):
+        """R+ID must preserve a successful BI upload when WX metadata failed."""
+        workdir = os.path.join(self.temp_dir, "batch_reset_wx_metadata")
+        os.makedirs(workdir)
+        metadata_path = os.path.join(workdir, "upload_metadata.json")
+        bili_marker = os.path.join(workdir, ".bili_uploaded")
+        with open(metadata_path, "w", encoding="utf-8") as handle:
+            handle.write("{}")
+        with open(bili_marker, "w", encoding="utf-8") as handle:
+            handle.write("1")
+
+        state_file = os.path.join(self.temp_dir, "wx_metadata_state.json")
+        task = SubTask(
+            uid=25,
+            url="http://test.com",
+            title="Video 25",
+            status="失败 (WX)",
+            workdir=workdir,
+            pcts={
+                "DL": 100.0,
+                "TR": 100.0,
+                "TL": 100.0,
+                "MR": 100.0,
+                "BR": 100.0,
+                "GD": 100.0,
+                "MG": 60.0,
+                "BI": 100.0,
+                "WX": 0.0,
+            },
+            wx_metadata_failed=True,
+        )
+        engine = BatchEngine(
+            output_dir=self.temp_dir,
+            sub_dir_name="project",
+            state_file=state_file,
+        )
+        engine.do_gdsync = False
+        engine.do_bili = True
+        engine.do_wechat = True
+        engine.task_map[task.uid] = task
+
+        self.assertEqual(engine.reset_task(task), "WX")
+        self.assertEqual(task.status, "排队中 (WX)")
+        self.assertTrue(os.path.exists(bili_marker))
+        self.assertTrue(os.path.exists(metadata_path))
+        self.assertEqual(task.pcts["BI"], 100.0)
+        self.assertEqual(task.pcts["MG"], 60.0)
+
+        restarted_engine = BatchEngine(
+            output_dir=self.temp_dir,
+            sub_dir_name="project",
+            state_file=state_file,
+        )
+        restarted_engine.do_gdsync = False
+        restarted_engine.do_bili = True
+        restarted_engine.do_wechat = True
+        restarted_engine.load_state()
+        self.assertEqual(restarted_engine.task_map[25].status, "排队中 (WX)")
+
+    def test_old_state_migrates_wechat_metadata_failure_to_wx_retry(self):
+        """A pre-upgrade task 25 state must not reset BI through MG."""
+        workdir = os.path.join(self.temp_dir, "old_wx_metadata_state")
+        os.makedirs(workdir)
+        with open(os.path.join(workdir, ".bili_uploaded"), "w", encoding="utf-8") as handle:
+            handle.write("1")
+
+        task_data = {
+            "uid": 25,
+            "url": "http://test.com",
+            "title": "Video 25",
+            "status": "失败 (WX)",
+            "error": "视频号元数据生成失败或不完整，WX上传未启动",
+            "workdir": workdir,
+            "pcts": {
+                "DL": 100.0,
+                "TR": 100.0,
+                "TL": 100.0,
+                "MR": 100.0,
+                "BR": 100.0,
+                "GD": 100.0,
+                "MG": 60.0,
+                "BI": 100.0,
+                "WX": 0.0,
+            },
+        }
+        state_file = os.path.join(self.temp_dir, "old_batch_state.json")
+        with open(state_file, "w", encoding="utf-8") as handle:
+            json.dump({"25": task_data, "bili": True, "wechat": True}, handle)
+
+        engine = BatchEngine(
+            output_dir=self.temp_dir,
+            sub_dir_name="project",
+            state_file=state_file,
+        )
+        engine.load_state()
+
+        task = engine.task_map[25]
+        self.assertTrue(task.wx_metadata_failed)
+        self.assertEqual(task.status, "排队中 (WX)")
+        self.assertEqual(engine.reset_task(task), "WX")
+        self.assertTrue(os.path.exists(os.path.join(workdir, ".bili_uploaded")))
+
+    def test_wechat_metadata_retry_prefers_local_fallback(self):
+        """A WX metadata retry must not loop through remote title models."""
+        workdir = os.path.join(self.temp_dir, "wechat_local_retry")
+        os.makedirs(workdir)
+        hardsub = os.path.join(workdir, "video_hardsub.mp4")
+        with open(hardsub, "w", encoding="utf-8") as handle:
+            handle.write("video")
+        metadata = {
+            "source_title": "A Conversation: Palantir Meritocracy Fellows",
+            "description": (
+                "Palantir在Tribeca直播对话三位Meritocracy Fellowship成员。"
+                "这期25人的项目让年轻人跳过大学，直接参与核心业务。"
+            ),
+            "title": "Palantir在Tribeca直播对话三位Meritocracy Fellowship成员",
+            "cover_title": "Isaac他们为Hertz做的东西，让客户每天省下了X个小时的工作量",
+            "wechat_title": "",
+        }
+        with open(os.path.join(workdir, "upload_metadata.json"), "w", encoding="utf-8") as handle:
+            json.dump(metadata, handle, ensure_ascii=False)
+
+        result = autosub.prepare_wechat_upload_metadata(
+            workdir,
+            prefer_local_wechat_fallback=True,
+        )
+
+        self.assertEqual(result["wechat_title"], "Palantir培养年轻人才")
+        with open(os.path.join(workdir, "upload_metadata.json"), encoding="utf-8") as handle:
+            saved = json.load(handle)
+        self.assertEqual(saved["wechat_title"], "Palantir培养年轻人才")
+
+    def test_wechat_only_retry_reports_wx_not_mg(self):
+        """A lone WX retry is a WX stage even while its metadata is rebuilt."""
+        workdir = os.path.join(self.temp_dir, "wx_only_retry")
+        os.makedirs(workdir)
+        with open(os.path.join(workdir, ".bili_uploaded"), "w", encoding="utf-8") as handle:
+            handle.write("1")
+        task = SubTask(
+            uid=25,
+            url="http://test.com",
+            title="Video 25",
+            status="排队中 (WX)",
+            workdir=workdir,
+            pcts={
+                "DL": 100.0,
+                "TR": 100.0,
+                "TL": 100.0,
+                "MR": 100.0,
+                "BR": 100.0,
+                "GD": 100.0,
+                "MG": 0.0,
+                "BI": 100.0,
+                "WX": 0.0,
+            },
+            wx_metadata_failed=True,
+        )
+        engine = BatchEngine(
+            output_dir=self.temp_dir,
+            sub_dir_name="project",
+            state_file=os.path.join(self.temp_dir, "wx_only_state.json"),
+        )
+        engine.do_gdsync = False
+        engine.do_bili = True
+        engine.do_wechat = True
+        engine.task_map[task.uid] = task
+        observed_statuses = []
+
+        def fake_wechat_metadata(_workdir, **kwargs):
+            observed_statuses.append(task.status)
+            self.assertTrue(kwargs["prefer_local_wechat_fallback"])
+            return {
+                "wechat_title": "Palantir培养年轻人才",
+                "desc": "共享简介",
+                "cover_title": "封面标题",
+            }
+
+        def fake_wechat_run(current_task, _cmd, result_box):
+            result_box[0] = True
+            engine._write_upload_marker(current_task, "WX")
+            return True
+
+        worker = threading.Thread(target=engine.worker, args=(task,), daemon=True)
+        with patch.object(
+            BatchEngine,
+            "disk_truth",
+            side_effect=lambda current_task: setattr(
+                current_task,
+                "status",
+                "完成" if os.path.exists(os.path.join(workdir, ".wechat_uploaded")) else current_task.status,
+            ),
+        ), \
+             patch.object(batch_pro, "prepare_wechat_upload_metadata", side_effect=fake_wechat_metadata), \
+             patch.object(batch_pro, "build_wechat_cmd", return_value=["wechat-upload"]), \
+             patch.object(BatchEngine, "_run_wechat_upload", side_effect=fake_wechat_run):
+            worker.start()
+            worker.join(15)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(observed_statuses, ["运行中 (WX)"])
+        self.assertEqual(task.status, "完成")
+        self.assertTrue(os.path.exists(os.path.join(workdir, ".wechat_uploaded")))
+
+    def test_explicit_mg_reset_preserves_successful_platform_markers(self):
+        """Regenerating metadata must not invalidate an already-published BI upload."""
+        workdir = os.path.join(self.temp_dir, "batch_reset_mg_preserve_bi")
+        os.makedirs(workdir)
+        metadata_path = os.path.join(workdir, "upload_metadata.json")
+        bili_marker = os.path.join(workdir, ".bili_uploaded")
+        with open(metadata_path, "w", encoding="utf-8") as handle:
+            handle.write("{}")
+        with open(bili_marker, "w", encoding="utf-8") as handle:
+            handle.write("1")
+
+        task = SubTask(
+            uid=25,
+            url="http://test.com",
+            title="Video 25",
+            status="失败 (WX)",
+            workdir=workdir,
+            pcts={
+                "DL": 100.0,
+                "TR": 100.0,
+                "TL": 100.0,
+                "MR": 100.0,
+                "BR": 100.0,
+                "GD": 100.0,
+                "MG": 60.0,
+                "BI": 100.0,
+                "WX": 0.0,
+            },
+            wx_metadata_failed=True,
+        )
+        engine = BatchEngine(
+            output_dir=self.temp_dir,
+            sub_dir_name="project",
+            state_file=os.path.join(self.temp_dir, "mg_reset_state.json"),
+        )
+        engine.do_gdsync = False
+        engine.do_bili = True
+        engine.do_wechat = True
+        engine.task_map[task.uid] = task
+
+        self.assertEqual(engine.reset_task(task, stage="MG"), "MG")
+        self.assertEqual(task.status, "排队中 (MG)")
+        self.assertTrue(os.path.exists(bili_marker))
+        self.assertFalse(os.path.exists(metadata_path))
+        self.assertEqual(task.pcts["BI"], 100.0)
+        self.assertEqual(task.pcts["MG"], 0.0)
+        self.assertFalse(task.wx_metadata_failed)
 
     def test_batch_worker_keeps_wechat_build_failure_unfinished(self):
         """A skipped WeChat upload must not create a success marker."""
@@ -2087,6 +2664,71 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
             "Palantir 员工谈新人一上来就被扔进深水区",
         )
         self.assertEqual(reframed_wechat_title, "Palantir员工谈新人深水区")
+
+    def test_generic_wechat_fallback_compresses_announcement_title(self):
+        """Announcement titles must still yield a short WeChat title offline."""
+        bili_title = (
+            "a16z宣布扩展加密基金为A16z Frontier，"
+            "尽早押注极具野心的前沿创业者"
+        )
+        description = (
+            "a16z宣布将 ACC加密基金扩展为 A16z Frontier。"
+            "Chris Dixon指出，此举源于加密技术融入主流科技版图，"
+            "以及团队需要覆盖落在垂直领域之外的“外行星”机会。"
+            "Marc Andreessen与Ben Horowitz强调，当下AI能力飞速跃升，"
+            "前沿极客与老牌企业间的认知落差已达职业生涯最大。"
+            "如今30人团队就能打造全栈设备公司，"
+            "创始人获得了前所未有的超级能力。"
+        )
+
+        subject = autosub._extract_bili_title_subject(bili_title)
+        wechat_title = autosub._compress_bili_title_for_wechat(
+            bili_title,
+            16,
+            description=description,
+        )
+
+        self.assertEqual(subject, "a16z")
+        self.assertEqual(wechat_title, "a16z押注极具野心的前沿创业者")
+        self.assertFalse(
+            autosub._metadata_title_has_quality_issue(
+                wechat_title,
+                "",
+                True,
+                description,
+            )
+        )
+
+    def test_ontology_metadata_fallback_survives_llm_timeout(self):
+        """The ontology summary must keep a concrete offline title."""
+        description = (
+            "你以为爱的是B，其实是脑海里的“B本体”。"
+            "本期用A与B二选一的恋爱情境，讲透本体的本质："
+            "我们比较、喜欢的，从来不是实体，而是自己构建的虚拟化身。"
+        )
+
+        title = autosub._fallback_bili_title_from_description(description, 80)
+        wechat_title = autosub._fallback_wechat_title_from_bili_title(title, 16)
+
+        self.assertEqual(title, "爱的不是B实体，而是脑海里的B本体")
+        self.assertEqual(wechat_title, "爱的不是B 而是脑海里的B本体")
+        self.assertFalse(autosub._metadata_title_has_quality_issue(
+            title,
+            "",
+            True,
+            description,
+        ))
+
+    def test_shared_title_gate_allows_grasp_predicate(self):
+        """The structural “把” ban must not reject the verb “把握”."""
+        self.assertFalse(
+            autosub._shared_title_has_quality_issue(
+                "人类为对象赋予意义并构建出本体，与实体的落差引出深度学习"
+            )
+        )
+        self.assertTrue(
+            autosub._shared_title_has_quality_issue("把数据做成产品")
+        )
 
     def test_recent_interview_metadata_fallbacks_survive_llm_timeout(self):
         """The two weak-title cases must have concrete offline fallbacks."""
@@ -2924,6 +3566,7 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
             provider=None,
             request_timeout=None,
             max_retries=1,
+            disable_thinking=False,
         )
 
     def test_generate_upload_metadata_uses_explicit_source_title(self):
@@ -3451,6 +4094,17 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         self.assertFalse(autosub._shared_title_has_quality_issue("Palantir押注工程团队"))
         self.assertTrue(autosub._shared_title_has_quality_issue("Palantir押注解决重要问题"))
 
+    def test_shared_title_accepts_reported_claims_and_consequences(self):
+        """A complete reported claim is not a fragment merely because it omits a whitelisted verb."""
+        good_titles = (
+            "卡普：成本只有目前的一半",
+            "卡普称许多CEO没魄力改核心业务",
+            "卡普指多数公司做AI都在做无用功",
+            "卡普称AI理论退场有效现实正进场",
+        )
+        for title in good_titles:
+            self.assertFalse(autosub._shared_title_has_quality_issue(title))
+
     def test_title_quality_gate_rejects_unnatural_chinese(self):
         """Bad translation-style hooks cannot pass merely by being Chinese."""
         bad_titles = (
@@ -3685,6 +4339,47 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
             ("我们不想把它做成服务。",),
             min_chars=12,
             max_chars=16,
+        )
+
+    def test_wechat_title_replaces_english_person_before_length_check(self):
+        """A known English person must not consume WeChat's character budget."""
+        llm_client = MagicMock()
+        llm_client.generate_content.return_value = "{}"
+        subtitle_title = MagicMock()
+        subtitle_title.SubtitleTitleError = ValueError
+        subtitle_title.parse_llm_title_candidates.return_value = (
+            "卡普谈AI核心业务",
+            (
+                (
+                    "Alex Karp：核心业务五倍成本减半",
+                    ("Alex Karp谈核心业务五倍成本减半。",),
+                ),
+            ),
+        )
+        subtitle_title.validate_title_from_subtitle.return_value = (
+            "Alex Karp谈核心业务五倍成本减半。",
+        )
+
+        with patch.dict(sys.modules, {"subtitle_title": subtitle_title}):
+            title = autosub._derive_wechat_title_from_bili_title(
+                "卡普谈AI核心业务",
+                "卡普谈AI核心业务。",
+                "Alex Karp谈核心业务五倍成本减半。",
+                llm_client,
+                "kimi-k2.6",
+                max_chars=16,
+            )
+
+        self.assertEqual(title, "卡普：核心业务五倍成本减半")
+        prompt = llm_client.generate_content.call_args.args[0]
+        self.assertIn("视频号标题不得输出英文人名全名", prompt)
+        self.assertIn("例如 Alex Karp 写成「卡普」", prompt)
+        subtitle_title.validate_title_from_subtitle.assert_called_once_with(
+            "Alex Karp：核心业务五倍成本减半",
+            "Alex Karp谈核心业务五倍成本减半。",
+            ("Alex Karp谈核心业务五倍成本减半。",),
+            min_chars=1,
+            max_chars=20,
         )
 
     def test_wechat_title_prefers_a_candidate_that_keeps_the_subject(self):
@@ -4422,6 +5117,7 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
                 "on_log": None,
                 "include_wechat": True,
                 "source_title": None,
+                "prefer_local_wechat_fallback": False,
             },
         )
         bili_kwargs = next(call[1] for call in calls if call[0] == "BI")
@@ -4667,6 +5363,165 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         resumed.load_state()
         self.assertEqual(resumed.cookie_path, "chrome")
 
+    def test_monitor_state_restores_flags_and_marker_truth(self):
+        """Live Monitor must show enabled upload stages and disk-truth completion."""
+        workdir = os.path.join(self.temp_dir, "task")
+        os.makedirs(workdir, exist_ok=True)
+        for marker in (".burn_complete", ".synced", ".bili_uploaded", ".wechat_uploaded"):
+            with open(os.path.join(workdir, marker), "w", encoding="utf-8") as handle:
+                handle.write("1")
+
+        state_file = os.path.join(self.temp_dir, "batch_state.json")
+        with open(state_file, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "1": {
+                        "uid": 1,
+                        "url": "",
+                        "vid_id": "",
+                        "title": "task",
+                        "status": "失败 (WX)",
+                        "pcts": {
+                            "DL": 100.0,
+                            "TR": 100.0,
+                            "TL": 100.0,
+                            "MR": 100.0,
+                            "BR": 100.0,
+                            "GD": 100.0,
+                            "MG": 100.0,
+                            "BI": 100.0,
+                            "WX": 90.0,
+                        },
+                        "workdir": workdir,
+                    },
+                    "bili": True,
+                    "gdsync": True,
+                    "wechat": True,
+                },
+                handle,
+                ensure_ascii=False,
+            )
+
+        engine = BatchEngine(
+            output_dir=self.temp_dir,
+            sub_dir_name="project",
+            state_file=state_file,
+        )
+        engine.load_state_monitor()
+
+        self.assertTrue(engine.do_bili)
+        self.assertTrue(engine.do_wechat)
+        self.assertTrue(engine.do_gdsync)
+        self.assertEqual(engine.task_map[1].status, "完成")
+        self.assertEqual(engine.task_map[1].pcts["WX"], 100.0)
+
+    def _monitor_engine_with_running_task(self, pid):
+        """Load a monitor whose only task was persisted as 运行中."""
+        # load_state_monitor only reads the stage flags from a file literally
+        # named batch_state.json, so each case needs its own directory.
+        case_dir = os.path.join(self.temp_dir, f"monitor-{pid}")
+        os.makedirs(case_dir, exist_ok=True)
+        workdir = os.path.join(case_dir, "task")
+        os.makedirs(workdir, exist_ok=True)
+        with open(os.path.join(workdir, ".bili_uploaded"), "w", encoding="utf-8") as handle:
+            handle.write("1")
+        state_file = os.path.join(case_dir, "batch_state.json")
+        with open(state_file, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "1": {
+                        "uid": 1,
+                        "url": "",
+                        "vid_id": "",
+                        "title": "task",
+                        "status": "运行中 (WX)",
+                        "pid": pid,
+                        "pcts": {
+                            "DL": 100.0,
+                            "TR": 100.0,
+                            "TL": 100.0,
+                            "MR": 100.0,
+                            "BR": 100.0,
+                            "GD": 100.0,
+                            "MG": 100.0,
+                            "BI": 100.0,
+                            "WX": 0.0,
+                        },
+                        "workdir": workdir,
+                    },
+                    "bili": True,
+                    "wechat": True,
+                },
+                handle,
+                ensure_ascii=False,
+            )
+        engine = BatchEngine(
+            output_dir=self.temp_dir,
+            sub_dir_name="project",
+            state_file=state_file,
+        )
+        engine.load_state_monitor()
+        return engine
+
+    def test_monitor_drops_stale_running_status_without_live_pid(self):
+        """An engine killed mid-task must not leave the row spinning forever."""
+        engine = self._monitor_engine_with_running_task(None)
+
+        self.assertEqual(engine.task_map[1].status, "排队中 (WX)")
+
+    def test_monitor_keeps_running_status_for_live_pid(self):
+        """A genuinely live worker pid keeps the persisted 运行中 status."""
+        engine = self._monitor_engine_with_running_task(os.getpid())
+
+        self.assertEqual(engine.task_map[1].status, "运行中 (WX)")
+
+    def test_monitor_preserves_persisted_failure_status(self):
+        """Re-deriving a stale row must not erase a real failure."""
+        case_dir = os.path.join(self.temp_dir, "monitor-failed")
+        os.makedirs(case_dir, exist_ok=True)
+        workdir = os.path.join(case_dir, "task")
+        os.makedirs(workdir, exist_ok=True)
+        state_file = os.path.join(case_dir, "batch_state.json")
+        with open(state_file, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "1": {
+                        "uid": 1,
+                        "url": "",
+                        "vid_id": "",
+                        "title": "task",
+                        "status": "失败 (上传)",
+                        "error": "BI upload failed",
+                        "pid": None,
+                        "pcts": {
+                            "DL": 100.0,
+                            "TR": 100.0,
+                            "TL": 100.0,
+                            "MR": 100.0,
+                            "BR": 100.0,
+                            "GD": 100.0,
+                            "MG": 100.0,
+                            "BI": 68.0,
+                            "WX": 70.5,
+                        },
+                        "workdir": workdir,
+                    },
+                    "bili": True,
+                    "wechat": True,
+                },
+                handle,
+                ensure_ascii=False,
+            )
+        engine = BatchEngine(
+            output_dir=self.temp_dir,
+            sub_dir_name="project",
+            state_file=state_file,
+        )
+        engine.load_state_monitor()
+
+        self.assertEqual(engine.task_map[1].status, "失败 (上传)")
+        self.assertEqual(engine.task_map[1].error, "BI upload failed")
+
     def test_check_all_completed_requires_wechat_progress(self):
         """A WeChat-enabled task is incomplete until WX reaches 100%."""
         pcts = {
@@ -4787,6 +5642,54 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         self.assertIn("超过视频号 10 分钟限制", task.error)
         self.assertEqual(task.pcts["WX"], 0.0)
         self.assertTrue(engine.do_wechat)
+
+    def test_load_state_preserves_ambiguous_wechat_failure(self):
+        """A submitted-but-unconfirmed WX upload must not auto-retry on restart."""
+        project_dir = os.path.join(self.temp_dir, "project")
+        task_dir = os.path.join(project_dir, "task_1")
+        os.makedirs(task_dir)
+        state_file = os.path.join(project_dir, "batch_state.json")
+        error = (
+            "视频号上传结果不确定：文件已提交给微信，请先检查草稿箱；"
+            "为避免重复投稿，已停止自动重试"
+        )
+        state = {
+            "wechat": True,
+            "1": {
+                "uid": 1,
+                "url": "http://test.com",
+                "vid_id": "vid1",
+                "title": "Video 1",
+                "status": "失败 (WX)",
+                "pcts": {
+                    "DL": 100.0,
+                    "TR": 100.0,
+                    "TL": 100.0,
+                    "MR": 100.0,
+                    "BR": 100.0,
+                    "GD": 100.0,
+                    "MG": 100.0,
+                    "BI": 100.0,
+                    "WX": 66.5,
+                },
+                "workdir": task_dir,
+                "error": error,
+            },
+        }
+        with open(state_file, "w", encoding="utf-8") as handle:
+            json.dump(state, handle, ensure_ascii=False)
+
+        engine = BatchEngine(
+            output_dir=self.temp_dir,
+            sub_dir_name="project",
+            state_file=state_file,
+        )
+        engine.load_state()
+
+        task = engine.task_map[1]
+        self.assertEqual(task.status, "失败 (WX)")
+        self.assertEqual(task.error, error)
+        self.assertEqual(task.pcts["WX"], 66.5)
 
 
 class TestUploadWatchdogAndProcessTree(unittest.TestCase):
@@ -5020,6 +5923,36 @@ class TestUploadWatchdogAndProcessTree(unittest.TestCase):
         self.assertEqual(task.status, "失败 (WX)")
         self.assertIn("看门狗", task.error or "")
         self.assertIsNone(task.pid)
+
+    def test_run_process_watchdog_resets_on_internal_retry(self):
+        """An uploader retry from 0% must not be judged against the old maximum."""
+        workdir = os.path.join(self.temp_dir, "bili_retry")
+        os.makedirs(workdir)
+        task = SubTask(
+            uid=20, url="http://test.com", title="Video 20", duration="01:00",
+            status="排队中 (BI)", workdir=workdir,
+            pcts={"DL": 100.0, "TR": 100.0, "TL": 100.0, "MR": 100.0,
+                  "BR": 100.0, "GD": 100.0, "BI": 0.0, "WX": 100.0},
+        )
+        engine = self._engine()
+        engine.task_map[task.uid] = task
+        script = (
+            "import time\n"
+            "print('Progress: 70%', flush=True)\n"
+            "time.sleep(0.3)\n"
+            "print('>>> 开始上传: test (attempt 2/3)', flush=True)\n"
+            "for i in range(1, 101):\n"
+            "    print(f'Progress: {i}%', flush=True)\n"
+            "    time.sleep(0.01)\n"
+        )
+        cmd = [sys.executable, "-u", "-c", script]
+        with patch.object(BatchEngine, "save_state", lambda self: None):
+            ok = engine.run_process(
+                task, "BI", cmd, start_pct=0.0, end_pct=100.0,
+                stall_timeout=1.0, silence_timeout=None,
+            )
+        self.assertTrue(ok)
+        self.assertEqual(task.pcts["BI"], 100.0)
 
     def test_run_process_without_timeouts_does_not_watchdog(self):
         """GD's sync.py has irregular output, so it stays unmonitored."""

@@ -101,7 +101,16 @@ class _BrowserProfileLock:
             os.close(fd)
 
 # 复用统一 LLM 接口（与 bili_upload.py 对齐）
-_COMMON_DIR = os.environ.get("AUTOSUB_COMMON_DIR", "/Users/shanfu/cc/Library/Tools/common")
+# Prefer the common package inside this repository (same rule as autosub.py):
+# the external Tools/common copy can lag behind repo-side fixes such as the
+# composition-aware cover frame selection.
+_COMMON_DIR = os.environ.get("AUTOSUB_COMMON_DIR")
+if not _COMMON_DIR:
+    _COMMON_DIR = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "..", "common")
+    )
+if not os.path.isdir(_COMMON_DIR):
+    _COMMON_DIR = "/Users/shanfu/cc/Library/Tools/common"
 if os.path.isdir(_COMMON_DIR) and _COMMON_DIR not in sys.path:
     sys.path.insert(0, _COMMON_DIR)
 try:
@@ -375,6 +384,52 @@ def _load_cached_upload_metadata(video_path):
         return value if isinstance(value, dict) else {}
     except (OSError, ValueError):
         return {}
+
+
+def _merge_upload_metadata(video_path, patch):
+    """Persist extra keys, such as the draft box reference, next to the video."""
+    metadata_path = os.path.join(
+        os.path.dirname(video_path) or ".",
+        "upload_metadata.json",
+    )
+    data = _load_cached_upload_metadata(video_path)
+    data.update(patch)
+    try:
+        with open(metadata_path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+        return True
+    except OSError as exc:
+        print(f">>> 写入 upload_metadata.json 失败: {exc}")
+        return False
+
+
+async def _record_draft_reference(video_path, page, desc):
+    """Remember which draft box entry holds this video, so repairs stay exact."""
+    try:
+        if not await _open_draft_list(page):
+            return None
+        entries = await _draft_list_entries(page)
+        candidates = _repair_draft_candidates(entries, desc)
+        if len(candidates) != 1:
+            print(f">>> 草稿箱匹配到 {len(candidates)} 条同描述草稿，未记录草稿引用")
+            return None
+        draft_time = str(candidates[0].get("time") or "").strip()
+        if not draft_time:
+            return None
+        if _merge_upload_metadata(video_path, {"wechat_draft_time": draft_time}):
+            print(f">>> 已记录草稿引用: {draft_time}")
+            # Reading the list leaves the page on the draft box. The caller
+            # continues on the edit form, so reopen the matched draft.
+            if not await _open_draft_entry(page, candidates[0]["index"]):
+                print(">>> 记录草稿引用后未能回到草稿编辑页")
+                return None
+            if not await _wait_cover_editor_ready(page, timeout=600):
+                print(">>> 记录草稿引用后封面编辑器未就绪")
+                return None
+            return draft_time
+    except Exception as exc:
+        print(f">>> 记录草稿引用失败: {exc}")
+    return None
 
 
 def build_description(video_path, title, description=None, llm_provider="dashscope", llm_model="glm-5.2"):
@@ -1062,12 +1117,12 @@ async def _click_menu_draft_link(page):
         return False
 
 
-async def _wait_draft_list_ready(page, timeout=20):
+async def _wait_draft_list_ready(page, timeout=60):
     start = time.time()
     while time.time() - start < timeout:
         if "/post/draftListManager" in page.url:
             list_start = time.time()
-            while time.time() - list_start < 10:
+            while time.time() - list_start < 60:
                 entries = await _draft_list_entries(page)
                 if entries:
                     return True
@@ -1111,6 +1166,14 @@ async def _open_draft_list(page):
         # route as a last resort, then still require real draft entries.
         print(">>> 可见菜单未打开草稿箱，尝试直达草稿箱路由...")
         await page.goto(WECHAT_DRAFT_URL, wait_until="domcontentloaded", timeout=60000)
+        await asyncio.sleep(3)
+        if await _wait_draft_list_ready(page):
+            return True
+
+        # The Wujie shell can leave the direct route blank after a save action.
+        # One reload is safer than declaring an already-saved draft unverified.
+        print(">>> 草稿箱直达路由未加载，刷新后重试...")
+        await page.reload(wait_until="domcontentloaded", timeout=60000)
         await asyncio.sleep(3)
         return await _wait_draft_list_ready(page)
     except Exception as e:
@@ -1314,6 +1377,7 @@ async def _wait_cover_editor_ready(page, timeout=180):
     start = time.time()
     last_generating = -1
     last_processing = None
+    last_nodes_ready = None
     ready_since = None
     while time.time() - start < timeout:
         text = await _wujie_text(page)
@@ -1321,6 +1385,7 @@ async def _wait_cover_editor_ready(page, timeout=180):
         combined_text = f"{text}\n{cover_text}"
         generating = combined_text.count("生成中")
         processing = "视频处理中" in combined_text
+        nodes_ready = await _cover_editor_nodes_ready(page)
         if generating != last_generating:
             print(f">>> 封面编辑器待生成资源: {generating}")
             last_generating = generating
@@ -1328,8 +1393,15 @@ async def _wait_cover_editor_ready(page, timeout=180):
             if processing:
                 print(">>> 封面编辑器仍在处理视频，等待可编辑状态...")
             last_processing = processing
+        if nodes_ready != last_nodes_ready:
+            if nodes_ready:
+                print(">>> 封面编辑器节点已挂载")
+            else:
+                print(">>> 等待封面编辑器节点挂载...")
+            last_nodes_ready = nodes_ready
         is_ready = (
-            generating == 0
+            nodes_ready
+            and generating == 0
             and "预览图生成中" not in combined_text
             and "视频处理中" not in combined_text
         )
@@ -1345,6 +1417,38 @@ async def _wait_cover_editor_ready(page, timeout=180):
         await asyncio.sleep(1)
     print(">>> 封面编辑器资源生成超时")
     return False
+
+
+async def _cover_editor_nodes_ready(page):
+    """Require both real cover cards and their edit buttons to be attached."""
+    selectors = (
+        ".vertical-cover-wrap",
+        ".vertical-cover-wrap .edit-btn",
+        ".horizon-cover-wrap",
+        ".horizon-cover-wrap .edit-btn",
+    )
+    try:
+        for selector in selectors:
+            if await page.locator(selector).count() == 0:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+async def _save_cover_editor_debug(page):
+    """Capture the page state when the cover editor cannot be opened."""
+    debug_path = os.path.join(SKILL_DIR, "assets", "cover_editor_failure.png")
+    try:
+        await page.screenshot(path=debug_path, full_page=True)
+        print(f">>> 已保存封面编辑失败截图: {debug_path}")
+    except Exception as screenshot_error:
+        print(f">>> 保存封面编辑失败截图失败: {screenshot_error}")
+    try:
+        page_text = await _wujie_text(page)
+        print(f">>> 封面编辑失败页面文本片段: {page_text[:1200]}")
+    except Exception:
+        pass
 
 
 async def _cover_editor_text(page):
@@ -1399,6 +1503,304 @@ async def _click_visible_text(page, label, timeout=5000):
             except Exception:
                 continue
         await asyncio.sleep(0.2)
+    return False
+
+
+# WeChat keeps the cover dialog's confirm button disabled while the uploaded
+# image is still being processed, and renders a full-screen mask on top of it.
+# Both states outlast a short poll on a slow route, so the click is driven from
+# inside the Wujie shadow root and reports why it is not clickable yet.
+_COVER_DIALOG_CONFIRM_JS = """
+(label) => {
+    const root = document.querySelector('wujie-app')?.shadowRoot?.querySelector('html') || document;
+    const visible = (el) => {
+        if (!el) return false;
+        const style = window.getComputedStyle(el);
+        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+    };
+    const mask = Array.from(root.querySelectorAll('.setting-cover-mask')).some(visible);
+    // Only the cover editor's own dialogs may be confirmed. The page keeps many
+    // unrelated hidden dialogs, and the innermost open one is the last visible
+    // wrapper in document order (the crop dialog nests inside the cover dialog).
+    const wrappers = Array.from(
+        root.querySelectorAll('.edit-cover-dialog-container .weui-desktop-dialog__wrp')
+    ).filter(visible);
+    if (wrappers.length === 0) {
+        return {title: '', mask, clicked: false, reason: 'no-cover-dialog', buttons: [], allButtons: []};
+    }
+    const scope = wrappers[wrappers.length - 1];
+    const titleEl = scope.querySelector('.weui-desktop-dialog__title');
+    const title = titleEl ? (titleEl.textContent || '').trim() : '';
+    const describe = (btn) => {
+        const rect = btn.getBoundingClientRect();
+        return {
+            text: (btn.textContent || '').trim(),
+            className: btn.className || '',
+            disabled: btn.disabled === true
+                || btn.getAttribute('aria-disabled') === 'true'
+                || /disabled/.test(btn.className || ''),
+            visible: visible(btn),
+            width: Math.round(rect.width),
+            height: Math.round(rect.height),
+        };
+    };
+    const buttons = Array.from(scope.querySelectorAll('button'));
+    const matched = buttons
+        .map((btn) => ({btn, info: describe(btn)}))
+        .filter((item) => item.info.text === label);
+    const state = {
+        title,
+        mask,
+        clicked: false,
+        reason: 'not-found',
+        buttons: matched.map((item) => item.info),
+        allButtons: buttons.map(describe).filter((info) => info.text).slice(0, 12),
+    };
+    if (matched.length === 0) return state;
+    const enabled = matched.filter((item) => item.info.visible && !item.info.disabled);
+    if (enabled.length === 0) {
+        state.reason = matched.some((item) => item.info.disabled) ? 'disabled' : 'hidden';
+        return state;
+    }
+    if (mask) {
+        state.reason = 'masked';
+        return state;
+    }
+    const primary = enabled.find((item) => /weui-desktop-btn_primary/.test(item.info.className));
+    const target = primary || enabled[enabled.length - 1];
+    target.btn.click();
+    state.clicked = true;
+    state.reason = 'clicked';
+    return state;
+}
+"""
+
+
+async def _cover_dialog_confirm_state(page, label="确认"):
+    """Probe (and optionally click) the active cover dialog's confirm button."""
+    try:
+        return await page.evaluate(_COVER_DIALOG_CONFIRM_JS, label)
+    except Exception as exc:
+        return {"clicked": False, "reason": f"evaluate-error: {exc}", "buttons": []}
+
+
+async def _save_cover_dialog_debug(page, tag="confirm"):
+    """Capture the cover dialog DOM so a failed confirm can be diagnosed."""
+    assets_dir = os.path.join(SKILL_DIR, "assets")
+    try:
+        os.makedirs(assets_dir, exist_ok=True)
+    except Exception:
+        return
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    html_path = os.path.join(assets_dir, f"cover_dialog_{tag}_{stamp}.html")
+    png_path = os.path.join(assets_dir, f"cover_dialog_{tag}_{stamp}.png")
+    try:
+        html = await page.evaluate(
+            """() => {
+                const root = document.querySelector('wujie-app')?.shadowRoot?.querySelector('html') || document;
+                return root.innerHTML;
+            }"""
+        )
+        with open(html_path, "w", encoding="utf-8") as handle:
+            handle.write(html or "")
+        print(f">>> 已保存封面弹层 DOM: {html_path}")
+    except Exception as exc:
+        print(f">>> 保存封面弹层 DOM 失败: {exc}")
+    try:
+        await page.screenshot(path=png_path, full_page=False)
+        print(f">>> 已保存封面弹层截图: {png_path}")
+    except Exception:
+        pass
+
+
+async def _cover_dialog_canvas_matches(page, cover_path, threshold=45.0):
+    """Whether the crop canvas already shows our uploaded cover.
+
+    WeChat keeps cropping the video frame (or nothing) until the uploaded image
+    finishes reaching its CDN. Confirming before that saves a crop of the wrong
+    source, so compare the canvas against the local cover inside the page.
+    """
+    try:
+        with open(cover_path, "rb") as handle:
+            encoded = base64.b64encode(handle.read()).decode("ascii")
+    except OSError:
+        return True
+    try:
+        return await page.evaluate(
+            """async (payload) => {
+                const root = document.querySelector('wujie-app')?.shadowRoot?.querySelector('html') || document;
+                const visible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    if (style.display === 'none' || style.visibility === 'hidden') return false;
+                    const rect = el.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                };
+                const wrappers = Array.from(
+                    root.querySelectorAll('.edit-cover-dialog-container .weui-desktop-dialog__wrp')
+                ).filter(visible);
+                const scope = wrappers.length ? wrappers[wrappers.length - 1] : null;
+                if (!scope) return false;
+                const canvas = scope.querySelector('.croppie-container canvas.cr-image');
+                if (!canvas || !canvas.width || !canvas.height) return false;
+                const load = (src) => new Promise((resolve, reject) => {
+                    const image = new Image();
+                    image.onload = () => resolve(image);
+                    image.onerror = reject;
+                    image.src = src;
+                });
+                let local;
+                try {
+                    local = await load('data:image/jpeg;base64,' + payload.b64);
+                } catch (err) {
+                    return true;
+                }
+                const size = 32;
+                const sample = (source, sw, sh) => {
+                    const out = document.createElement('canvas');
+                    out.width = size;
+                    out.height = size;
+                    const ctx = out.getContext('2d');
+                    ctx.drawImage(source, 0, 0, sw, sh, 0, 0, size, size);
+                    return ctx.getImageData(0, 0, size, size).data;
+                };
+                const a = sample(canvas, canvas.width, canvas.height);
+                const b = sample(local, local.naturalWidth, local.naturalHeight);
+                let sum = 0;
+                for (let i = 0; i < a.length; i += 4) {
+                    const d1 = a[i] - b[i];
+                    const d2 = a[i + 1] - b[i + 1];
+                    const d3 = a[i + 2] - b[i + 2];
+                    sum += d1 * d1 + d2 * d2 + d3 * d3;
+                }
+                return Math.sqrt(sum / (a.length / 4)) <= payload.threshold;
+            }""",
+            {"b64": encoded, "threshold": threshold},
+        )
+    except Exception:
+        return True
+
+
+async def _close_cover_dialog(page):
+    """Dismiss an open cover dialog so a retry starts from a clean form."""
+    try:
+        closed = await page.evaluate(
+            """() => {
+                const root = document.querySelector('wujie-app')?.shadowRoot?.querySelector('html') || document;
+                const visible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    if (style.display === 'none' || style.visibility === 'hidden') return false;
+                    const rect = el.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                };
+                const wrappers = Array.from(
+                    root.querySelectorAll('.edit-cover-dialog-container .weui-desktop-dialog__wrp')
+                ).filter(visible);
+                for (const wrp of wrappers.reverse()) {
+                    const cancel = Array.from(wrp.querySelectorAll('button'))
+                        .find((btn) => (btn.textContent || '').trim() === '取消');
+                    const target = cancel || wrp.querySelector('.weui-desktop-dialog__close-btn');
+                    if (target) {
+                        target.click();
+                        return true;
+                    }
+                }
+                return false;
+            }"""
+        )
+    except Exception:
+        return False
+    if closed:
+        await asyncio.sleep(2)
+    return bool(closed)
+
+
+async def _cover_dialog_open(page):
+    """Whether any cover-editor dialog is still on screen."""
+    try:
+        return await page.evaluate(
+            """() => {
+                const root = document.querySelector('wujie-app')?.shadowRoot?.querySelector('html') || document;
+                const visible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    if (style.display === 'none' || style.visibility === 'hidden') return false;
+                    const rect = el.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                };
+                return Array.from(
+                    root.querySelectorAll('.edit-cover-dialog-container .weui-desktop-dialog__wrp')
+                ).some(visible);
+            }"""
+        )
+    except Exception:
+        return False
+
+
+async def _cover_dialog_text(page):
+    """Visible text of the open cover-editor dialog, for failure diagnosis."""
+    try:
+        return await page.evaluate(
+            """() => {
+                const root = document.querySelector('wujie-app')?.shadowRoot?.querySelector('html') || document;
+                const visible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    if (style.display === 'none' || style.visibility === 'hidden') return false;
+                    const rect = el.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                };
+                const wrappers = Array.from(
+                    root.querySelectorAll('.edit-cover-dialog-container .weui-desktop-dialog__wrp')
+                ).filter(visible);
+                const scope = wrappers.length ? wrappers[wrappers.length - 1] : null;
+                return scope ? (scope.innerText || '') : '';
+            }"""
+        )
+    except Exception:
+        return ""
+
+
+async def _click_cover_dialog_confirm(page, orientation=None, timeout=240000):
+    """Click the active cover dialog's confirm button, waiting out WeChat processing."""
+    deadline = time.time() + timeout / 1000
+    last_signature = None
+    last_note = 0.0
+    while time.time() < deadline:
+        state = None
+        for label in ("确认", "确定"):
+            state = await _cover_dialog_confirm_state(page, label)
+            if state.get("clicked"):
+                print(f">>> 已点击封面弹层按钮: {label}（弹层: {state.get('title') or '未知'}）")
+                return True
+            if state.get("reason") in ("disabled", "masked", "hidden"):
+                break
+        signature = (
+            (state or {}).get("title"),
+            (state or {}).get("reason"),
+            tuple(
+                (item.get("text"), item.get("disabled"), item.get("visible"))
+                for item in (state or {}).get("buttons", [])
+            ),
+        )
+        now = time.time()
+        if signature != last_signature or now - last_note >= 30:
+            last_signature = signature
+            last_note = now
+            detail = ", ".join(
+                f"{item.get('text')}{'(禁用)' if item.get('disabled') else ''}"
+                f"{'' if item.get('visible') else '(不可见)'}"
+                for item in (state or {}).get("buttons", [])
+            ) or "无匹配按钮"
+            print(
+                f">>> 等待封面弹层确认可点击: 弹层={(state or {}).get('title') or '未知'} "
+                f"原因={(state or {}).get('reason')} 遮罩={(state or {}).get('mask')} 按钮=[{detail}]"
+            )
+        await asyncio.sleep(1)
+    await _save_cover_dialog_debug(page, "confirm_timeout")
     return False
 
 
@@ -1502,6 +1904,40 @@ async def _wait_cover_preview_changed(
     return False
 
 
+async def _active_cover_file_input(page, orientation, timeout=10000):
+    """Return the file input belonging to the currently visible cover dialog."""
+    title = "编辑个人主页卡片" if orientation == "portrait" else "编辑分享卡片"
+    deadline = time.time() + timeout / 1000
+    while time.time() < deadline:
+        try:
+            index = await page.evaluate(
+                """(title) => {
+                    const root = document.querySelector('wujie-app')?.shadowRoot?.querySelector('html') || document;
+                    const inputs = Array.from(root.querySelectorAll('.edit-cover-dialog input[type="file"]'));
+                    return inputs.findIndex((input) => {
+                        const dialog = input.closest('.edit-cover-dialog');
+                        const wrapper = dialog?.querySelector('.weui-desktop-dialog__wrp');
+                        const dialogTitle = dialog?.querySelector('.weui-desktop-dialog__title')?.innerText || '';
+                        return Boolean(
+                            dialog
+                            && wrapper
+                            && wrapper.style.display !== 'none'
+                            && dialogTitle.includes(title)
+                        );
+                    });
+                }""",
+                title,
+            )
+        except Exception:
+            index = -1
+        if isinstance(index, int) and index >= 0:
+            inputs = page.locator('.edit-cover-dialog input[type="file"]')
+            if await inputs.count() > index:
+                return inputs.nth(index)
+        await asyncio.sleep(0.2)
+    return page.locator(".single-cover-uploader-wrap input[type='file']").first
+
+
 async def _upload_wechat_cover_card(page, cover_path, orientation, expected_title):
     """Upload one exact-ratio cover card in WeChat's cover editor."""
     wrap_selector = ".vertical-cover-wrap" if orientation == "portrait" else ".horizon-cover-wrap"
@@ -1509,79 +1945,30 @@ async def _upload_wechat_cover_card(page, cover_path, orientation, expected_titl
     try:
         if not _validate_cover_file(cover_path, orientation, expected_title):
             return False
+        if not await _wait_cover_editor_ready(page):
+            print(">>> 封面编辑器未就绪，无法上传封面")
+            await _save_cover_editor_debug(page)
+            return False
         wrap = page.locator(wrap_selector).first
         edit_btn = page.locator(edit_selector).first
         try:
-            await wrap.wait_for(state="attached", timeout=20000)
-            await edit_btn.wait_for(state="attached", timeout=20000)
+            await wrap.wait_for(state="attached", timeout=5000)
+            await edit_btn.wait_for(state="attached", timeout=5000)
         except Exception:
             print(f">>> 未找到{'个人主页' if orientation == 'portrait' else '分享'}封面编辑入口")
-            return False
-        if not await _wait_cover_editor_ready(page):
+            await _save_cover_editor_debug(page)
             return False
         before_images = await _cover_wrap_images(page, wrap_selector)
         before_sources = {item.get("src") for item in before_images}
 
-        upload_tabs = page.get_by_text("上传封面", exact=True)
-        direct_edit_tabs = page.get_by_text("直接编辑", exact=True)
-        upload_tab = None
-        for click_mode in ("normal", "dom"):
-            try:
-                if click_mode == "normal":
-                    await wrap.hover()
-                    await edit_btn.click(timeout=3000)
-                else:
-                    await edit_btn.evaluate("element => element.click()")
-            except Exception as click_error:
-                print(f">>> {click_mode} 点击封面编辑按钮失败: {click_error}")
-
-            upload_deadline = time.time() + 8
-            chose_direct_edit = False
-            while time.time() < upload_deadline:
-                if not chose_direct_edit:
-                    direct_count = await direct_edit_tabs.count()
-                    for index in range(direct_count):
-                        direct_candidate = direct_edit_tabs.nth(index)
-                        try:
-                            if await direct_candidate.is_visible():
-                                await direct_candidate.click()
-                                chose_direct_edit = True
-                                print(">>> 已选择直接编辑封面")
-                                break
-                        except Exception:
-                            continue
-                count = await upload_tabs.count()
-                for index in range(count):
-                    candidate = upload_tabs.nth(index)
-                    try:
-                        if await candidate.is_visible():
-                            upload_tab = candidate
-                            break
-                    except Exception:
-                        continue
-                if upload_tab is not None:
-                    break
-                await asyncio.sleep(0.2)
-            if upload_tab is not None:
-                break
-            print(f">>> {click_mode} 点击封面编辑按钮后未出现上传封面入口")
-        if upload_tab is None:
-            print(">>> 封面编辑弹层未显示可点击的上传封面入口")
-            debug_path = os.path.join(SKILL_DIR, "assets", "cover_editor_failure.png")
-            try:
-                await page.screenshot(path=debug_path, full_page=True)
-                print(f">>> 已保存封面编辑失败截图: {debug_path}")
-            except Exception as screenshot_error:
-                print(f">>> 保存封面编辑失败截图失败: {screenshot_error}")
-            page_text = await _wujie_text(page)
-            print(f">>> 封面编辑失败页面文本片段: {page_text[:1200]}")
+        try:
+            await edit_btn.evaluate("element => element.click()")
+            image_input = await _active_cover_file_input(page, orientation)
+            await image_input.wait_for(state="attached", timeout=10000)
+        except Exception:
+            print(">>> 封面编辑弹层未显示上传封面入口")
+            await _save_cover_editor_debug(page)
             return False
-        await upload_tab.click()
-
-        image_input = page.locator(".single-cover-uploader-wrap input[type='file']").first
-        if await image_input.count() == 0:
-            image_input = page.locator('input[type="file"][accept*="image"]').first
-        await image_input.wait_for(state="attached", timeout=10000)
         await image_input.set_input_files(cover_path)
 
         # WeChat renders a local preview before enabling the crop confirmation.
@@ -1591,7 +1978,21 @@ async def _upload_wechat_cover_card(page, cover_path, orientation, expected_titl
             dialog_images = await page.evaluate(
                 """() => {
                     const root = document.querySelector('wujie-app')?.shadowRoot?.querySelector('html') || document;
-                    return Array.from(root.querySelectorAll('.preview-image')).map((img) => ({
+                    // Scope to the open cover dialog: the form behind it also
+                    // carries 3:4 / 4:3 previews that would satisfy this gate
+                    // before our image has actually rendered in the dialog.
+                    const visible = (el) => {
+                        if (!el) return false;
+                        const style = window.getComputedStyle(el);
+                        if (style.display === 'none' || style.visibility === 'hidden') return false;
+                        const rect = el.getBoundingClientRect();
+                        return rect.width > 0 && rect.height > 0;
+                    };
+                    const wrappers = Array.from(
+                        root.querySelectorAll('.edit-cover-dialog-container .weui-desktop-dialog__wrp')
+                    ).filter(visible);
+                    const scope = wrappers.length ? wrappers[wrappers.length - 1] : root;
+                    return Array.from(scope.querySelectorAll('.preview-image')).map((img) => ({
                         naturalWidth: img.naturalWidth,
                         naturalHeight: img.naturalHeight,
                     }));
@@ -1605,29 +2006,87 @@ async def _upload_wechat_cover_card(page, cover_path, orientation, expected_titl
             print(">>> 封面编辑弹层未显示上传图片预览")
             return False
 
-        confirmed = await _click_visible_button(page, "确认", timeout=8000)
-        if not confirmed:
-            confirmed = await _click_visible_button(page, "确定", timeout=5000)
-        if not confirmed:
-            print(">>> 未找到封面编辑弹层的确认按钮")
+        # WeChat only switches the crop source to our image once it finishes
+        # reaching its CDN; until then the canvas crops the video frame (or
+        # nothing) and 确认 would save that wrong source. Wait for the canvas
+        # to actually show our cover, reopening the dialog once if needed.
+        async def _wait_canvas_shows_cover(seconds):
+            deadline = time.time() + seconds
+            while time.time() < deadline:
+                if await _cover_dialog_canvas_matches(page, cover_path):
+                    return True
+                await asyncio.sleep(2)
             return False
+
+        canvas_ok = await _wait_canvas_shows_cover(180)
+        if not canvas_ok:
+            print(">>> 裁剪画布仍未切换到上传封面，关闭弹层重开一次")
+            await _close_cover_dialog(page)
+            try:
+                await edit_btn.evaluate("element => element.click()")
+                image_input = await _active_cover_file_input(page, orientation)
+                await image_input.wait_for(state="attached", timeout=10000)
+                await image_input.set_input_files(cover_path)
+            except Exception:
+                print(">>> 重开封面编辑弹层失败")
+                return False
+            canvas_ok = await _wait_canvas_shows_cover(180)
+        if not canvas_ok:
+            print(">>> 裁剪画布始终未切换到上传封面，放弃本次封面设置以保留现有封面")
+            await _save_cover_dialog_debug(page, f"canvas_mismatch_{orientation}")
+            await _close_cover_dialog(page)
+            return False
+
+        confirmed = await _click_cover_dialog_confirm(page, orientation, timeout=240000)
+        if not confirmed:
+            # No page-wide fallback: clicking an unrelated dialog's 确定 can
+            # silently change the form instead of the cover.
+            print(">>> 封面编辑弹层的确认按钮始终不可点击，已保存弹层 DOM 与截图")
+            return False
+
+        # WeChat ignores the confirm while it is still pushing our image to its
+        # CDN: the dialog stays open with no error and the card keeps its old
+        # frame. Keep re-clicking until the dialog closes instead of giving up
+        # after a fixed number of attempts.
+        still_open_deadline = time.time() + 300
+        captured_debug = False
+        clicks = 0
+        # Give WeChat a moment to close the dialog after a successful confirm.
+        await asyncio.sleep(8)
+        while await _cover_dialog_open(page):
+            if time.time() > still_open_deadline:
+                print(">>> 封面弹层 300 秒后仍未关闭，放弃本次封面设置")
+                break
+            clicks += 1
+            dialog_text = (await _cover_dialog_text(page)).replace("\n", " ").strip()
+            print(
+                f">>> 确认点击 {clicks} 次后弹层仍未关闭，弹层文本: {dialog_text[:240] or '(空)'}"
+            )
+            if not captured_debug:
+                await _save_cover_dialog_debug(page, f"still_open_{orientation}")
+                captured_debug = True
+            if not await _click_cover_dialog_confirm(page, orientation, timeout=30000):
+                await asyncio.sleep(5)
+                continue
+            await asyncio.sleep(10)
 
         if not await _wait_cover_preview_changed(
             page,
             wrap_selector,
             orientation,
             before_sources,
-            timeout=20,
+            timeout=180,
             expected_path=cover_path,
         ):
+            await _save_cover_dialog_debug(page, f"preview_unchanged_{orientation}")
             # Some flows show a second crop confirmation after the first save.
-            if await _click_visible_button(page, "确认", timeout=2000):
+            if await _click_cover_dialog_confirm(page, orientation, timeout=60000):
                 if not await _wait_cover_preview_changed(
                     page,
                     wrap_selector,
                     orientation,
                     before_sources,
-                    timeout=15,
+                    timeout=120,
                     expected_path=cover_path,
                 ):
                     return False
@@ -1754,7 +2213,7 @@ async def _verify_cover_preview_matches(page, expected, orientation):
     current = await _current_cover_preview(page, wrap_selector, orientation)
     if not current:
         print(f">>> 回读时{'个人主页' if orientation == 'portrait' else '分享'}封面预览缺失")
-        return False
+        return None
     if current.get("src") and current.get("src") == expected.get("src"):
         print(f">>> 回读{'个人主页' if orientation == 'portrait' else '分享'}封面 URL 一致")
         return True
@@ -1773,18 +2232,27 @@ async def _verify_cover_preview_matches(page, expected, orientation):
 
 
 async def _verify_wechat_cover_previews(page, expected_previews):
-    """Confirm both saved cover cards still contain the uploaded images."""
+    """Confirm saved cover cards, treating lazy-loaded previews as warnings."""
     if not expected_previews:
         return False
+    missing_previews = []
     for orientation, label in (("portrait", "个人主页"), ("share", "分享")):
         expected = expected_previews.get(orientation)
         if not expected:
             print(f">>> 缺少{label}封面回读基准")
             return False
-        if not await _verify_cover_preview_matches(page, expected, orientation):
+        result = await _verify_cover_preview_matches(page, expected, orientation)
+        if result is None:
+            missing_previews.append(label)
+            print(f">>> {label}封面预览未回读，继续以草稿箱和表单回读为准")
+            continue
+        if result is False:
             print(f">>> {label}封面回读校验失败")
             return False
-    print(">>> 横竖双封面均已回读确认")
+    if missing_previews:
+        print(f">>> 封面预览缺失: {', '.join(missing_previews)}；草稿已保存，不判失败")
+    else:
+        print(">>> 横竖双封面均已回读确认")
     return True
 
 
@@ -1812,14 +2280,39 @@ async def _open_draft_by_text(page, text):
     return False
 
 
+def _repair_draft_candidates(entries, desc, draft_time=None):
+    """Return exact-description drafts, optionally narrowed by visible time."""
+    expected = _normalize_draft_text(desc)
+    candidates = [
+        entry
+        for entry in entries or []
+        if _normalize_draft_text(entry.get("title")) == expected
+    ]
+    if draft_time:
+        candidates = [
+            entry
+            for entry in candidates
+            if str(draft_time) in str(entry.get("time") or "")
+        ]
+    return candidates
+
+
+def _select_repair_draft_entry(entries, desc, draft_time=None):
+    """Select one repair target, refusing to guess among duplicate drafts."""
+    candidates = _repair_draft_candidates(entries, desc, draft_time)
+    if len(candidates) != 1:
+        return None
+    return candidates[0]
+
+
 async def _set_wechat_covers_same_page(
     page, portrait_cover, share_cover, expected_title, max_attempts=2
 ):
     """Set both cover cards on the create form before saving one draft."""
     previews = {}
     for orientation, cover_path in (
-        ("share", share_cover),
         ("portrait", portrait_cover),
+        ("share", share_cover),
     ):
         preview = None
         for attempt in range(1, max_attempts + 1):
@@ -1855,6 +2348,89 @@ async def _set_wechat_covers_for_upload(
     if incomplete:
         raise RuntimeError("微信横竖封面未完全设置成功，已停止保存草稿")
     return previews or {}
+
+
+async def _set_wechat_covers_sequentially(
+    page,
+    portrait_cover,
+    share_cover,
+    expected_title,
+    title,
+    desc,
+    known_drafts,
+    video_path=None,
+):
+    """Set one cover, save, reopen, then set the other cover.
+
+    WeChat's current editor reliably accepts only one uploaded cover before it
+    needs a draft save/reopen. Keeping both uploads on one page makes the
+    second confirm button disappear and turns a finished upload into an
+    ambiguous failure.
+    """
+    previews = {}
+    for orientation, cover_path in (
+        ("portrait", portrait_cover),
+        ("share", share_cover),
+    ):
+        label = "个人主页" if orientation == "portrait" else "分享"
+        preview = None
+        for attempt in range(1, 4):
+            preview = await _upload_wechat_cover_card(
+                page, cover_path, orientation, expected_title
+            )
+            if preview:
+                break
+            if attempt < 3:
+                # Right after the video finishes processing, WeChat's pending
+                # auto cover generation can overwrite a custom cover that was
+                # just confirmed. Wait the race out, dismiss the dialog and
+                # apply the cover again instead of failing the whole upload.
+                print(
+                    f">>> {label}封面未生效，关闭弹层等待 45 秒后重试 ({attempt}/3)"
+                )
+                await _close_cover_dialog(page)
+                await asyncio.sleep(45)
+        if not preview:
+            if orientation == "share" and previews.get("portrait"):
+                # The draft already holds the video and the portrait cover. A
+                # share card we cannot pixel-verify is a cosmetic difference,
+                # not a lost upload: save the draft and record success with a
+                # warning instead of reporting the whole upload as failed.
+                print(
+                    f">>> {label}封面未能像素校验通过；草稿已含视频与竖封面，"
+                    "先存草稿保住本次上传"
+                )
+                action = await _click_final_action(page, False)
+                await asyncio.sleep(6)
+                if not await _verify_draft_saved(
+                    page, title, desc, known_drafts=known_drafts
+                ):
+                    raise RuntimeError(f"{action}后草稿箱核验失败")
+                print(
+                    ">>> 警告：分享卡片可能仍是微信自动封面，请在草稿箱目视确认；"
+                    "本次上传按成功记录"
+                )
+                previews[orientation] = {"local_path": cover_path, "unverified": True}
+                continue
+            raise RuntimeError(f"微信{label}封面未能确认设置")
+        previews[orientation] = preview
+
+        action = await _click_final_action(page, False)
+        await asyncio.sleep(6)
+        expected_covers = previews if orientation == "share" else None
+        if not await _verify_draft_saved(
+            page,
+            title,
+            desc,
+            expected_covers=expected_covers,
+            known_drafts=known_drafts,
+        ):
+            raise RuntimeError(f"{action}后草稿箱核验失败")
+        if orientation == "portrait" and video_path:
+            # The draft now exists even if the share cover later fails, so pin
+            # its box entry for an exact --repair-covers run.
+            await _record_draft_reference(video_path, page, desc)
+    return previews
 
 
 def _generate_wechat_covers(video_path, title, cover_title=None):
@@ -2102,30 +2678,46 @@ async def upload_one_video(video_path, title, desc=None, tags=None, is_public=Fa
                         )
                         if not await _wait_cover_editor_ready(page, timeout=1800):
                             raise RuntimeError("超时恢复后的封面编辑器未就绪")
+
+                    if not is_public:
+                        cover_previews = await _set_wechat_covers_sequentially(
+                            page,
+                            portrait_cover,
+                            share_cover,
+                            cover_headline,
+                            title,
+                            desc,
+                            known_drafts,
+                            video_path=video_path,
+                        )
+                        marker = os.path.join(os.path.dirname(video_path), ".wechat_uploaded")
+                        with open(marker, "w") as f:
+                            f.write("1")
+                        print(">>> 存草稿完成！")
+                        return True
+
                     cover_previews = await _set_wechat_covers_for_upload(
                         page,
                         portrait_cover,
                         share_cover,
                         cover_headline,
                     )
+                    # 尝试找到"公开"选项
+                    try:
+                        public_opt = await _try_selectors(page, [
+                            'text="公开"',
+                            '[class*="public"]',
+                            'label:has-text("公开")',
+                        ], "公开选项")
+                        if public_opt:
+                            await public_opt.click()
+                            print(">>> 已设置为公开")
+                    except Exception:
+                        print(">>> 未找到公开选项（默认可能已是公开）")
 
-                    if is_public:
-                        # 尝试找到"公开"选项
-                        try:
-                            public_opt = await _try_selectors(page, [
-                                'text="公开"',
-                                '[class*="public"]',
-                                'label:has-text("公开")',
-                            ], "公开选项")
-                            if public_opt:
-                                await public_opt.click()
-                                print(">>> 已设置为公开")
-                        except Exception:
-                            print(">>> 未找到公开选项（默认可能已是公开）")
-
-                    # 8. 发布或存草稿
+                    # 8. 发布
                     await asyncio.sleep(1)
-                    action = await _click_final_action(page, is_public)
+                    action = await _click_final_action(page, True)
                     await asyncio.sleep(5)
                     print(f">>> 点击后页面: {page.url}")
                     after_text = await _wujie_text(page)
@@ -2137,19 +2729,8 @@ async def upload_one_video(video_path, title, desc=None, tags=None, is_public=Fa
                     except Exception as e:
                         print(f">>> 保存调试截图失败: {e}")
 
-                    # 9. 等待发布/保存结果。草稿必须回读草稿箱确认。
-                    if is_public:
-                        await _wait_published(page, timeout=30)
-                    else:
-                        ok = await _verify_draft_saved(
-                            page,
-                            title,
-                            desc,
-                            expected_covers=cover_previews,
-                            known_drafts=known_drafts,
-                        )
-                        if not ok:
-                            raise RuntimeError("草稿箱核验失败，未确认保存草稿")
+                    # 9. 等待发布结果。
+                    await _wait_published(page, timeout=30)
 
                     # 10. 标记完成
                     marker = os.path.join(os.path.dirname(video_path), ".wechat_uploaded")
@@ -2170,6 +2751,23 @@ async def upload_one_video(video_path, title, desc=None, tags=None, is_public=Fa
             print(f">>> 尝试 {attempt} 失败: {e}")
             if file_selected:
                 print(">>> 文件已提交给微信，为避免重复上传，本次不再自动重试")
+                # The video is in WeChat's hands. If the draft box confirms a
+                # draft for this description, the upload itself succeeded and
+                # only a cover detail is off: record success instead of
+                # reporting a failure the user has to disprove by hand.
+                if await _draft_exists_for(page, desc):
+                    marker = os.path.join(os.path.dirname(video_path), ".wechat_uploaded")
+                    with open(marker, "w", encoding="utf-8") as handle:
+                        handle.write("1")
+                    print(
+                        ">>> 草稿箱已确认存在本次草稿；上传按成功记录，"
+                        "封面差异请用 --repair-covers 或目视核对"
+                    )
+                    return True
+                print(
+                    ">>> 草稿箱未找到本次草稿；请用 --repair-covers 或重跑，"
+                    "不要盲目重复上传"
+                )
                 return False
             if attempt < max_retries:
                 print(f">>> 等待 5 秒后重试...")
@@ -2177,6 +2775,194 @@ async def upload_one_video(video_path, title, desc=None, tags=None, is_public=Fa
 
     print(f">>> 上传最终失败: {last_error}")
     return False
+
+
+async def _draft_exists_for(page, desc):
+    """Whether the draft box already holds a draft for this description."""
+    try:
+        if not await _open_draft_list(page):
+            return False
+        entries = await _draft_list_entries(page)
+        return len(_repair_draft_candidates(entries, desc)) >= 1
+    except Exception:
+        return False
+
+
+async def _list_draft_box(headless=False):
+    """Read-only inventory of the WeChat draft box, for reconciling with tasks."""
+    from playwright.async_api import async_playwright
+    async with async_playwright() as p:
+        context, page, profile_lock = await _ensure_browser(p, headless=headless)
+        try:
+            await _goto_wechat_page(page, WECHAT_HOME_URL)
+            await asyncio.sleep(2)
+            if not await _ensure_logged_in(page, allow_qr=not headless):
+                return False
+            if not await _open_draft_list(page):
+                print(">>> 无法打开草稿箱")
+                return False
+            entries = await _draft_list_entries(page)
+            print(f"\n=== 草稿箱第一页共 {len(entries)} 条 ===")
+            for entry in entries:
+                title = (entry.get("title") or "").replace("\n", " ")[:64]
+                print(f"[{entry.get('index')}] {entry.get('time')} | {title}")
+            return True
+        finally:
+            try:
+                await context.close()
+            finally:
+                await profile_lock.release()
+
+
+async def repair_existing_draft(
+    video_path,
+    title=None,
+    desc=None,
+    cover_title=None,
+    draft_time=None,
+    headless=False,
+):
+    """Repair covers on an already-uploaded draft without submitting the video again."""
+    if not os.path.exists(video_path):
+        print(f">>> 视频文件不存在: {video_path}")
+        return False
+
+    cached_metadata = _load_cached_upload_metadata(video_path)
+    title = str(title or cached_metadata.get("wechat_title") or "").strip()
+    desc = str(desc or cached_metadata.get("description") or "").strip()
+    cover_title = str(cover_title or cached_metadata.get("cover_title") or "").strip()
+    # A previous upload records which draft box entry it wrote, so a repair can
+    # target it exactly even when older duplicate drafts still exist.
+    draft_time = str(draft_time or cached_metadata.get("wechat_draft_time") or "").strip() or None
+    title = _normalize_wechat_title(title)
+    if not title or not desc or not cover_title:
+        print(">>> 修复草稿需要标题、描述和封面标题；请传入或提供 upload_metadata.json")
+        return False
+
+    portrait_cover, share_cover = _generate_wechat_covers(
+        video_path, title, cover_title=cover_title
+    )
+    if not portrait_cover or not share_cover:
+        print(">>> 微信横竖封面生成失败，已停止修复草稿")
+        return False
+
+    print(f"\n{'=' * 60}")
+    print("🛠 视频号草稿封面修复")
+    print(f"   文件: {video_path}")
+    print(f"   标题: {title}")
+    print(f"   草稿时间: {draft_time or '自动匹配唯一描述'}")
+    print(f"   封面标题: {cover_title}")
+    print(f"{'=' * 60}")
+
+    from playwright.async_api import async_playwright
+    async with async_playwright() as p:
+        context, page, profile_lock = await _ensure_browser(p, headless=headless)
+        try:
+            await _goto_wechat_page(page, WECHAT_HOME_URL)
+            await asyncio.sleep(2)
+            if not await _ensure_logged_in(page, allow_qr=not headless):
+                return False
+            if not await _open_draft_list(page):
+                print(">>> 无法打开草稿箱")
+                return False
+
+            entries = await _draft_list_entries(page)
+            known_drafts = {_draft_signature(entry) for entry in entries}
+            target = _select_repair_draft_entry(entries, desc, draft_time)
+            if not target:
+                candidates = _repair_draft_candidates(entries, desc)
+                print(
+                    f">>> 描述匹配到 {len(candidates)} 条草稿，"
+                    "请用 --draft-time 指定其中一条: "
+                    + "; ".join(
+                        f"{entry.get('time')} (index={entry.get('index')})"
+                        for entry in candidates
+                    )
+                )
+                return False
+
+            print(f">>> 打开待修复草稿: {target.get('time')} (index={target.get('index')})")
+            if not await _open_draft_entry(page, target["index"]):
+                return False
+            if not await _wait_cover_editor_ready(page, timeout=1800):
+                print(">>> 待修复草稿的封面编辑器未就绪")
+                await _save_cover_editor_debug(page)
+                return False
+
+            cover_previews = {}
+            action = "存草稿"
+            for orientation, cover_path in (
+                ("portrait", portrait_cover),
+                ("share", share_cover),
+            ):
+                preview = await _upload_wechat_cover_card(
+                    page, cover_path, orientation, cover_title
+                )
+                if not preview:
+                    print(f">>> {'个人主页' if orientation == 'portrait' else '分享'}封面未能确认设置")
+                    return False
+                cover_previews[orientation] = preview
+
+                action = await _click_final_action(page, False)
+                await asyncio.sleep(6)
+                print(f">>> 修复保存后页面: {page.url}")
+                if not await _open_draft_list(page):
+                    print(">>> 修复后无法打开草稿箱核验")
+                    return False
+                entries = await _draft_list_entries(page)
+                updated_entries = [
+                    entry
+                    for entry in _repair_draft_candidates(entries, desc)
+                    if _draft_signature(entry) not in known_drafts
+                ]
+                if len(updated_entries) == 1:
+                    target = updated_entries[0]
+                else:
+                    target = _select_repair_draft_entry(entries, desc, draft_time)
+                if not target:
+                    print(">>> 修复后无法唯一确定这条草稿，未写入成功标记")
+                    return False
+                print(f">>> 重新打开草稿以设置下一张封面: {target.get('time')} (index={target.get('index')})")
+                if not await _open_draft_entry(page, target["index"]):
+                    return False
+                if not await _wait_cover_editor_ready(page, timeout=1800):
+                    print(">>> 修复后的草稿封面编辑器未就绪")
+                    await _save_cover_editor_debug(page)
+                    return False
+
+            print(f">>> 核验修复后的草稿: {target.get('time')} (index={target.get('index')})")
+            # The last loop iteration already reopened this draft, so the editor
+            # is normally on screen. Only walk back through the draft list when
+            # the current page is not the draft's edit form.
+            if not await _cover_editor_nodes_ready(page):
+                if not await _open_draft_list(page):
+                    print(">>> 核验前无法打开草稿箱")
+                    return False
+                entries = await _draft_list_entries(page)
+                refreshed = _select_repair_draft_entry(entries, desc, draft_time)
+                if refreshed:
+                    target = refreshed
+                if not await _open_draft_entry(page, target["index"]):
+                    return False
+            if not await _wait_cover_editor_ready(page, timeout=1800):
+                print(">>> 修复后的草稿封面编辑器未就绪")
+                await _save_cover_editor_debug(page)
+                return False
+            if not await _verify_draft_form_fields(page, title, desc):
+                return False
+            if not await _verify_wechat_cover_previews(page, cover_previews):
+                return False
+
+            marker = os.path.join(os.path.dirname(video_path), ".wechat_uploaded")
+            with open(marker, "w", encoding="utf-8") as handle:
+                handle.write("1")
+            print(f">>> {action}完成，草稿封面已修复！")
+            return True
+        finally:
+            try:
+                await context.close()
+            finally:
+                await profile_lock.release()
 
 
 # ============================================================================ #
@@ -2305,6 +3091,21 @@ def main():
     parser.add_argument("--pattern", default="*hardsub*.mp4", help="批量上传文件匹配模式")
     parser.add_argument("--project-title", default=None, help="项目标题前缀")
     parser.add_argument("--retry-failed", action="store_true", help="补传失败队列")
+    parser.add_argument(
+        "--repair-covers",
+        action="store_true",
+        help="修复已保存草稿的横竖封面；不会重新上传视频",
+    )
+    parser.add_argument(
+        "--list-drafts",
+        action="store_true",
+        help="只读列出草稿箱条目，用于核对任务与草稿是否一致",
+    )
+    parser.add_argument(
+        "--draft-time",
+        default=None,
+        help="修复草稿时用草稿箱显示时间区分同描述草稿，例如 23:36",
+    )
     parser.add_argument("--headless", action="store_true", help="无头模式（不显示浏览器窗口）")
     parser.add_argument("--no_auto_title", action="store_true", help="禁用字幕自动标题，使用传入/文件名标题")
     parser.add_argument("--interval", type=float, default=10.0, help="批量上传间隔秒数")
@@ -2328,6 +3129,23 @@ def main():
             return
         print(f">>> 补传模式: {len(videos)} 个视频")
         ok = asyncio.run(run_batch(videos, args))
+        sys.exit(0 if ok else 1)
+
+    if args.list_drafts:
+        ok = asyncio.run(_list_draft_box(headless=args.headless))
+        sys.exit(0 if ok else 1)
+
+    if args.repair_covers:
+        if not args.path:
+            parser.error("--repair-covers 需要视频文件路径")
+        ok = asyncio.run(repair_existing_draft(
+            args.path,
+            title=args.title,
+            desc=args.desc,
+            cover_title=args.cover_title,
+            draft_time=args.draft_time,
+            headless=args.headless,
+        ))
         sys.exit(0 if ok else 1)
 
     if args.batch:

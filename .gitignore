@@ -41,3 +41,6 @@ Library/Tools/vdown/network_log.txt
 Library/Tools/vdown/screenshot_debug.png
 Library/Tools/vdown/cookies.txt
 *.exe
+
+# 视频号上传器的本地浏览器 profile（含登录态）、锁文件与调试产物
+Library/Tools/autosub/wechat-channel-uploader/assets/

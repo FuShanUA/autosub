@@ -175,6 +175,7 @@ def _read_escape_seq():
 
         # For sequences like \x1b[5~ (PgUp), \x1b[3~ (Delete), \x1b[1;5A (Ctrl+Up)
         # ch3 is a digit or intermediate char — keep reading until terminator
+        buf = ch3
         while True:
             dr, _, _ = select.select([fd], [], [], 0.02)
             if not dr:
@@ -182,9 +183,14 @@ def _read_escape_seq():
             extra = os.read(fd, 1)
             if not extra:
                 break
+            buf += extra
             # Terminators: alphabetic characters or '~'
             if extra.isalpha() or extra == b'~':
                 break
+        if buf.startswith(b'5') and buf.endswith(b'~'):
+            return 'pageup'
+        if buf.startswith(b'6') and buf.endswith(b'~'):
+            return 'pagedown'
         return None
     except Exception:
         return None
@@ -304,6 +310,14 @@ logger = logging.getLogger("AutoSubBatchPro")
 _UPLOAD_SLEEP_GUARD = None
 
 
+def _rich_environ():
+    """Give Rich a usable TERM so dumb-terminal fallback does not lock 80 columns."""
+    env = dict(os.environ)
+    if env.get("TERM") in (None, "", "dumb"):
+        env["TERM"] = "xterm-256color"
+    return env
+
+
 def _stop_upload_sleep_guard():
     """Terminate the batch-level sleep guard started by _start_upload_sleep_guard."""
     global _UPLOAD_SLEEP_GUARD
@@ -406,6 +420,8 @@ def clean_title_text(title, playlist_title=None):
 
     return title
 
+_ANSI_ESCAPE_RE = re.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')
+
 _ZERO_WIDTH_RE = re.compile(
     r'[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFE00-\uFE0F\u200D\u00AD]'
 )
@@ -413,7 +429,10 @@ _ZERO_WIDTH_RE = re.compile(
 def sanitize_title(s: str) -> str:
     """Strip zero-width chars and replace ambiguous-width Unicode punctuation
     with ASCII equivalents so rich's cell_len matches terminal render width."""
-    s = _ZERO_WIDTH_RE.sub('', str(s))
+    s = _ANSI_ESCAPE_RE.sub('', str(s))
+    s = _ZERO_WIDTH_RE.sub('', s)
+    s = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]', '', s)
+    s = re.sub(r'\s+', ' ', s).strip()
     for old, new in {'\u2014': '--', '\u2013': '-', '\u2019': "'",
                       '\u2018': "'", '\u201c': '"', '\u201d': '"',
                       '\u2026': '...'}.items():
@@ -579,6 +598,7 @@ class SubTask:
     playlist_index: Optional[int] = None
     retries: int = 0
     wx_skip_reason: Optional[str] = None
+    wx_metadata_failed: bool = False
 
     def to_dict(self):
         d = asdict(self)
@@ -588,6 +608,13 @@ class SubTask:
     @classmethod
     def from_dict(cls, d):
         data = {k: v for k, v in d.items() if k in cls.__dataclass_fields__}
+        if "wx_metadata_failed" not in data:
+            status = str(data.get("status") or "")
+            error = str(data.get("error") or "")
+            data["wx_metadata_failed"] = (
+                status.startswith("失败 (WX)")
+                and "元数据" in error
+            )
         if isinstance(data.get("pcts"), dict):
             data["pcts"].setdefault("WX", 0.0)
             if "MG" not in data["pcts"]:
@@ -797,6 +824,22 @@ def _pid_command(pid: int) -> str:
         return ""
 
 
+def _pid_alive(pid) -> bool:
+    """Whether a recorded worker pid still exists."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if psutil is not None:
+        try:
+            return psutil.pid_exists(pid)
+        except Exception:
+            return False
+    return bool(_pid_command(pid))
+
+
 # --- 资源管理器 ---
 class ResourceManager:
     def __init__(self):
@@ -925,10 +968,12 @@ class BatchEngine:
                     dash = Dashboard(self)
                     from rich.live import Live
                     try:
+                        init_terminal()
                         with Live(dash.render(), console=dash.console, screen=True, refresh_per_second=2) as live:
                             while True:
                                 # Reload state from disk to see updates from the active background process
                                 self.load_state_monitor()
+                                self._poll_monitor_input(dash)
                                 live.update(dash.render())
                                 time.sleep(0.5)
                     except KeyboardInterrupt:
@@ -1287,6 +1332,12 @@ class BatchEngine:
             return True
         if stage == "MG" and not self.do_bili and not self.do_wechat:
             return True
+        if (
+            stage == "MG"
+            and task.wx_metadata_failed
+            and self._stage_is_complete(task, "BI")
+        ):
+            return True
         if stage == "BI" and not self.do_bili:
             return True
         if stage == "WX" and not self.do_wechat:
@@ -1337,6 +1388,17 @@ class BatchEngine:
                 )
 
             reset_stages = RESET_DOWNSTREAM_STAGES[selected_stage]
+            preserved_upload_stages = set()
+            if selected_stage == "MG" and task.workdir:
+                for upload_stage in ("BI", "WX"):
+                    marker = STAGE_MARKERS.get(upload_stage)
+                    if marker and os.path.exists(os.path.join(task.workdir, marker)):
+                        preserved_upload_stages.add(upload_stage)
+                reset_stages = tuple(
+                    stage_name
+                    for stage_name in reset_stages
+                    if stage_name not in preserved_upload_stages
+                )
 
             if task.workdir and os.path.isdir(task.workdir):
                 try:
@@ -1402,6 +1464,8 @@ class BatchEngine:
 
             for reset_stage in reset_stages:
                 task.pcts[reset_stage] = 0.0
+            if "MG" in reset_stages:
+                task.wx_metadata_failed = False
             task.status = f"排队中 ({selected_stage})"
             task.error = None
             task.retries = 0
@@ -1513,15 +1577,18 @@ class BatchEngine:
                     ):
                         t.pid = None
                         continue
+                    if (
+                        t.status.startswith("失败 (WX)")
+                        and t.pcts.get("WX", 0.0) < 100.0
+                        and is_wechat_ambiguous_upload_reason(t.error)
+                    ):
+                        t.pid = None
+                        continue
 
-                    # 彻底自愈：不再解析可能损坏的 status 字符串，而是根据 pcts 数据重新推导
-                    current_stage = "DL"
-                    for s in STAGE_ORDER:
-                        if t.pcts.get(s, 0.0) < 100.0:
-                            current_stage = s
-                            break
-                    else:
-                        current_stage = "完成"
+                    # 彻底自愈：根据磁盘标记和平台独立状态重新推导。MG 是
+                    # BI/WX 共用的聚合进度，不能让 WX 元数据失败把已成功的
+                    # BI 上传拖回 MG。
+                    current_stage = self._first_unfinished_stage(t) or "完成"
 
                     if current_stage == "完成":
                         t.status = "完成"
@@ -1536,6 +1603,49 @@ class BatchEngine:
         except Exception as e:
             logger.error(f"Load state failed: {e}")
 
+    def _poll_monitor_input(self, dash):
+        """Handle GUI resize/scroll input while monitoring another engine."""
+        while check_kbhit():
+            raw_ch = read_char()
+            if not raw_ch:
+                break
+
+            if raw_ch == b'\x1e':
+                buf = b''
+                fd = sys.stdin.fileno()
+                while True:
+                    try:
+                        dr, _, _ = select.select([fd], [], [], 0.1)
+                        if not dr:
+                            break
+                        b = os.read(fd, 1)
+                        if not b or b == b'\n':
+                            break
+                        buf += b
+                    except Exception:
+                        break
+                try:
+                    h_str, w_str = buf.decode('utf-8', errors='ignore').split(",")
+                    dash.console.height = int(h_str)
+                    dash.console.width = int(w_str)
+                except Exception:
+                    pass
+            elif raw_ch == b'q':
+                raise KeyboardInterrupt
+            elif raw_ch == b'\x1b':
+                direction = _read_escape_seq()
+                if direction == 'up':
+                    dash.scroll_offset = max(0, dash.scroll_offset - 1)
+                elif direction == 'down':
+                    with self.lock:
+                        max_offset = max(0, len(self.task_map) - dash.page_size)
+                    dash.scroll_offset = min(max_offset, dash.scroll_offset + 1)
+                elif direction in ('pageup', 'pagedown'):
+                    step = -dash.page_size if direction == 'pageup' else dash.page_size
+                    with self.lock:
+                        max_offset = max(0, len(self.task_map) - dash.page_size)
+                    dash.scroll_offset = min(max_offset, max(0, dash.scroll_offset + step))
+
     def load_state_monitor(self):
         """Loads state directly from disk in read-only mode for monitor dashboard
         preserving actual live statuses (like '运行中') instead of resetting them."""
@@ -1545,11 +1655,39 @@ class BatchEngine:
                 data = json.load(f)
             tasks_source = data.get("tasks", data) if isinstance(data, dict) else {}
             if not isinstance(tasks_source, dict): tasks_source = {}
+
+            if "batch_state.json" in os.path.basename(self.state_file):
+                self.do_bili = bool(data.get("bili", self.do_bili))
+                self.do_gdsync = bool(data.get("gdsync", self.do_gdsync))
+                self.do_wechat = bool(data.get("wechat", self.do_wechat))
+                self.wechat_public = bool(data.get("wechat_public", self.wechat_public))
+
             with self.lock:
                 for uid_str, d in tasks_source.items():
                     if not isinstance(d, dict): continue
                     t = SubTask.from_dict(d)
-                    t.status = d.get("status", "未知")
+                    self._sync_marker_progress(t)
+                    live_status = d.get("status", "未知")
+                    stage = self._first_unfinished_stage(t)
+                    # The monitor owns no workers, so a persisted 运行中 is only
+                    # trustworthy while its recorded child pid is alive. An engine
+                    # killed mid-task otherwise leaves the row spinning forever and
+                    # hides which stages still have to run.
+                    running = live_status.startswith("运行中") and _pid_alive(t.pid)
+                    paused = live_status.startswith("暂停中") and t.is_paused
+                    if running or paused:
+                        t.status = live_status
+                    elif stage is None:
+                        t.status = "完成"
+                        t.error = None
+                        t.retries = 0
+                    elif live_status.startswith(("运行中", "暂停中")):
+                        t.status = f"排队中 ({stage})"
+                        t.error = None
+                        t.retries = 0
+                    else:
+                        # Keep persisted failures and skips visible as they are.
+                        t.status = live_status
                     self.task_map[t.uid] = t
         except Exception as e:
             pass
@@ -1595,6 +1733,33 @@ class BatchEngine:
             if s <= 0: return "未知"
             return f"{s//60:02d}:{s%60:02d}"
         except: return "未知"
+
+    def source_duration_matches(self, path: str, expected_duration: str) -> bool:
+        """Check whether a downloaded source is close to the remote duration."""
+        local_sec = parse_duration_to_seconds(self.get_duration(path))
+        expected_sec = parse_duration_to_seconds(expected_duration)
+        if local_sec <= 0 or expected_sec <= 0:
+            return True
+        tolerance = max(3.0, expected_sec * 0.005)
+        return abs(local_sec - expected_sec) <= tolerance
+
+    def quarantine_partial_source(self, path: str) -> str:
+        """Move an incomplete merged download out of the source-video namespace."""
+        target = f"{path}.partial-{int(time.time() * 1000)}.part"
+        os.replace(path, target)
+        return target
+
+    def quarantine_partial_run(self, workdir: str) -> str:
+        """Move an invalid partial run aside so a retry starts from download."""
+        backup_dir = os.path.join(workdir, f".invalid-partial-run-{int(time.time() * 1000)}")
+        os.makedirs(backup_dir, exist_ok=False)
+        for entry in os.listdir(workdir):
+            if entry == os.path.basename(backup_dir):
+                continue
+            path = os.path.join(workdir, entry)
+            if os.path.isfile(path):
+                os.replace(path, os.path.join(backup_dir, entry))
+        return backup_dir
 
     def get_video_dimensions(self, path):
         """Returns (width, height) using ffprobe."""
@@ -1703,10 +1868,14 @@ class BatchEngine:
                         main_vids = [v for v in all_vids if "_hardsub" not in v]
                         target_vid = main_vids[0] if main_vids else all_vids[0]
                         dur = self.get_duration(os.path.join(task.workdir, target_vid))
-                        if dur and dur != "未知":
-                            task.duration = dur
+                        self.fetch_web_metadata(task)
+                        if not task.duration or task.duration in ["未知", "00:00"]:
+                            if dur and dur != "未知":
+                                task.duration = dur
+                                found_on_disk = True
+                                self._refresh_wechat_skip(task)
+                        else:
                             found_on_disk = True
-                            self._refresh_wechat_skip(task)
 
                 # B. 物理文件未找到，尝试从 Web 获取
                 if not found_on_disk:
@@ -1717,6 +1886,57 @@ class BatchEngine:
 
             # 4. 判定环节状态
             files = os.listdir(task.workdir)
+
+            source_files = [
+                f for f in files
+                if f.endswith((".mp4", ".mkv", ".webm"))
+                and "_hardsub" not in f
+                and not re.search(r'\.f\d+\.', f)
+                and not f.endswith(".part")
+            ]
+            if source_files and not self.source_duration_matches(
+                os.path.join(task.workdir, source_files[0]), task.duration
+            ):
+                local_sec = parse_duration_to_seconds(
+                    self.get_duration(os.path.join(task.workdir, source_files[0]))
+                )
+                expected_sec = parse_duration_to_seconds(task.duration)
+                error = (
+                    f"源视频时长不完整（本地 {local_sec:.0f}s / 远端 {expected_sec:.0f}s），"
+                )
+                if task.status == "完成":
+                    task.status = "失败 (DL)"
+                    task.pcts.update({
+                        "DL": round(min(99.9, local_sec / expected_sec * 100.0), 1),
+                        "TR": 0.0,
+                        "TL": 0.0,
+                        "MR": 0.0,
+                        "BR": 0.0,
+                        "GD": 0.0,
+                        "BI": 0.0,
+                        "WX": 0.0,
+                    })
+                    task.error = error + "任务需人工重置后重新下载"
+                    logger.warning(f"Task {task.uid} | {task.error}")
+                    return
+
+                backup_dir = self.quarantine_partial_run(task.workdir)
+                task.status = "排队中 (DL)"
+                task.pcts.update({
+                    "DL": round(min(99.9, local_sec / expected_sec * 100.0), 1),
+                    "TR": 0.0,
+                    "TL": 0.0,
+                    "MR": 0.0,
+                    "BR": 0.0,
+                    "GD": 0.0,
+                    "BI": 0.0,
+                    "WX": 0.0,
+                })
+                task.error = (
+                    error + f"已备份至 {os.path.basename(backup_dir)}，需重新下载"
+                )
+                logger.warning(f"Task {task.uid} | {task.error}")
+                return
 
             # Translation quality is a hard gate. Old .cn/.bi files from a run
             # before this check must not be promoted to MR/BR merely because
@@ -1986,6 +2206,16 @@ class BatchEngine:
                     nonlocal _last_save
                     _watch["output"] = time.time()
                     output_lines.append(_line)
+                    if re.search(r"(开始上传|\((?:attempt|尝试)\s*\d+/\d+\))", _line, re.I):
+                        # An uploader retry restarts from 0%. Without resetting the
+                        # watchdog baseline, the new attempt looks like a stall at
+                        # the previous attempt's maximum percentage.
+                        _watch["pct"] = -1.0
+                        _watch["advance"] = time.time()
+                        task.pcts[stage] = start_pct
+                        if allow_save:
+                            self.save_state()
+                        return
                     m = re.search(r'Progress:\s*([\d\.]+)%', _line) or re.search(r'\[download\]\s*([\d\.]+)%', _line) or re.search(r'上传进度:\s*([\d\.]+)%', _line)
                     if not m:
                         return
@@ -2157,7 +2387,7 @@ class BatchEngine:
                         task.pcts["DL"] = 0.0
                     # Pre-check: skip download if a valid source video already exists
                     # in workdir (re-run or resume). Verify by comparing local video
-                    # duration against remote duration with 5% tolerance.
+                    # duration against remote duration with a tight tolerance.
                     dl_skip = False
                     if workdir and os.path.exists(workdir):
                         existing_vids = [f for f in os.listdir(workdir)
@@ -2172,18 +2402,25 @@ class BatchEngine:
                             if local_sec <= 0:
                                 continue
                             if not task.duration or task.duration == "未知":
+                                self.fetch_web_metadata(task)
+                            if not task.duration or task.duration == "未知":
                                 task.duration = local_dur
                             self._refresh_wechat_skip(task)
                             # Try remote duration; fall back to size check (>10MB)
                             remote_sec = parse_duration_to_seconds(task.duration) if task.duration and task.duration != "未知" else 0
-                            if remote_sec > 0 and abs(local_sec - remote_sec) / remote_sec < 0.05:
+                            if remote_sec > 0 and self.source_duration_matches(candidate, task.duration):
                                 logger.info(f"Task {task.uid} | DL skip: existing video matches duration ({local_sec:.0f}s vs {remote_sec:.0f}s)")
                                 dl_skip = True
                                 break
-                            elif os.path.getsize(candidate) > 10 * 1024 * 1024:
+                            elif remote_sec <= 0 and os.path.getsize(candidate) > 10 * 1024 * 1024:
                                 logger.info(f"Task {task.uid} | DL skip: existing video ({local_sec:.0f}s, {os.path.getsize(candidate)/(1024*1024):.0f}MB)")
                                 dl_skip = True
                                 break
+                            partial_path = self.quarantine_partial_source(candidate)
+                            logger.warning(
+                                f"Task {task.uid} | DL retry: existing video is incomplete "
+                                f"({local_sec:.0f}s vs {remote_sec:.0f}s); moved to {os.path.basename(partial_path)}"
+                            )
                     if dl_skip:
                         task.pcts["DL"] = 100.0
                         task.status = "排队中 (TR)"
@@ -2324,13 +2561,15 @@ class BatchEngine:
                         initial_upload_stages = []
                         if need_gd:
                             initial_upload_stages.append("GD")
-                        if need_bi or need_wx:
+                        if need_bi:
                             initial_upload_stages.append("MG")
+                        elif need_wx:
+                            initial_upload_stages.append("WX")
                         upload_status_label = "/".join(initial_upload_stages)
                         if upload_status_label:
                             with self.lock:
                                 task.status = f"运行中 ({upload_status_label})"
-                                if need_bi or need_wx:
+                                if need_bi:
                                     task.pcts["MG"] = max(
                                         task.pcts.get("MG", 0.0),
                                         1.0,
@@ -2432,7 +2671,7 @@ class BatchEngine:
                         if need_wx:
                             def _wechat_metadata_log(message):
                                 self._advance_mg_progress(task, message)
-                                logger.info(f"Task {task.uid} | MG | {message}")
+                                logger.info(f"Task {task.uid} | WX | {message}")
 
                             wechat_metadata = prepare_wechat_upload_metadata(
                                 workdir,
@@ -2440,14 +2679,17 @@ class BatchEngine:
                                 llm_provider=upload_llm_provider,
                                 on_log=_wechat_metadata_log,
                                 source_title=task.title,
+                                prefer_local_wechat_fallback=task.wx_metadata_failed,
                             )
                             wx_skip_reason = get_wechat_upload_skip_reason(workdir)
                         if need_wx and not wechat_metadata:
                             logger.error(
-                                f"Task {task.uid} | MG | WeChat metadata "
+                                f"Task {task.uid} | WX | WeChat metadata "
                                 "incomplete; WX upload stopped"
                             )
                             metadata_failed = True
+                            with self.lock:
+                                task.wx_metadata_failed = True
                             upload_failure_reasons.append(
                                 "视频号元数据生成失败或不完整，WX上传未启动"
                             )
@@ -2455,6 +2697,7 @@ class BatchEngine:
                         elif need_wx:
                             with self.lock:
                                 task.pcts["MG"] = 100.0
+                                task.wx_metadata_failed = False
                                 self.save_state()
                             wechat_cmd = build_wechat_cmd(
                                 workdir,
@@ -2520,6 +2763,7 @@ class BatchEngine:
                                 with open(os.path.join(workdir, ".wechat_uploaded"), "w", encoding="utf-8") as f: f.write("1")
                             except: pass
                             task.pcts["WX"] = 100.0
+                            task.wx_metadata_failed = False
                         self.save_state()
 
                         if need_bi and not bi_result[0]:
@@ -2943,7 +3187,7 @@ class BatchEngine:
 class Dashboard:
     def __init__(self, engine: BatchEngine):
         self.engine = engine
-        self.console = Console(force_terminal=True)
+        self.console = Console(force_terminal=True, _environ=_rich_environ())
         self.cmd_buf = ""
         self.scroll_offset = 0
         self.page_size = 10  # 默认每页显示 10 个任务
@@ -3050,7 +3294,7 @@ class Dashboard:
                     )
                 ),
             )
-            
+
         else:
             # 3. Narrow Mode: Completely hide stage progress columns to prioritize Title column
             table.add_column("ID", width=3, justify="center", vertical="middle")
@@ -3169,6 +3413,9 @@ def main():
     args = parser.parse_args()
 
     _start_upload_sleep_guard()
+    # Large Bilibili uploads over the current split-VPN route can exceed the
+    # uploader's 900s default while still making progress.
+    os.environ.setdefault("BILI_UPLOAD_TIMEOUT_SECONDS", "3600")
 
     engine = BatchEngine(output_dir=args.output, sub_dir_name=args.sub_dir_name, state_file=args.state_file)
     engine.quality = args.quality
@@ -3345,6 +3592,11 @@ def main():
                             with engine.lock:
                                 max_offset = max(0, len(engine.task_map) - dash.page_size)
                             dash.scroll_offset = min(max_offset, dash.scroll_offset + 1)
+                        elif direction in ('pageup', 'pagedown'):
+                            step = -dash.page_size if direction == 'pageup' else dash.page_size
+                            with engine.lock:
+                                max_offset = max(0, len(engine.task_map) - dash.page_size)
+                            dash.scroll_offset = min(max_offset, max(0, dash.scroll_offset + step))
                         else:
                             # Bare ESC key — clear command buffer
                             cmd_mode, id_buf, dash.cmd_buf = None, "", ""

@@ -42,7 +42,7 @@ _PLATFORM_ALIASES = {
     "wx": "wechat",
 }
 
-_COVER_STYLE_VERSION = "kaiti-alliance-hard-shadow-lower-card-v12"
+_COVER_STYLE_VERSION = "kaiti-alliance-hard-shadow-lower-card-v13"
 _FONT_FALLBACKS = (
     os.path.join(os.path.dirname(__file__), "fonts", "LXGWWenKai-Medium.ttf"),
     "/Users/shanfu/Library/Fonts/LXGWWenKai-Medium.ttf",
@@ -69,6 +69,21 @@ _MIN_FRAME_BRIGHTNESS = 40.0
 _MIN_FALLBACK_FRAME_BRIGHTNESS = 8.0
 _SAMPLE_FRAME_COUNT = 16
 _DENSE_SAMPLE_FRAME_COUNT = 64
+_COMPOSITION_NONE = 0
+_COMPOSITION_SINGLE = 1
+_COMPOSITION_PANEL = 2
+_COMPOSITION_CONVERSATION = 3
+_COMPOSITION_LABELS = {
+    _COMPOSITION_NONE: "无主体",
+    _COMPOSITION_SINGLE: "单人",
+    _COMPOSITION_PANEL: "多人",
+    _COMPOSITION_CONVERSATION: "对谈",
+}
+_MIN_SUBJECT_FACE_AREA = 0.0018
+_MIN_SINGLE_FACE_AREA = 0.0035
+_SUBJECT_AREA_RATIO_TO_LARGEST = 0.22
+_MAX_PANEL_SUBJECTS = 5
+_MAX_ACCEPTABLE_SUBJECTS = 8
 
 
 def _normalize_orientation(orientation: str) -> Tuple[str, Tuple[int, int]]:
@@ -330,12 +345,126 @@ def _largest_face_bbox(image: Image.Image):
     return max(faces, key=lambda face: face[2] * face[3]) if faces else None
 
 
+def _face_geometry(
+    image_width: int,
+    image_height: int,
+    faces: Sequence[Tuple[int, int, int, int]],
+):
+    """Normalize face boxes into area ratios and center coordinates."""
+    image_area = max(1, image_width * image_height)
+    width_denominator = max(1, image_width)
+    height_denominator = max(1, image_height)
+    geometry = []
+    for x, y, width, height in faces:
+        area = (width * height) / image_area
+        center_x = (x + width / 2) / width_denominator
+        center_y = (y + height / 2) / height_denominator
+        geometry.append((area, center_x, center_y))
+    return geometry
+
+
+def _subject_faces(
+    image_width: int,
+    image_height: int,
+    faces: Sequence[Tuple[int, int, int, int]],
+):
+    """Split detections into likely subjects and background/audience faces."""
+    geometry = _face_geometry(image_width, image_height, faces)
+    if not geometry:
+        return [], []
+    largest_area = max(item[0] for item in geometry)
+    threshold = max(
+        _MIN_SUBJECT_FACE_AREA,
+        largest_area * _SUBJECT_AREA_RATIO_TO_LARGEST,
+    )
+    subjects = [item for item in geometry if item[0] >= threshold]
+    background = [item for item in geometry if item[0] < threshold]
+    return subjects, background
+
+
+def _center_is_in_frame(center_x: float, center_y: float) -> bool:
+    return 0.06 <= center_x <= 0.94 and 0.08 <= center_y <= 0.92
+
+
+def _is_conversation_pair(subjects) -> bool:
+    """Whether two prominent faces look like an interview/conversation frame."""
+    if len(subjects) != 2:
+        return False
+    (area_a, x_a, y_a), (area_b, x_b, y_b) = subjects
+    largest_area = max(area_a, area_b)
+    smallest_area = min(area_a, area_b)
+    if largest_area <= 0 or smallest_area / largest_area < 0.40:
+        return False
+    if area_a + area_b < 0.008:
+        return False
+    horizontal_distance = abs(x_a - x_b)
+    vertical_distance = abs(y_a - y_b)
+    return (
+        0.10 <= horizontal_distance <= 0.85
+        and vertical_distance <= 0.30
+        and all(_center_is_in_frame(x, y) for _, x, y in subjects)
+    )
+
+
+def _is_panel_group(subjects) -> bool:
+    """Whether several prominent faces form a panel or multi-guest frame."""
+    if not 3 <= len(subjects) <= _MAX_PANEL_SUBJECTS:
+        return False
+    areas = [area for area, _, _ in subjects]
+    largest_area = max(areas)
+    smallest_area = min(areas)
+    if largest_area <= 0 or smallest_area / largest_area < 0.30:
+        return False
+    if sum(areas) < 0.012:
+        return False
+    xs = [x for _, x, _ in subjects]
+    ys = [y for _, _, y in subjects]
+    if max(xs) - min(xs) < 0.15:
+        return False
+    if max(ys) - min(ys) > 0.35:
+        return False
+    return all(_center_is_in_frame(x, y) for _, x, y in subjects)
+
+
+def _composition_metrics(
+    image_width: int,
+    image_height: int,
+    faces: Sequence[Tuple[int, int, int, int]],
+):
+    """Classify a frame as conversation, panel, single subject, or no subject."""
+    subjects, background = _subject_faces(image_width, image_height, faces)
+    subject_count = len(subjects)
+    background_count = len(background)
+    if subject_count == 0:
+        return _COMPOSITION_NONE, subjects, background_count
+    if subject_count == 1:
+        area, center_x, center_y = subjects[0]
+        if (
+            area >= _MIN_SINGLE_FACE_AREA
+            and background_count <= 4
+            and _center_is_in_frame(center_x, center_y)
+        ):
+            return _COMPOSITION_SINGLE, subjects, background_count
+        return _COMPOSITION_NONE, subjects, background_count
+    if subject_count == 2:
+        if _is_conversation_pair(subjects):
+            return _COMPOSITION_CONVERSATION, subjects, background_count
+        return _COMPOSITION_SINGLE, subjects, background_count
+    if subject_count <= _MAX_PANEL_SUBJECTS:
+        if _is_panel_group(subjects):
+            return _COMPOSITION_PANEL, subjects, background_count
+        return _COMPOSITION_SINGLE, subjects, background_count
+    if subject_count <= _MAX_ACCEPTABLE_SUBJECTS:
+        return _COMPOSITION_SINGLE, subjects, background_count
+    return _COMPOSITION_NONE, subjects, background_count
+
+
 def _face_score(
     image: Image.Image,
     faces: Sequence[Tuple[int, int, int, int]],
     brightness: float,
 ) -> float:
-    """Score a frame after face detection has already been run."""
+    """Score a frame by conversational composition, not raw face count."""
     if cv2 is None or np is None or not faces:
         return 2.0 * brightness
 
@@ -343,28 +472,38 @@ def _face_score(
         cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2BGR), cv2.COLOR_BGR2GRAY
     )
     sharpness = min(1.0, cv2.Laplacian(gray, cv2.CV_64F).var() / 300.0)
-    image_area = max(1, image.width * image.height)
-    face_areas = [
-        (width * height) / image_area for _, _, width, height in faces
-    ]
-    total_face_area_ratio = min(1.0, sum(face_areas))
-    largest_face_area_ratio = max(face_areas)
-    center_distances = [
-        abs((x + width / 2) / image.width - 0.5)
-        for x, _, width, _ in faces
-    ]
+    composition, subjects, background_count = _composition_metrics(
+        image.width, image.height, faces
+    )
+    base_scores = {
+        _COMPOSITION_NONE: 0.0,
+        _COMPOSITION_SINGLE: 220.0,
+        _COMPOSITION_PANEL: 420.0,
+        _COMPOSITION_CONVERSATION: 500.0,
+    }
+    subject_areas = [area for area, _, _ in subjects]
+    total_subject_area = sum(subject_areas)
+    largest_subject_area = max(subject_areas) if subject_areas else 0.0
 
-    score = 35.0 * len(faces)
-    score += 25.0 * total_face_area_ratio
-    score += 10.0 * largest_face_area_ratio
+    score = base_scores[composition]
+    score += 100.0 * min(1.0, total_subject_area / 0.10)
+    score += 60.0 * min(1.0, largest_subject_area / 0.05)
     score += 4.0 * sharpness
     score += 2.0 * brightness
-    score -= 1.5 * sum(center_distances) / len(center_distances)
+    if subjects:
+        average_center_distance = sum(
+            abs(center_x - 0.5) for _, center_x, _ in subjects
+        ) / len(subjects)
+        score -= 20.0 * average_center_distance
+    score -= 18.0 * background_count
+    score -= 35.0 * max(0, len(subjects) - _MAX_PANEL_SUBJECTS)
+    if composition == _COMPOSITION_NONE:
+        score -= 8.0 * len(faces)
     return score
 
 
 def _frame_face_score(path: str) -> float:
-    """Prefer the most people, then total face area, sharpness, and brightness."""
+    """Prefer conversation/panel composition, then subject area and clarity."""
     with Image.open(path) as image:
         rgb = image.convert("RGB")
         brightness = _frame_brightness(path) / 255.0
@@ -372,13 +511,17 @@ def _frame_face_score(path: str) -> float:
         return _face_score(rgb, faces, brightness)
 
 
-def _frame_face_rank(path: str) -> Tuple[int, float]:
-    """Return face count first, then the subject score for cover ranking."""
+def _frame_face_rank(path: str) -> Tuple[int, float, int, int]:
+    """Return composition class, score, total faces, and subject faces."""
     with Image.open(path) as image:
         rgb = image.convert("RGB")
         faces = _face_bboxes(rgb)
         brightness = _frame_brightness(path) / 255.0
-        return len(faces), _face_score(rgb, faces, brightness)
+        score = _face_score(rgb, faces, brightness)
+        composition, subjects, _ = _composition_metrics(
+            rgb.width, rgb.height, faces
+        )
+        return composition, score, len(faces), len(subjects)
 
 
 def _sample_video_frames(
@@ -462,12 +605,14 @@ def extract_best_frame(video_path: str, output_path: str) -> str:
             video_path, temp_dir, ffmpeg, duration
         )
         for timestamp, frame in sampled_frames:
-            face_count, score = _frame_face_rank(frame)
-            candidates.append((score, face_count, frame, timestamp))
+            composition, score, face_count, subject_count = _frame_face_rank(frame)
+            candidates.append(
+                (score, composition, face_count, subject_count, frame, timestamp)
+            )
 
-        # A single face is an acceptable fallback, but it is also weak evidence
-        # that a multi-person interview was missed by sparse sampling.
-        if candidates and max(item[1] for item in candidates) <= 1:
+        # A single subject is an acceptable fallback, but it is also weak evidence
+        # that a conversation or panel frame was missed by sparse sampling.
+        if candidates and max(item[1] for item in candidates) <= _COMPOSITION_SINGLE:
             dense_frames = _sample_video_frames(
                 video_path,
                 temp_dir,
@@ -475,12 +620,14 @@ def extract_best_frame(video_path: str, output_path: str) -> str:
                 duration,
                 frame_count=_DENSE_SAMPLE_FRAME_COUNT,
             )
-            existing_timestamps = {item[3] for item in candidates}
+            existing_timestamps = {item[5] for item in candidates}
             for timestamp, frame in dense_frames:
                 if timestamp in existing_timestamps:
                     continue
-                face_count, score = _frame_face_rank(frame)
-                candidates.append((score, face_count, frame, timestamp))
+                composition, score, face_count, subject_count = _frame_face_rank(frame)
+                candidates.append(
+                    (score, composition, face_count, subject_count, frame, timestamp)
+                )
 
         if not candidates:
             raise RuntimeError(
@@ -492,7 +639,14 @@ def extract_best_frame(video_path: str, output_path: str) -> str:
         )
         validated = []
         selected = None
-        for rank, (sample_score, sample_face_count, sample_path, timestamp) in enumerate(
+        for rank, (
+            sample_score,
+            sample_composition,
+            sample_face_count,
+            sample_subject_count,
+            sample_path,
+            timestamp,
+        ) in enumerate(
             ranked[:8], start=1
         ):
             full_frame = os.path.join(temp_dir, f"validated-{rank}.jpg")
@@ -525,15 +679,36 @@ def extract_best_frame(video_path: str, output_path: str) -> str:
 
             if not extracted:
                 continue
-            full_face_count, full_score = _frame_face_rank(full_frame)
-            validated.append((full_score, full_face_count, full_frame, timestamp))
+            (
+                full_composition,
+                full_score,
+                full_face_count,
+                full_subject_count,
+            ) = _frame_face_rank(full_frame)
+            validated.append(
+                (
+                    full_score,
+                    full_composition,
+                    full_face_count,
+                    full_subject_count,
+                    full_frame,
+                    timestamp,
+                )
+            )
             # A real subject should keep most of its score after returning to
             # full resolution; low-resolution Haar false positives often do not.
             if (
-                full_face_count >= sample_face_count
+                full_composition >= sample_composition
                 and full_score >= max(5.0, sample_score * 0.6)
             ):
-                selected = (full_score, full_face_count, full_frame, timestamp)
+                selected = (
+                    full_score,
+                    full_composition,
+                    full_face_count,
+                    full_subject_count,
+                    full_frame,
+                    timestamp,
+                )
                 break
 
         if selected is None and validated:
@@ -541,11 +716,20 @@ def extract_best_frame(video_path: str, output_path: str) -> str:
         if selected is None:
             raise RuntimeError("ffmpeg could not extract a bright enough cover frame")
 
-        best_score, best_face_count, best, timestamp = selected
+        (
+            best_score,
+            best_composition,
+            best_face_count,
+            best_subject_count,
+            best,
+            timestamp,
+        ) = selected
         shutil.copy2(best, output_path)
+        composition_label = _COMPOSITION_LABELS.get(best_composition, "未知")
         print(
             f">>> 封面选帧: {timestamp:.2f}s "
-            f"(人脸: {best_face_count}, 主体评分: {best_score:.2f})"
+            f"(构图: {composition_label}, 人脸: {best_face_count}, "
+            f"主体: {best_subject_count}, 评分: {best_score:.2f})"
         )
     return output_path
 
@@ -918,12 +1102,35 @@ def _centering_for_face(
     return (0.5, center_y)
 
 
+def _subject_face_boxes(
+    source_width: int,
+    source_height: int,
+    faces: Sequence[Tuple[int, int, int, int]],
+):
+    """Boxes of likely subjects; every box when none reaches subject size."""
+    geometry = _face_geometry(source_width, source_height, faces)
+    if not geometry:
+        return []
+    largest = max(item[0] for item in geometry)
+    threshold = max(
+        _MIN_SUBJECT_FACE_AREA,
+        largest * _SUBJECT_AREA_RATIO_TO_LARGEST,
+    )
+    subjects = [box for box, item in zip(faces, geometry) if item[0] >= threshold]
+    return subjects or list(faces)
+
+
 def _centering_for_faces(
     source_size: Tuple[int, int],
     target_size: Tuple[int, int],
     faces: Sequence[Tuple[int, int, int, int]],
 ) -> Tuple[float, float]:
-    """Crop to keep the most visible people, not only the largest face."""
+    """Crop to keep subjects in frame, never decapitating the main face.
+
+    A window that only clips the largest subject face (a half body with no
+    head, typical for 3:4 crops of a wide two-shot) must lose to a window that
+    contains that face whole, even when the latter sits off centre.
+    """
     if not faces:
         return (0.5, 0.5)
 
@@ -932,6 +1139,10 @@ def _centering_for_faces(
     source_ratio = source_width / source_height
     target_ratio = target_width / target_height
 
+    scored = _subject_face_boxes(source_width, source_height, faces)
+    areas = [width * height for _, _, width, height in scored]
+    largest_index = max(range(len(scored)), key=lambda i: areas[i]) if scored else 0
+
     if source_ratio > target_ratio:
         crop_width = round(source_height * target_ratio)
         max_left = max(0, source_width - crop_width)
@@ -939,19 +1150,22 @@ def _centering_for_faces(
             return (0.5, 0.5)
 
         best_left = 0
-        best_key = (-1, -1.0, 0.0)
+        best_key = (-1.0, -1, -1.0, 0.0)
         for left in range(max_left + 1):
             full_count = 0
             visible_area = 0.0
-            for x, _, width, height in faces:
+            largest_visible = 0.0
+            for index, (x, _, width, height) in enumerate(scored):
                 visible_width = max(
                     0, min(x + width, left + crop_width) - max(x, left)
                 )
                 visible_area += visible_width * height
                 if visible_width == width:
                     full_count += 1
+                if index == largest_index:
+                    largest_visible = visible_width / max(1, width)
             center_bonus = -abs(left + crop_width / 2 - source_width / 2)
-            key = (full_count, visible_area, center_bonus)
+            key = (largest_visible, full_count, visible_area, center_bonus)
             if key > best_key:
                 best_key = key
                 best_left = left
@@ -963,19 +1177,22 @@ def _centering_for_faces(
         return (0.5, 0.5)
 
     best_top = 0
-    best_key = (-1, -1.0, 0.0)
+    best_key = (-1.0, -1, -1.0, 0.0)
     for top in range(max_top + 1):
         full_count = 0
         visible_area = 0.0
-        for _, y, width, height in faces:
+        largest_visible = 0.0
+        for index, (_, y, width, height) in enumerate(scored):
             visible_height = max(
                 0, min(y + height, top + crop_height) - max(y, top)
             )
             visible_area += visible_height * width
             if visible_height == height:
                 full_count += 1
+            if index == largest_index:
+                largest_visible = visible_height / max(1, height)
         center_bonus = -abs(top + crop_height / 2 - source_height / 2)
-        key = (full_count, visible_area, center_bonus)
+        key = (largest_visible, full_count, visible_area, center_bonus)
         if key > best_key:
             best_key = key
             best_top = top

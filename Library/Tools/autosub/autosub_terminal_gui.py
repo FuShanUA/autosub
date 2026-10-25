@@ -508,6 +508,7 @@ class TerminalGUI:
                 self.engine_started = True
                 self.input_frame.grid_forget()
                 self.text_area.focus_set()
+                self.root.after(50, self._send_current_size)
 
 
     def _send_stdin_bytes(self, data: bytes):
@@ -516,6 +517,21 @@ class TerminalGUI:
             if self.proc and self.proc.poll() is None:
                 self.proc.stdin.write(data)
                 self.proc.stdin.flush()
+        except Exception:
+            pass
+
+    def _send_current_size(self):
+        """Send the current terminal size once after the engine dashboard starts."""
+        try:
+            width = self.text_area.winfo_width()
+            height = self.text_area.winfo_height()
+            if width < 100 or height < 100:
+                return
+            char_width = self.custom_font.measure("A")
+            char_height = self.custom_font.metrics("linespace")
+            cols = max(40, (width - 32) // char_width)
+            rows = max(10, (height - 32) // char_height)
+            self._send_stdin_bytes(f"\x1e{rows},{cols}\n".encode("utf-8"))
         except Exception:
             pass
 
@@ -542,6 +558,14 @@ class TerminalGUI:
             return "break"
         elif event.keysym == "Down":
             self._send_stdin_bytes(b'\x1b[B')
+            return "break"
+
+        # Page Up/Down — jump a whole dashboard page
+        if event.keysym == "Prior":
+            self._send_stdin_bytes(b'\x1b[5~')
+            return "break"
+        elif event.keysym == "Next":
+            self._send_stdin_bytes(b'\x1b[6~')
             return "break"
         
         # Enter

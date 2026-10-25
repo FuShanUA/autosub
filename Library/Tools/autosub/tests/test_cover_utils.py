@@ -17,6 +17,10 @@ from PIL import Image, ImageFont
 from cover_utils import (
     _DENSE_SAMPLE_FRAME_COUNT,
     _COVER_STYLE_VERSION,
+    _COMPOSITION_CONVERSATION,
+    _COMPOSITION_NONE,
+    _COMPOSITION_PANEL,
+    _COMPOSITION_SINGLE,
     _frame_brightness,
     _frame_is_usable,
     _frame_face_rank,
@@ -27,6 +31,7 @@ from cover_utils import (
     _cover_cache_marker,
     _centering_for_face,
     _centering_for_faces,
+    _composition_metrics,
     _draw_title,
     _find_latin_font,
     _fit_font,
@@ -123,7 +128,7 @@ class TestCoverUtils(unittest.TestCase):
         self.assertGreaterEqual(_frame_brightness(output), 8.0)
         self.assertLess(_frame_brightness(output), 40.0)
 
-    def test_extract_best_frame_prefers_more_faces_over_higher_subject_score(self):
+    def test_extract_best_frame_prefers_conversation_composition_over_raw_score(self):
         no_face = os.path.join(self.temp_dir, "no-face.jpg")
         one_face = os.path.join(self.temp_dir, "one-face.jpg")
         two_faces = os.path.join(self.temp_dir, "two-faces.jpg")
@@ -132,9 +137,9 @@ class TestCoverUtils(unittest.TestCase):
         output = os.path.join(self.temp_dir, "best.jpg")
         completed = type("CompletedProcess", (), {"returncode": 0})()
         ranks = {
-            no_face: (0, 100.0),
-            one_face: (1, 80.0),
-            two_faces: (2, 80.0),
+            no_face: (_COMPOSITION_NONE, 100.0, 0, 0),
+            one_face: (_COMPOSITION_SINGLE, 80.0, 1, 1),
+            two_faces: (_COMPOSITION_CONVERSATION, 80.0, 2, 2),
         }
 
         def fake_run(args, **kwargs):
@@ -169,7 +174,10 @@ class TestCoverUtils(unittest.TestCase):
         Image.new("RGB", (1920, 1080), (72, 112, 156)).save(one_face, "JPEG")
         output = os.path.join(self.temp_dir, "best.jpg")
         completed = type("CompletedProcess", (), {"returncode": 0})()
-        ranks = {no_face: (0, 100.0), one_face: (1, 80.0)}
+        ranks = {
+            no_face: (_COMPOSITION_NONE, 100.0, 0, 0),
+            one_face: (_COMPOSITION_SINGLE, 80.0, 1, 1),
+        }
         sample_calls = []
 
         def fake_sample(video, temp_dir, ffmpeg, duration, frame_count=None):
@@ -208,7 +216,10 @@ class TestCoverUtils(unittest.TestCase):
         Image.new("RGB", (1920, 1080), (72, 112, 156)).save(two_faces, "JPEG")
         output = os.path.join(self.temp_dir, "best.jpg")
         completed = type("CompletedProcess", (), {"returncode": 0})()
-        ranks = {one_face: (1, 100.0), two_faces: (2, 80.0)}
+        ranks = {
+            one_face: (_COMPOSITION_SINGLE, 100.0, 1, 1),
+            two_faces: (_COMPOSITION_CONVERSATION, 80.0, 2, 2),
+        }
         sample_calls = []
 
         def fake_sample(video, temp_dir, ffmpeg, duration, frame_count=None):
@@ -268,7 +279,7 @@ class TestCoverUtils(unittest.TestCase):
         self.assertEqual(result, output)
         self.assertGreaterEqual(_frame_brightness(output), 8.0)
 
-    def test_more_faces_win_even_when_each_face_is_smaller(self):
+    def test_conversation_faces_beat_one_large_face(self):
         one_large_face = [(760, 240, 400, 400)]
         two_smaller_faces = [(560, 420, 180, 180), (1180, 420, 180, 180)]
 
@@ -280,6 +291,61 @@ class TestCoverUtils(unittest.TestCase):
             two_face_score = _frame_face_score(self.source)
 
         self.assertGreater(two_face_score, one_face_score)
+
+    def test_audience_crowd_loses_to_conversation_frame(self):
+        conversation_faces = [(560, 420, 180, 180), (1180, 420, 180, 180)]
+        audience_faces = [
+            (80 + 100 * (index % 10), 120 + 90 * (index // 10), 40, 40)
+            for index in range(30)
+        ]
+
+        with patch.object(cover_utils, "_face_bboxes", return_value=conversation_faces):
+            conversation_score = _frame_face_score(self.source)
+        with patch.object(cover_utils, "_face_bboxes", return_value=audience_faces):
+            audience_score = _frame_face_score(self.source)
+
+        self.assertGreater(conversation_score, audience_score)
+        self.assertLess(audience_score, 0.0)
+
+    def test_panel_group_beats_single_subject(self):
+        single_face = [(760, 240, 400, 400)]
+        panel_faces = [
+            (180, 420, 120, 120),
+            (580, 420, 120, 120),
+            (980, 420, 120, 120),
+            (1380, 420, 120, 120),
+        ]
+
+        with patch.object(cover_utils, "_face_bboxes", return_value=single_face):
+            single_score = _frame_face_score(self.source)
+        with patch.object(cover_utils, "_face_bboxes", return_value=panel_faces):
+            panel_score = _frame_face_score(self.source)
+
+        self.assertGreater(panel_score, single_score)
+
+    def test_composition_metrics_classifies_expected_frames(self):
+        conversation_faces = [(560, 420, 180, 180), (1180, 420, 180, 180)]
+        panel_faces = [
+            (180, 420, 120, 120),
+            (580, 420, 120, 120),
+            (980, 420, 120, 120),
+            (1380, 420, 120, 120),
+        ]
+        audience_faces = [
+            (80 + 100 * (index % 10), 120 + 90 * (index // 10), 40, 40)
+            for index in range(30)
+        ]
+
+        conversation = _composition_metrics(1920, 1080, conversation_faces)
+        panel = _composition_metrics(1920, 1080, panel_faces)
+        audience = _composition_metrics(1920, 1080, audience_faces)
+
+        self.assertEqual(conversation[0], _COMPOSITION_CONVERSATION)
+        self.assertEqual(conversation[2], 0)
+        self.assertEqual(panel[0], _COMPOSITION_PANEL)
+        self.assertEqual(panel[2], 0)
+        self.assertEqual(audience[0], _COMPOSITION_NONE)
+        self.assertEqual(audience[2], 30)
 
     def test_largest_face_bbox_keeps_dominant_face_for_cropping(self):
         faces = [(100, 100, 120, 120), (650, 300, 260, 260)]
@@ -589,6 +655,19 @@ class TestCoverUtils(unittest.TestCase):
                 visible_faces += 1
         self.assertGreaterEqual(visible_faces, 1)
         self.assertGreater(centering[0], 0.0)
+
+    def test_portrait_crop_never_splits_two_distant_faces(self):
+        """A 3:4 crop of a wide two-shot must keep one whole face, not a gap."""
+        faces = [(200, 300, 200, 200), (1500, 300, 200, 200)]
+        centering = _centering_for_faces((1920, 1080), (1080, 1440), faces)
+        crop_width = round(1080 * 1080 / 1440)
+        left = round(centering[0] * (1920 - crop_width))
+        contained = [
+            x
+            for x, _, width, _ in faces
+            if x >= left and x + width <= left + crop_width
+        ]
+        self.assertEqual(len(contained), 1)
 
     def test_title_card_moves_below_subject(self):
         image = Image.new("RGB", (1920, 1080), (42, 82, 126))

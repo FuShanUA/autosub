@@ -49,6 +49,29 @@ class TestAutosubWechatCommand(unittest.TestCase):
                 handle.write(b"1")
         return python, script, video
 
+    def test_wechat_profile_defaults_to_uploader_assets(self):
+        spec, module = self._load_module()
+        expected_profile = (
+            Path(__file__).resolve().parents[1]
+            / "wechat-channel-uploader"
+            / "assets"
+            / "browser_data"
+        )
+        try:
+            with patch.dict(os.environ):
+                os.environ.pop("WECHAT_BROWSER_DATA_DIR", None)
+                spec.loader.exec_module(module)
+
+            self.assertEqual(
+                Path(module.WECHAT_BROWSER_DATA_DIR), expected_profile
+            )
+            self.assertEqual(
+                module.os.environ["WECHAT_BROWSER_DATA_DIR"],
+                str(expected_profile),
+            )
+        finally:
+            sys.modules.pop("autosub_wechat_command_under_test", None)
+
     def test_launcher_upload_command_is_headless(self):
         spec, module = self._load_module()
         try:
@@ -192,6 +215,17 @@ class TestWechatUploadTitle(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.temp_dir)
         sys.modules.pop("wechat_upload_under_test", None)
+
+    def _cover_page(self, nodes_attached=True):
+        class FakeLocator:
+            async def count(self):
+                return 1 if nodes_attached else 0
+
+        class FakePage:
+            def locator(self, _selector):
+                return FakeLocator()
+
+        return FakePage()
 
     def test_find_ffprobe_uses_homebrew_fallback_on_macos(self):
         with patch.object(self.module.shutil, "which", return_value=None), \
@@ -528,7 +562,9 @@ class TestWechatUploadTitle(unittest.TestCase):
              patch.object(self.module, "_cover_editor_text", fake_cover_editor_text), \
              patch.object(self.module, "asyncio", fake_asyncio):
             ready = asyncio.run(
-                self.module._wait_cover_editor_ready(object(), timeout=5)
+                self.module._wait_cover_editor_ready(
+                    self._cover_page(), timeout=5
+                )
             )
 
         self.assertTrue(ready)
@@ -556,11 +592,35 @@ class TestWechatUploadTitle(unittest.TestCase):
              patch.object(self.module, "_cover_editor_text", fake_cover_editor_text), \
              patch.object(self.module, "asyncio", fake_asyncio):
             ready = asyncio.run(
-                self.module._wait_cover_editor_ready(object(), timeout=5)
+                self.module._wait_cover_editor_ready(
+                    self._cover_page(), timeout=5
+                )
             )
 
         self.assertTrue(ready)
         self.assertGreaterEqual(calls["count"], 5)
+
+    def test_wait_cover_editor_ready_requires_real_cover_nodes(self):
+        async def fake_wujie_text(_page):
+            return ""
+
+        async def fake_cover_editor_text(_page):
+            return ""
+
+        async def fake_sleep(_delay):
+            return None
+
+        fake_asyncio = SimpleNamespace(sleep=fake_sleep)
+        with patch.object(self.module, "_wujie_text", fake_wujie_text), \
+             patch.object(self.module, "_cover_editor_text", fake_cover_editor_text), \
+             patch.object(self.module, "asyncio", fake_asyncio):
+            ready = asyncio.run(
+                self.module._wait_cover_editor_ready(
+                    self._cover_page(nodes_attached=False), timeout=1
+                )
+            )
+
+        self.assertFalse(ready)
 
     def test_cover_preview_matches_expected_card_ratio(self):
         self.assertTrue(
@@ -913,7 +973,70 @@ class TestWechatUploadTitle(unittest.TestCase):
 
         self.assertEqual(
             calls,
-            [("share", "抽象产品"), ("portrait", "抽象产品")],
+            [("portrait", "抽象产品"), ("share", "抽象产品")],
+        )
+        self.assertEqual(set(previews), {"portrait", "share"})
+
+    def test_sequential_cover_flow_saves_and_reopens_between_cards(self):
+        calls = []
+        portrait_preview = {
+            "src": "https://example.test/portrait.jpg",
+            "naturalWidth": 810,
+            "naturalHeight": 1080,
+            "local_path": "portrait.jpg",
+        }
+        share_preview = {
+            "src": "https://example.test/share.jpg",
+            "naturalWidth": 1080,
+            "naturalHeight": 810,
+            "local_path": "share.jpg",
+        }
+
+        async def fake_upload(page, cover, orientation, title):
+            calls.append(("upload", orientation, title))
+            return portrait_preview if orientation == "portrait" else share_preview
+
+        async def fake_click(page, is_public):
+            calls.append(("save", is_public))
+            return "存草稿"
+
+        async def fake_verify(
+            page,
+            title,
+            desc,
+            expected_covers=None,
+            known_drafts=None,
+            timeout=40,
+        ):
+            calls.append(("verify", expected_covers, known_drafts))
+            return True
+
+        with patch.object(self.module, "_upload_wechat_cover_card", fake_upload), \
+             patch.object(self.module, "_click_final_action", fake_click), \
+             patch.object(self.module, "_verify_draft_saved", fake_verify), \
+             patch.object(self.module.asyncio, "sleep", _noop_sleep):
+            previews = asyncio.run(
+                self.module._set_wechat_covers_sequentially(
+                    object(),
+                    "portrait.jpg",
+                    "share.jpg",
+                    "抽象产品",
+                    "FDE的核心职能：抽象产品",
+                    "本次描述",
+                    {"旧草稿"},
+                )
+            )
+
+        self.assertEqual(
+            calls,
+            [
+                ("upload", "portrait", "抽象产品"),
+                ("save", False),
+                ("verify", None, {"旧草稿"}),
+                ("upload", "share", "抽象产品"),
+                ("save", False),
+                ("verify", previews, {"旧草稿"}),
+            ],
         )
         self.assertEqual(set(previews), {"portrait", "share"})
 
@@ -922,7 +1045,7 @@ class TestWechatUploadTitle(unittest.TestCase):
 
         async def fake_upload(page, cover, orientation, title):
             calls.append(orientation)
-            if orientation == "share" and len(calls) == 1:
+            if orientation == "portrait" and len(calls) == 1:
                 return False
             return {
                 "src": f"https://example.test/{orientation}.jpg",
@@ -941,8 +1064,378 @@ class TestWechatUploadTitle(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(calls, ["share", "share", "portrait"])
+        self.assertEqual(calls, ["portrait", "portrait", "share"])
         self.assertEqual(set(previews), {"portrait", "share"})
+
+    def test_active_cover_file_input_selects_visible_dialog(self):
+        class FakeLocator:
+            def __init__(self, index):
+                self.index = index
+
+            async def count(self):
+                return 2
+
+            def nth(self, index):
+                return f"input-{index}"
+
+        class FakePage:
+            def __init__(self):
+                self.selectors = []
+
+            async def evaluate(self, _script, title):
+                self.title = title
+                return 1
+
+            def locator(self, selector):
+                self.selectors.append(selector)
+                return FakeLocator(1)
+
+        page = FakePage()
+        with patch.object(self.module.asyncio, "sleep", _noop_sleep):
+            share_input = asyncio.run(
+                self.module._active_cover_file_input(page, "share", timeout=1)
+            )
+
+        self.assertEqual(page.title, "编辑分享卡片")
+        self.assertEqual(share_input, "input-1")
+
+    def test_cover_dialog_confirm_waits_out_disabled_button(self):
+        states = [
+            {"title": "编辑个人主页卡片", "mask": False, "clicked": False,
+             "reason": "disabled",
+             "buttons": [{"text": "确认", "disabled": True, "visible": True}]},
+            {"title": "编辑个人主页卡片", "mask": True, "clicked": False,
+             "reason": "masked",
+             "buttons": [{"text": "确认", "disabled": False, "visible": True}]},
+            {"title": "编辑个人主页卡片", "mask": False, "clicked": True,
+             "reason": "clicked",
+             "buttons": [{"text": "确认", "disabled": False, "visible": True}]},
+        ]
+
+        class FakePage:
+            def __init__(self):
+                self.calls = []
+
+            async def evaluate(self, _script, label):
+                self.calls.append(label)
+                return states[min(len(self.calls) - 1, len(states) - 1)]
+
+        page = FakePage()
+        with patch.object(self.module.asyncio, "sleep", _noop_sleep):
+            confirmed = asyncio.run(
+                self.module._click_cover_dialog_confirm(page, "portrait", timeout=5000)
+            )
+
+        self.assertTrue(confirmed)
+        self.assertEqual(page.calls, ["确认", "确认", "确认"])
+
+    def test_cover_dialog_confirm_falls_back_to_crop_dialog(self):
+        responses = {
+            "确认": {"title": "裁剪封面图", "mask": False, "clicked": False,
+                     "reason": "not-found", "buttons": []},
+            "确定": {"title": "裁剪封面图", "mask": False, "clicked": True,
+                     "reason": "clicked",
+                     "buttons": [{"text": "确定", "disabled": False, "visible": True}]},
+        }
+
+        class FakePage:
+            def __init__(self):
+                self.calls = []
+
+            async def evaluate(self, _script, label):
+                self.calls.append(label)
+                return responses[label]
+
+        page = FakePage()
+        with patch.object(self.module.asyncio, "sleep", _noop_sleep):
+            confirmed = asyncio.run(
+                self.module._click_cover_dialog_confirm(page, "portrait", timeout=5000)
+            )
+
+        self.assertTrue(confirmed)
+        self.assertEqual(page.calls, ["确认", "确定"])
+
+    def test_cover_dialog_confirm_timeout_saves_debug(self):
+        class FakePage:
+            async def evaluate(self, _script, _label):
+                return {"title": "", "mask": False, "clicked": False,
+                        "reason": "no-cover-dialog", "buttons": []}
+
+        saved = []
+
+        async def fake_debug(_page, tag):
+            saved.append(tag)
+
+        with patch.object(self.module.asyncio, "sleep", _noop_sleep), patch.object(
+            self.module, "_save_cover_dialog_debug", fake_debug
+        ):
+            confirmed = asyncio.run(
+                self.module._click_cover_dialog_confirm(FakePage(), "portrait", timeout=1)
+            )
+
+        self.assertFalse(confirmed)
+        self.assertEqual(saved, ["confirm_timeout"])
+
+    def test_cover_dialog_confirm_script_scopes_to_cover_dialog(self):
+        script = self.module._COVER_DIALOG_CONFIRM_JS
+        self.assertIn(".edit-cover-dialog-container .weui-desktop-dialog__wrp", script)
+        self.assertIn("setting-cover-mask", script)
+
+    def _run_repair(self, nodes_ready_at_verify, entries=None, cached=None,
+                    draft_time="09:03"):
+        """Drive repair_existing_draft with a stubbed browser and draft list."""
+        module = self.module
+        opened = []
+        temp_dir = tempfile.mkdtemp()
+        video = os.path.join(temp_dir, "video_hardsub.mp4")
+        with open(video, "wb") as handle:
+            handle.write(b"1")
+        if entries is None:
+            entries = [{"index": 1, "title": "draft desc", "time": "2026年10月25日 09:03"}]
+        metadata = {
+            "wechat_title": "draft title",
+            "description": "draft desc",
+            "cover_title": "cover title",
+        }
+        metadata.update(cached or {})
+
+        class FakeLock:
+            async def release(self):
+                return None
+
+        class FakeContext:
+            async def close(self):
+                return None
+
+        class FakePlaywright:
+            async def __aenter__(self):
+                return SimpleNamespace()
+
+            async def __aexit__(self, *_args):
+                return False
+
+        async def fake_ensure_browser(_p, headless=False):
+            return FakeContext(), SimpleNamespace(url="https://channels.weixin.qq.com/platform/post/create"), FakeLock()
+
+        async def fake_true(*_args, **_kwargs):
+            return True
+
+        async def fake_entries(_page):
+            return list(entries)
+
+        async def fake_open_entry(_page, index):
+            opened.append(index)
+            return True
+
+        async def fake_cover_card(_page, cover_path, orientation, _title):
+            return {"naturalWidth": 810, "naturalHeight": 1080, "local_path": cover_path}
+
+        async def fake_final_action(_page, _publish):
+            return "存草稿"
+
+        async def fake_nodes_ready(_page):
+            # Only the post-loop verification probe reaches this stub.
+            return nodes_ready_at_verify
+
+        patches = [
+            patch.object(module, "_load_cached_upload_metadata", lambda _p: dict(metadata)),
+            patch.object(module, "_generate_wechat_covers",
+                         lambda *_a, **_k: ("portrait.jpg", "share.jpg")),
+            patch.object(module, "_ensure_browser", fake_ensure_browser),
+            patch.object(module, "_goto_wechat_page", fake_true),
+            patch.object(module, "_ensure_logged_in", fake_true),
+            patch.object(module, "_open_draft_list", fake_true),
+            patch.object(module, "_draft_list_entries", fake_entries),
+            patch.object(module, "_open_draft_entry", fake_open_entry),
+            patch.object(module, "_wait_cover_editor_ready", fake_true),
+            patch.object(module, "_upload_wechat_cover_card", fake_cover_card),
+            patch.object(module, "_click_final_action", fake_final_action),
+            patch.object(module, "_cover_editor_nodes_ready", fake_nodes_ready),
+            patch.object(module, "_verify_draft_form_fields", fake_true),
+            patch.object(module, "_verify_wechat_cover_previews", fake_true),
+            patch.object(module.asyncio, "sleep", _noop_sleep),
+            patch("playwright.async_api.async_playwright", lambda: FakePlaywright()),
+        ]
+        for item in patches:
+            item.start()
+        try:
+            result = asyncio.run(module.repair_existing_draft(
+                video, draft_time=draft_time, headless=True
+            ))
+        finally:
+            for item in patches:
+                item.stop()
+        marker = os.path.join(temp_dir, ".wechat_uploaded")
+        wrote_marker = os.path.isfile(marker)
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        return result, opened, wrote_marker
+
+    def test_repair_verifies_open_draft_without_reopening(self):
+        result, opened, wrote_marker = self._run_repair(nodes_ready_at_verify=True)
+
+        self.assertTrue(result)
+        self.assertTrue(wrote_marker)
+        # Initial open plus one reopen per cover; verification stays in place.
+        self.assertEqual(opened, [1, 1, 1])
+
+    def test_repair_reopens_draft_when_editor_is_gone(self):
+        result, opened, wrote_marker = self._run_repair(nodes_ready_at_verify=False)
+
+        self.assertTrue(result)
+        self.assertTrue(wrote_marker)
+        self.assertEqual(opened, [1, 1, 1, 1])
+
+    def test_repair_uses_recorded_draft_time_from_metadata(self):
+        """A recorded draft reference disambiguates duplicate drafts."""
+        entries = [
+            {"index": 0, "title": "draft desc", "time": "2026年10月25日 09:17"},
+            {"index": 6, "title": "draft desc", "time": "2026年10月24日 22:02"},
+        ]
+        result, opened, wrote_marker = self._run_repair(
+            nodes_ready_at_verify=True,
+            entries=entries,
+            cached={"wechat_draft_time": "09:17"},
+            draft_time=None,
+        )
+
+        self.assertTrue(result)
+        self.assertTrue(wrote_marker)
+        self.assertEqual(opened[0], 0)
+
+    def test_unverified_share_cover_still_saves_draft_and_succeeds(self):
+        """A saved draft must not be reported as a failed upload."""
+        module = self.module
+        saves = []
+
+        async def fake_cover_card(_page, cover_path, orientation, _title):
+            if orientation == "portrait":
+                return {"local_path": cover_path}
+            return None
+
+        async def fake_final_action(_page, _publish):
+            saves.append("save")
+            return "存草稿"
+
+        async def fake_verify(*_args, **_kwargs):
+            return True
+
+        async def fake_record(*_args, **_kwargs):
+            return None
+
+        with patch.object(module, "_upload_wechat_cover_card", fake_cover_card), \
+                patch.object(module, "_click_final_action", fake_final_action), \
+                patch.object(module, "_verify_draft_saved", fake_verify), \
+                patch.object(module, "_record_draft_reference", fake_record), \
+                patch.object(module, "_close_cover_dialog", fake_verify), \
+                patch.object(module.asyncio, "sleep", _noop_sleep):
+            previews = asyncio.run(module._set_wechat_covers_sequentially(
+                "page", "portrait.jpg", "share.jpg", "headline",
+                "title", "desc", set(), video_path="video.mp4",
+            ))
+
+        self.assertIn("portrait", previews)
+        self.assertTrue(previews["share"].get("unverified"))
+        # One save for the portrait step, one to protect the upload after the
+        # share cover could not be pixel-verified.
+        self.assertEqual(len(saves), 2)
+
+    def test_draft_exists_for_matches_description(self):
+        module = self.module
+
+        async def fake_open_list(_page):
+            return True
+
+        async def fake_entries(_page):
+            return [{"index": 0, "title": "mine", "time": "12:59"}]
+
+        with patch.object(module, "_open_draft_list", fake_open_list), patch.object(
+            module, "_draft_list_entries", fake_entries
+        ):
+            self.assertTrue(asyncio.run(module._draft_exists_for("page", "mine")))
+            self.assertFalse(asyncio.run(module._draft_exists_for("page", "other")))
+
+    def test_record_draft_reference_refuses_duplicates(self):
+        module = self.module
+
+        async def fake_open_list(_page):
+            return True
+
+        async def fake_entries(_page):
+            return [
+                {"index": 0, "title": "same", "time": "09:17"},
+                {"index": 1, "title": "same", "time": "22:02"},
+            ]
+
+        with patch.object(module, "_open_draft_list", fake_open_list), patch.object(
+            module, "_draft_list_entries", fake_entries
+        ):
+            recorded = asyncio.run(module._record_draft_reference("/tmp/x.mp4", "page", "same"))
+
+        self.assertIsNone(recorded)
+
+    def test_record_draft_reference_writes_metadata(self):
+        module = self.module
+        temp_dir = tempfile.mkdtemp()
+        video = os.path.join(temp_dir, "video_hardsub.mp4")
+        with open(video, "wb") as handle:
+            handle.write(b"1")
+
+        async def fake_open_list(_page):
+            return True
+
+        async def fake_entries(_page):
+            return [{"index": 3, "title": "same", "time": "2026年10月25日 09:17"}]
+
+        reopened = []
+
+        async def fake_open_entry(_page, index):
+            reopened.append(index)
+            return True
+
+        async def fake_editor_ready(_page, timeout=1800):
+            return True
+
+        with patch.object(module, "_open_draft_list", fake_open_list), patch.object(
+            module, "_draft_list_entries", fake_entries
+        ), patch.object(module, "_open_draft_entry", fake_open_entry), patch.object(
+            module, "_wait_cover_editor_ready", fake_editor_ready
+        ):
+            recorded = asyncio.run(module._record_draft_reference(video, "page", "same"))
+
+        try:
+            self.assertEqual(recorded, "2026年10月25日 09:17")
+            # The caller keeps working on the edit form, not the draft list.
+            self.assertEqual(reopened, [3])
+            with open(os.path.join(temp_dir, "upload_metadata.json"), encoding="utf-8") as handle:
+                stored = json.load(handle)
+            self.assertEqual(stored["wechat_draft_time"], "2026年10月25日 09:17")
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_repair_draft_selection_requires_unique_match(self):
+        entries = [
+            {"index": 0, "title": "same description", "time": "23:36"},
+            {"index": 6, "title": "same description", "time": "14:10"},
+        ]
+
+        self.assertIsNone(
+            self.module._select_repair_draft_entry(entries, "same description")
+        )
+        self.assertEqual(
+            self.module._select_repair_draft_entry(
+                entries, "same description", draft_time="23:36"
+            )["index"],
+            0,
+        )
+
+    def test_repair_draft_selection_rejects_wrong_time(self):
+        entries = [{"index": 0, "title": "same description", "time": "23:36"}]
+
+        self.assertIsNone(
+            self.module._select_repair_draft_entry(
+                entries, "same description", draft_time="14:10"
+            )
+        )
 
     def test_draft_cover_readback_failure_is_failure(self):
         async def fake_open_draft_list(page):
@@ -976,6 +1469,49 @@ class TestWechatUploadTitle(unittest.TestCase):
                     "FDE的核心职能：抽象产品",
                     "本次描述",
                     expected_covers={"portrait": {}, "share": {}},
+                )
+            )
+
+        self.assertFalse(ok)
+
+    def test_draft_cover_preview_missing_is_warning_not_failure(self):
+        results = {"portrait": None, "share": True}
+
+        async def fake_verify(page, expected, orientation):
+            self.assertEqual(expected, {"local_path": f"/tmp/{orientation}.jpg"})
+            return results[orientation]
+
+        with patch.object(
+            self.module, "_verify_cover_preview_matches", fake_verify
+        ):
+            ok = asyncio.run(
+                self.module._verify_wechat_cover_previews(
+                    object(),
+                    {
+                        "portrait": {"local_path": "/tmp/portrait.jpg"},
+                        "share": {"local_path": "/tmp/share.jpg"},
+                    },
+                )
+            )
+
+        self.assertTrue(ok)
+
+    def test_draft_cover_preview_mismatch_is_failure(self):
+        results = {"portrait": False, "share": True}
+
+        async def fake_verify(page, expected, orientation):
+            return results[orientation]
+
+        with patch.object(
+            self.module, "_verify_cover_preview_matches", fake_verify
+        ):
+            ok = asyncio.run(
+                self.module._verify_wechat_cover_previews(
+                    object(),
+                    {
+                        "portrait": {"local_path": "/tmp/portrait.jpg"},
+                        "share": {"local_path": "/tmp/share.jpg"},
+                    },
                 )
             )
 
