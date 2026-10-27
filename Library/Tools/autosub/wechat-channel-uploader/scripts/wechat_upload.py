@@ -550,7 +550,11 @@ async def _ensure_browser(playwright, headless=False):
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-proxy-server",
-            ],
+            ] + (
+                [f"--host-resolver-rules={rules}"]
+                if (rules := os.environ.get("WECHAT_HOST_RESOLVER_RULES"))
+                else []
+            ),
         )
         # 拦截可能的自动化检测
         await context.add_init_script("""
@@ -1654,7 +1658,7 @@ async def _click_uploaded_cover_thumb(page):
         return False
 
 
-async def _cover_dialog_canvas_matches(page, cover_path, threshold=45.0):
+async def _cover_dialog_canvas_matches(page, cover_path, threshold=90.0):
     """Whether the crop canvas already shows our uploaded cover.
 
     WeChat keeps cropping the video frame (or nothing) until the uploaded image
@@ -2647,6 +2651,15 @@ async def upload_one_video(video_path, title, desc=None, tags=None, is_public=Fa
                             f"{response.status} {response.url[:220]}"
                         )
                     page.on("response", _log_wechat_response)
+
+                    def _log_wechat_request_failed(request):
+                        failure = request.failure
+                        print(
+                            f">>> ⚠️ 微信网络请求失败: "
+                            f"{request.method} {request.url[:220]} {failure or 'unknown'}"
+                        )
+
+                    page.on("requestfailed", _log_wechat_request_failed)
 
                     # 1. 直接打开发布页。首页按钮在 Wujie 微前端中加载时机不稳定，
                     # 直达 /post/create 后顶层文档即可看到 file input。
