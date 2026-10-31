@@ -42,7 +42,7 @@ _PLATFORM_ALIASES = {
     "wx": "wechat",
 }
 
-_COVER_STYLE_VERSION = "kaiti-alliance-hard-shadow-lower-card-v13"
+_COVER_STYLE_VERSION = "kaiti-alliance-hard-shadow-lower-card-v14"
 _FONT_FALLBACKS = (
     os.path.join(os.path.dirname(__file__), "fonts", "LXGWWenKai-Medium.ttf"),
     "/Users/shanfu/Library/Fonts/LXGWWenKai-Medium.ttf",
@@ -64,6 +64,9 @@ _FONT_FALLBACKS = (
 _COVER_BACKGROUND = (216, 8, 0)
 _COVER_TITLE = (255, 255, 255)
 _COVER_SHADOW = (255, 255, 255)
+_COVER_DATE_BACKGROUND = (255, 212, 0)
+_COVER_DATE_TEXT = (17, 17, 17)
+_COVER_DATE_BORDER = (255, 255, 255)
 _TITLE_CENTER_Y_RATIO = 0.62
 _MIN_FRAME_BRIGHTNESS = 40.0
 _MIN_FALLBACK_FRAME_BRIGHTNESS = 8.0
@@ -163,6 +166,98 @@ def find_existing_frame(video_path: str) -> Optional[str]:
         except Exception:
             continue
     return None
+
+
+def _normalize_publish_date(value) -> str:
+    """Normalize common yt-dlp date fields to YYYY-MM-DD."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if re.fullmatch(r"\d{8}", text):
+        return f"{text[:4]}-{text[4:6]}-{text[6:8]}"
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        return text
+    if re.fullmatch(r"\d{10}", text):
+        try:
+            from datetime import datetime
+
+            return datetime.fromtimestamp(int(text)).date().isoformat()
+        except Exception:
+            return ""
+    try:
+        from datetime import datetime
+
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return parsed.date().isoformat()
+    except Exception:
+        return ""
+
+
+def _publish_date_from_info(data: dict) -> str:
+    if not isinstance(data, dict):
+        return ""
+    for key in (
+        "publish_date",
+        "upload_date",
+        "release_date",
+        "published_date",
+    ):
+        normalized = _normalize_publish_date(data.get(key))
+        if normalized:
+            return normalized
+    for key in ("timestamp", "release_timestamp"):
+        value = data.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            normalized = _normalize_publish_date(int(value))
+            if normalized:
+                return normalized
+    return ""
+
+
+def _read_publish_date(video_path: str) -> str:
+    """Read the publish date saved beside the source or hardsub video."""
+    base = os.path.splitext(os.path.abspath(video_path))[0]
+    original_base = base[:-8] if base.endswith("_hardsub") else base
+    candidates = []
+    for current_base in (base, original_base):
+        candidates.extend(
+            (
+                current_base + ".video_metadata.json",
+                current_base + ".info.json",
+            )
+        )
+    for path in candidates:
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            if isinstance(data, dict):
+                normalized = _normalize_publish_date(data.get("publish_date"))
+                if normalized:
+                    return normalized
+                normalized = _publish_date_from_info(data)
+                if normalized:
+                    return normalized
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+    # Directory names can contain literal [video_id] brackets, which glob()
+    # interprets as character classes.
+    info_files = [
+        os.path.join(os.path.dirname(video_path) or ".", name)
+        for name in os.listdir(os.path.dirname(video_path) or ".")
+        if name.endswith(".info.json")
+    ]
+    if len(info_files) == 1:
+        try:
+            with open(info_files[0], "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            normalized = _publish_date_from_info(data)
+            if normalized:
+                return normalized
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+    return ""
 
 
 def _find_ffmpeg() -> Optional[str]:
@@ -1071,6 +1166,67 @@ def _draw_title(
         y += line_height + line_gap
 
 
+def _draw_publish_date_badge(
+    image: Image.Image,
+    publish_date: str,
+    orientation: str,
+) -> None:
+    """Draw a compact, high-contrast source publish date in the top-right."""
+    normalized = _normalize_publish_date(publish_date)
+    if not normalized:
+        return
+
+    width, height = image.size
+    font_size = 42 if orientation in ("portrait", "wide") else 38
+    fonts = _load_title_fonts(font_size)
+    text = _publish_date_badge_text(normalized)
+    text_width, ascent, descent = _line_metrics(text, fonts)
+    text_height = ascent + descent
+    horizontal_padding = max(12, int(font_size * 0.42))
+    vertical_padding = max(7, int(font_size * 0.28))
+    box_width = text_width + horizontal_padding * 2
+    box_height = text_height + vertical_padding * 2
+    margin = max(24, int(width * 0.028))
+    x1 = width - margin
+    y0 = margin
+    x0 = x1 - box_width
+    y1 = y0 + box_height
+    radius = min(10, box_height // 3)
+    border_width = max(2, font_size // 14)
+
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle(
+        (x0, y0, x1, y1),
+        radius=radius,
+        fill=_COVER_DATE_BACKGROUND,
+        outline=_COVER_DATE_BORDER,
+        width=border_width,
+    )
+    baseline = y0 + vertical_padding + ascent
+    x = x0 + horizontal_padding
+    for segment in _script_segments(text):
+        font = _font_for_segment(segment, fonts)
+        segment_ascent, _ = font.getmetrics()
+        draw.text(
+            (x, baseline - segment_ascent),
+            segment,
+            font=font,
+            fill=_COVER_DATE_TEXT,
+        )
+        x += font.getlength(segment)
+
+
+def _publish_date_badge_text(publish_date: str) -> str:
+    """Return the user-facing source publish-date label."""
+    normalized = _normalize_publish_date(publish_date)
+    if not normalized:
+        return ""
+    return (
+        f"原视频发布时间：{normalized[:4]}年-"
+        f"{normalized[5:7]}月-{normalized[8:10]}日"
+    )
+
+
 def _centering_for_face(
     source_size: Tuple[int, int],
     target_size: Tuple[int, int],
@@ -1237,7 +1393,11 @@ def _load_source_frame(video_path: str, source_path: Optional[str]) -> Image.Ima
             temporary_dir.cleanup()
 
 
-def _cover_cache_marker(title: str, orientation: str) -> bytes:
+def _cover_cache_marker(
+    title: str,
+    orientation: str,
+    publish_date: str = "",
+) -> bytes:
     title_digest = hashlib.sha256(str(title).encode("utf-8")).hexdigest()
     metadata = {
         "app": "autosub",
@@ -1247,6 +1407,9 @@ def _cover_cache_marker(title: str, orientation: str) -> bytes:
         "title": str(title),
         "title_sha256": title_digest,
     }
+    normalized_date = _normalize_publish_date(publish_date)
+    if normalized_date:
+        metadata["publish_date"] = normalized_date
     return json.dumps(
         metadata,
         ensure_ascii=False,
@@ -1301,7 +1464,13 @@ def read_cover_metadata(path: str) -> Optional[dict]:
     return None
 
 
-def _cover_style_matches(path: str, title: str, orientation: str) -> bool:
+def _cover_style_matches(
+    path: str,
+    title: str,
+    orientation: str,
+    publish_date: str = "",
+) -> bool:
+    requested_date = _normalize_publish_date(publish_date)
     try:
         with Image.open(path) as image:
             comment = image.info.get("comment", b"")
@@ -1312,6 +1481,10 @@ def _cover_style_matches(path: str, title: str, orientation: str) -> bool:
                     metadata.get("style_version") == _COVER_STYLE_VERSION
                     and metadata.get("orientation") == orientation
                     and metadata.get("title_sha256") == title_digest
+                    and (
+                        not requested_date
+                        or metadata.get("publish_date", "") == requested_date
+                    )
                 )
             if isinstance(comment, str):
                 comment = comment.encode("utf-8")
@@ -1332,14 +1505,23 @@ def generate_cover(
     orientation: str = "landscape",
     source_path: Optional[str] = None,
     overwrite: bool = False,
+    publish_date: Optional[str] = None,
 ) -> str:
     """Generate a video-frame cover with a hard-shadowed red title card."""
     orientation_key, size = _normalize_orientation(orientation)
+    normalized_date = _normalize_publish_date(publish_date)
+    if not normalized_date:
+        normalized_date = _read_publish_date(video_path)
     output_path = os.path.abspath(output_path)
     if (
         os.path.isfile(output_path)
         and not overwrite
-        and _cover_style_matches(output_path, title, orientation_key)
+        and _cover_style_matches(
+            output_path,
+            title,
+            orientation_key,
+            normalized_date,
+        )
     ):
         print(f">>> 复用已有封面: {os.path.basename(output_path)}")
         return output_path
@@ -1360,13 +1542,14 @@ def generate_cover(
         orientation_key,
         face_bbox=_largest_face_bbox(cover),
     )
+    _draw_publish_date_badge(cover, normalized_date, orientation_key)
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     cover.save(
         output_path,
         "JPEG",
         quality=92,
         optimize=True,
-        comment=_cover_cache_marker(title, orientation_key),
+        comment=_cover_cache_marker(title, orientation_key, normalized_date),
     )
     print(f">>> 已生成封面: {os.path.basename(output_path)} ({size[0]}x{size[1]})")
     return output_path
@@ -1378,6 +1561,7 @@ def generate_platform_cover(
     title: str,
     source_path: Optional[str] = None,
     overwrite: bool = False,
+    publish_date: Optional[str] = None,
 ) -> str:
     """Generate the default cover shape for a supported platform."""
     key = _PLATFORM_ALIASES.get(str(platform).strip().lower())
@@ -1391,6 +1575,7 @@ def generate_platform_cover(
         orientation=orientation,
         source_path=source_path,
         overwrite=overwrite,
+        publish_date=publish_date,
     )
 
 
@@ -1400,6 +1585,7 @@ def generate_platform_covers(
     title: str,
     source_path: Optional[str] = None,
     overwrite: bool = False,
+    publish_date: Optional[str] = None,
 ) -> Tuple[str, ...]:
     """Generate every cover shape used by a platform from one source frame."""
     key = _PLATFORM_ALIASES.get(str(platform).strip().lower())
@@ -1427,6 +1613,7 @@ def generate_platform_covers(
                 orientation=orientation,
                 source_path=source,
                 overwrite=overwrite,
+                publish_date=publish_date,
             )
             for orientation in orientations
         )

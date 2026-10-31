@@ -1,4 +1,5 @@
 import os
+import json
 import shutil
 import tempfile
 import unittest
@@ -17,6 +18,8 @@ from PIL import Image, ImageFont
 from cover_utils import (
     _DENSE_SAMPLE_FRAME_COUNT,
     _COVER_STYLE_VERSION,
+    _COVER_DATE_BACKGROUND,
+    _COVER_DATE_TEXT,
     _COMPOSITION_CONVERSATION,
     _COMPOSITION_NONE,
     _COMPOSITION_PANEL,
@@ -37,8 +40,11 @@ from cover_utils import (
     _fit_font,
     _frame_face_score,
     _largest_face_bbox,
+    _read_publish_date,
+    _publish_date_badge_text,
     _load_title_fonts,
     _legacy_cover_cache_marker,
+    cover_style_matches,
     read_cover_metadata,
     _wrap_title,
 )
@@ -466,6 +472,127 @@ class TestCoverUtils(unittest.TestCase):
             "title_sha256": metadata["title_sha256"],
         })
         self.assertRegex(metadata["title_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_publish_date_is_read_from_info_json_and_drawn_top_right(self):
+        video = os.path.join(self.temp_dir, "source video.mp4")
+        info_path = os.path.join(self.temp_dir, "source video.info.json")
+        output = os.path.join(self.temp_dir, "source video.cover.wechat.jpg")
+        with open(info_path, "w", encoding="utf-8") as handle:
+            json.dump({"upload_date": "20261029"}, handle)
+
+        result = generate_cover(
+            video,
+            output,
+            "Palantir FDE",
+            orientation="portrait",
+            source_path=self.source,
+        )
+
+        self.assertEqual(result, output)
+        metadata = read_cover_metadata(output)
+        self.assertEqual(metadata["publish_date"], "2026-10-29")
+        self.assertEqual(
+            _publish_date_badge_text(metadata["publish_date"]),
+            "原视频发布时间：2026年-10月-29日",
+        )
+        with Image.open(output) as image:
+            top_right = image.crop((image.width - 900, 0, image.width, 180))
+            colors = set(top_right.getdata())
+            yellow_pixels = [
+                (x, y)
+                for y in range(200)
+                for x in range(image.width - 900, image.width)
+                if abs(image.getpixel((x, y))[0] - _COVER_DATE_BACKGROUND[0]) < 20
+                and abs(image.getpixel((x, y))[1] - _COVER_DATE_BACKGROUND[1]) < 20
+                and abs(image.getpixel((x, y))[2] - _COVER_DATE_BACKGROUND[2]) < 20
+            ]
+            yellow_bbox = (
+                min(x for x, _ in yellow_pixels),
+                min(y for _, y in yellow_pixels),
+                max(x for x, _ in yellow_pixels),
+                max(y for _, y in yellow_pixels),
+            )
+            self.assertTrue(
+                any(
+                    abs(red - _COVER_DATE_BACKGROUND[0]) < 20
+                    and abs(green - _COVER_DATE_BACKGROUND[1]) < 20
+                    and abs(blue - _COVER_DATE_BACKGROUND[2]) < 20
+                    for red, green, blue in colors
+                )
+            )
+            self.assertGreaterEqual(yellow_bbox[1], 20)
+            self.assertLess(yellow_bbox[3], 180)
+            self.assertGreater(yellow_bbox[0], 0)
+            self.assertLess(yellow_bbox[2], image.width)
+            title_red_rows = [
+                y
+                for y in range(700, image.height)
+                for x in range(0, image.width, 4)
+                if image.getpixel((x, y))[0] > 180
+                and image.getpixel((x, y))[1] < 50
+                and image.getpixel((x, y))[2] < 50
+            ]
+            self.assertLess(yellow_bbox[3], min(title_red_rows))
+            self.assertTrue(
+                any(
+                    red < 50 and green < 50 and blue < 50
+                    for red, green, blue in colors
+                )
+            )
+
+    def test_cover_regenerates_when_publish_date_changes(self):
+        output = os.path.join(self.temp_dir, "video.cover.wechat.jpg")
+        generate_cover(
+            "/tmp/does-not-exist.mp4",
+            output,
+            "Same title",
+            orientation="portrait",
+            source_path=self.source,
+            publish_date="2026-10-28",
+        )
+        os.utime(output, (1000000000, 1000000000))
+
+        result = generate_cover(
+            "/tmp/does-not-exist.mp4",
+            output,
+            "Same title",
+            orientation="portrait",
+            source_path=self.source,
+            publish_date="2026-10-29",
+        )
+
+        self.assertEqual(result, output)
+        self.assertGreater(os.stat(output).st_mtime_ns, 1000000000000000000)
+        self.assertEqual(
+            read_cover_metadata(output)["publish_date"],
+            "2026-10-29",
+        )
+
+    def test_uploader_cache_check_accepts_date_badge_without_explicit_date(self):
+        output = os.path.join(self.temp_dir, "video.cover.wechat.jpg")
+        generate_cover(
+            "/tmp/does-not-exist.mp4",
+            output,
+            "Same title",
+            orientation="portrait",
+            source_path=self.source,
+            publish_date="2026-10-29",
+        )
+
+        self.assertTrue(cover_style_matches(output, "Same title", "portrait"))
+
+    def test_read_publish_date_fallback_handles_literal_brackets(self):
+        bracket_dir = os.path.join(self.temp_dir, "project [iGTXWPy3CY4]")
+        os.makedirs(bracket_dir, exist_ok=True)
+        info_path = os.path.join(bracket_dir, "source video.info.json")
+        with open(info_path, "w", encoding="utf-8") as handle:
+            json.dump({"upload_date": "20261029"}, handle)
+
+        value = _read_publish_date(
+            os.path.join(bracket_dir, "different video_hardsub.mp4")
+        )
+
+        self.assertEqual(value, "2026-10-29")
 
     def test_accepts_legacy_hash_only_cover_marker(self):
         output = os.path.join(self.temp_dir, "video.cover.bili.jpg")

@@ -9,7 +9,6 @@ import glob
 import shutil
 from datetime import datetime
 from contextlib import contextmanager
-import datetime
 import tempfile
 from pathlib import Path
 
@@ -265,6 +264,79 @@ def get_restricted_name(url, cookies=None):
         except: pass
     return None
 
+
+def normalize_publish_date(value):
+    """Normalize common yt-dlp date values to YYYY-MM-DD."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if re.fullmatch(r"\d{8}", text):
+        return f"{text[:4]}-{text[4:6]}-{text[6:8]}"
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        return text
+    if re.fullmatch(r"\d{10}", text):
+        try:
+            return datetime.fromtimestamp(int(text)).date().isoformat()
+        except Exception:
+            return ""
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).date().isoformat()
+    except Exception:
+        return ""
+
+
+def publish_date_from_info(info):
+    """Extract a normalized publish date from yt-dlp metadata."""
+    if not isinstance(info, dict):
+        return ""
+    for key in ("publish_date", "upload_date", "release_date", "published_date"):
+        normalized = normalize_publish_date(info.get(key))
+        if normalized:
+            return normalized
+    for key in ("timestamp", "release_timestamp"):
+        value = info.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            normalized = normalize_publish_date(int(value))
+            if normalized:
+                return normalized
+    return ""
+
+
+def write_publish_date_metadata(out_dir):
+    """Persist the source publish date beside the downloaded video metadata."""
+    try:
+        # Project folders contain literal [video_id] brackets. glob() treats
+        # those as character classes, so enumerate the directory instead.
+        info_files = [
+            os.path.join(out_dir, name)
+            for name in os.listdir(out_dir)
+            if name.endswith(".info.json")
+        ]
+        if not info_files:
+            return None
+        info_path = max(info_files, key=os.path.getmtime)
+        with open(info_path, "r", encoding="utf-8") as handle:
+            info = json.load(handle)
+        publish_date = publish_date_from_info(info)
+        if not publish_date:
+            return None
+        metadata_base = os.path.splitext(info_path)[0]
+        if metadata_base.endswith(".info"):
+            metadata_base = os.path.splitext(metadata_base)[0]
+        metadata_path = metadata_base + ".video_metadata.json"
+        payload = {
+            "publish_date": publish_date,
+            "source_info_file": os.path.basename(info_path),
+        }
+        with open(metadata_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+        log(f"📅 视频发布时间已记录: {publish_date}")
+        return metadata_path
+    except Exception as exc:
+        log(f"⚠️ 记录视频发布时间失败: {exc}")
+        return None
+
+
 def download_video(url, custom_cookies=None, out_dir=None, title=None, start_time=None, end_time=None, **kwargs):
     if out_dir:
         target_dir = out_dir
@@ -295,6 +367,7 @@ def download_video(url, custom_cookies=None, out_dir=None, title=None, start_tim
         "--no-check-certificates",
         "--geo-bypass",
         "--merge-output-format", "mp4",
+        "--write-info-json",
         "-o", os.path.join(target_dir, "%(title)s [%(id)s] [%(height)sp].%(ext)s")
     ]
     if sys.platform == "win32":
@@ -439,8 +512,10 @@ def download_video(url, custom_cookies=None, out_dir=None, title=None, start_tim
                 process.wait()
 
             if process.returncode == 0:
+                write_publish_date_metadata(target_dir)
                 log("✅ Download completed successfully.")
                 return True
+            write_publish_date_metadata(target_dir)
 
             if bot_detected or (process.returncode != 0 and "403" in "".join(output_lines)):
                 if resolved_cookies and resolved_cookies != "NONE":

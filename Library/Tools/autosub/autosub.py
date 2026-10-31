@@ -1224,6 +1224,7 @@ _COVER_TITLE_SUBJECT_MARKERS = (
     "医院", "病人", "医生", "警局", "警察", "新人", "员工", "团队",
     "公司", "客户", "企业", "工程师", "学生", "学校", "军队", "前线",
     "数据治理", "网络攻击", "透析", "脓毒症", "癌症", "战争", "武器",
+    "国家安全", "主权AI",
     "中年", "50岁", "54岁", "人生", "第三节", "素材库", "性生活", "杏生活",
 )
 _COVER_TITLE_CONFLICT_MARKERS = (
@@ -1243,6 +1244,7 @@ _COVER_TITLE_THESIS_ACTION_MARKERS = (
     "用", "整合", "识别", "救治", "优化", "合作", "布局",
     "推进", "建立", "采用", "穿针引线",
     "解决", "放大", "谈",
+    "就是",
     "到", "成", "感觉", "觉得", "以为", "认识",
     "收购",
 )
@@ -1375,6 +1377,26 @@ def _cover_title_has_context_issue(title, form_title="", source_title="", descri
     substantive_description = _contains_chinese_text(description, 8)
     required_anchors = 2 if substantive_description else 1
     return _cover_title_context_anchor_count(title, *contexts) < required_anchors
+
+
+def _cover_title_has_source_title_issue(title, source_title):
+    """Require a cover headline to keep at least one source-title anchor."""
+    if not _is_usable_source_title(source_title):
+        return False
+    if _cover_title_context_anchor_count(title, source_title) > 0:
+        return False
+    # Cross-language source titles do not share tokens with a Chinese hook.
+    if _contains_hangul_text(source_title):
+        return False
+    # A strong consequence or conflict hook can stand without a source-title
+    # token when it is grounded in the transcript.
+    value = re.sub(r"\s+", " ", str(title or "")).strip()
+    if any(
+        marker in value
+        for marker in _COVER_TITLE_CONFLICT_MARKERS + _COVER_TITLE_CONSEQUENCE_MARKERS
+    ):
+        return False
+    return True
 
 
 def _cover_title_subject_tokens(*contexts):
@@ -1729,6 +1751,8 @@ def _metadata_cover_title_has_quality_issue(
     }:
         return True
     if _cover_title_repeats_form_title(value, form_title):
+        return True
+    if _cover_title_has_source_title_issue(value, source_title):
         return True
     if (
         _is_interview_title_context(value, description, source_title)
@@ -4511,6 +4535,39 @@ def _fallback_wechat_title_from_bili_title(bili_title, max_chars):
     cleaned = re.sub(r"\s+", "", cleaned)
     if cleaned and len(cleaned) <= max_chars:
         return normalize_shared_upload_title(cleaned, max_chars=max_chars)
+
+    # Product titles often use "subject + beneficiary + action + object".
+    # Keep that causal structure while replacing a long verb such as
+    # "生成" with the short, natural verb "做".
+    subject = _extract_bili_title_subject(value)
+    if subject:
+        compact = re.sub(r"\s+", "", value)
+        beneficiary_match = re.search(
+            r"为(.{2,10}?)(?:生成|提供|打造|建立|解决|做|给出)",
+            compact,
+        )
+        object_match = re.search(
+            r"(?:生成|提供|打造|建立|解决|做|给出)(.{2,10}?)(?:，|。|；|;|$)",
+            compact,
+        )
+        if beneficiary_match and object_match:
+            beneficiary = beneficiary_match.group(1)
+            object_value = object_match.group(1)
+            object_variants = []
+            if object_value.endswith("包"):
+                object_variants.append(object_value[:-1])
+            if object_value.endswith("方案"):
+                object_variants.append(object_value[:-2])
+            object_variants.append(object_value)
+            for current_object in object_variants:
+                for verb in ("帮", "为"):
+                    candidate = f"{subject}{verb}{beneficiary}做{current_object}"
+                    normalized = normalize_shared_upload_title(
+                        candidate,
+                        max_chars=max_chars,
+                    )
+                    if normalized:
+                        return normalized
     return ""
 
 
@@ -4724,6 +4781,47 @@ def _fallback_cover_title(meta):
         if 12 <= len(value) <= 48 and not _cover_title_has_quality_issue(value):
             return value
     return ""
+
+
+def _fallback_cover_title_from_source_title(
+    source_title,
+    llm_client,
+    model_name,
+    provider=None,
+):
+    """Translate the publisher title when transcript-derived hooks are weak."""
+    if not _is_usable_source_title(source_title) or llm_client is None:
+        return ""
+    prompt = (
+        "把视频原标题翻译成一个中文封面标题。"
+        "保留公司名、产品名和人名原文。"
+        "标题要有明确判断，不要解释，不要加书名号。"
+        f"\n原标题：{source_title}\n"
+        "只输出12到48个字的中文标题。"
+    )
+    try:
+        raw = _generate_content_with_timeout(
+            llm_client,
+            prompt,
+            model_name,
+            provider=provider,
+            disable_thinking=True,
+        )
+    except Exception:
+        return ""
+    value = re.sub(r"\s+", " ", str(raw or "")).strip()
+    value = value.strip("“”\"'《》")
+    if "\n" in value:
+        value = value.splitlines()[0].strip()
+    if not 12 <= len(value) <= 48:
+        return ""
+    if (
+        _cover_title_has_quality_issue(value)
+        or _cover_title_has_engagement_issue(value)
+        or _cover_title_has_source_title_issue(value, source_title)
+    ):
+        return ""
+    return value
 
 
 def generate_upload_metadata(
@@ -5100,6 +5198,17 @@ def generate_upload_metadata(
             _log(f">>> [MetaGen] 封面标题（本地兜底）: {local_cover_title}")
         else:
             _log("⚠️ [MetaGen] Cover title generation failed; no local fallback")
+
+    if not meta.get("cover_title") and source_title and llm_client:
+        translated_cover_title = _fallback_cover_title_from_source_title(
+            source_title,
+            llm_client,
+            preferred_model,
+            provider=provider,
+        )
+        if translated_cover_title:
+            meta["cover_title"] = translated_cover_title
+            _log(f">>> [MetaGen] 封面标题（原标题翻译兜底）: {translated_cover_title}")
 
     # The publisher title is deliberately the last resort. It is weaker than a
     # transcript-grounded title, but a known-topic upload is more recoverable

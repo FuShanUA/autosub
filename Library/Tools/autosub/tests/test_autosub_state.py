@@ -2665,6 +2665,43 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         )
         self.assertEqual(reframed_wechat_title, "Palantir员工谈新人深水区")
 
+    def test_cover_title_must_keep_source_title_anchor(self):
+        source_title = (
+            "Ondas Sentinel: Sovereign AI Is National Security | "
+            "Sovereignty Bootcamp 3"
+        )
+
+        self.assertTrue(
+            autosub._cover_title_has_source_title_issue(
+                "模型在边缘端评估证据，操作员逐行审计决策包",
+                source_title,
+            )
+        )
+        self.assertFalse(
+            autosub._cover_title_has_source_title_issue(
+                "Ondas Sentinel：主权AI就是国家安全",
+                source_title,
+            )
+        )
+
+    def test_cover_title_fallback_translates_source_title(self):
+        source_title = (
+            "Ondas Sentinel: Sovereign AI Is National Security | "
+            "Sovereignty Bootcamp 3"
+        )
+        llm_client = MagicMock()
+        llm_client.generate_content.return_value = (
+            "Ondas Sentinel：主权AI就是国家安全"
+        )
+
+        cover_title = autosub._fallback_cover_title_from_source_title(
+            source_title,
+            llm_client,
+            "glm-5.2",
+        )
+
+        self.assertEqual(cover_title, "Ondas Sentinel：主权AI就是国家安全")
+
     def test_generic_wechat_fallback_compresses_announcement_title(self):
         """Announcement titles must still yield a short WeChat title offline."""
         bili_title = (
@@ -2694,6 +2731,32 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
             autosub._metadata_title_has_quality_issue(
                 wechat_title,
                 "",
+                True,
+                description,
+            )
+        )
+
+    def test_generic_wechat_fallback_compresses_beneficiary_title(self):
+        """A product title must keep its subject, beneficiary, and action."""
+        bili_title = "Skyweaver为操作员生成决策包，可逐行审计"
+        description = (
+            "在本期Sovereignty训练营中，Palantir与首个客户Ondas合作展示"
+            "主权AI产品Skyweaver C4I。该系统在边缘端自主运行，抗断连与拒止。"
+            "在北部湾非法捕捞演练中，模型于边缘端评估证据并生成可逐行审计的决策包，"
+            "将最终决策权交还操作员。"
+        )
+
+        wechat_title = autosub._fallback_wechat_title_from_bili_title(
+            bili_title,
+            16,
+        )
+
+        self.assertEqual(wechat_title, "Skyweaver帮操作员做决策")
+        self.assertLessEqual(len(wechat_title), 16)
+        self.assertFalse(
+            autosub._metadata_title_has_quality_issue(
+                wechat_title,
+                "Ondas Sentinel: Sovereign AI Is National Security",
                 True,
                 description,
             )

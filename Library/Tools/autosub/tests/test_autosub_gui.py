@@ -6,11 +6,16 @@ import time
 
 # Add current dir to path to import autosub modules
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+AUTOSUB_DIR = os.path.dirname(CURRENT_DIR)
+if AUTOSUB_DIR not in sys.path:
+    sys.path.insert(0, AUTOSUB_DIR)
 if CURRENT_DIR not in sys.path:
     sys.path.insert(0, CURRENT_DIR)
 
 import tkinter as tk
+import customtkinter as ctk
 from autosub_terminal_gui import TerminalGUI
+from autosub_gui import AutoSubGUI
 
 class DummyEvent:
     def __init__(self, char="", keysym="", widget=None):
@@ -77,6 +82,67 @@ class TestTerminalGUI(unittest.TestCase):
         time.sleep(0.2)
         
         self.gui.proc.stdin.write.assert_called_with(b'\n')
+
+
+class TestAutoSubGUIEditing(unittest.TestCase):
+    def setUp(self):
+        self.root = tk.Tk()
+        self.root.withdraw()
+        with patch.object(AutoSubGUI, "restore_pending_input", lambda _self: None):
+            self.gui = AutoSubGUI(self.root)
+
+    def tearDown(self):
+        self.root.destroy()
+
+    def test_log_area_has_only_the_internal_scrollbar(self):
+        self.assertFalse(hasattr(self.gui, "log_scrollbar"))
+        self.assertIsInstance(self.gui.log_text._y_scrollbar, ctk.CTkScrollbar)
+
+    def test_header_has_icon_and_left_spacing(self):
+        self.assertIsInstance(self.gui.header_logo, ctk.CTkImage)
+        self.assertEqual(tuple(self.gui.header_brand.pack_info()["padx"]), (24, 0))
+        self.assertEqual(
+            os.path.basename(self.gui.header_logo_path), "autosub_gui_neon.png"
+        )
+
+    def test_text_widgets_have_standard_editing_bindings(self):
+        widgets = (
+            self.gui.input_entry,
+            self.gui.api_key_entry,
+            self.gui.vendor_combo,
+            self.gui.log_text,
+        )
+        sequences = (
+            "<Control-a>", "<Command-a>",
+            "<Control-c>", "<Command-c>",
+            "<Control-x>", "<Command-x>",
+            "<Control-v>", "<Command-v>",
+            "<Button-2>", "<Button-3>",
+        )
+        for widget in widgets:
+            native_widget = getattr(widget, "_entry", None) or getattr(widget, "_textbox")
+            for sequence in sequences:
+                self.assertTrue(native_widget.bind(sequence), f"{sequence} missing")
+
+    def test_log_text_select_all_and_copy(self):
+        self.gui.log_text.configure(state="normal")
+        self.gui.log_text.delete("1.0", "end")
+        self.gui.log_text.insert("1.0", "hello log")
+        self.gui.log_text.configure(state="disabled")
+
+        self.gui._select_all_widget(self.gui.log_text._textbox)
+        self.gui._copy_widget_selection(self.gui.log_text._textbox)
+
+        self.assertEqual(self.root.clipboard_get().strip(), "hello log")
+
+    def test_entry_paste_updates_textvariable(self):
+        self.gui.input_var.set("")
+        self.root.clipboard_clear()
+        self.root.clipboard_append("https://example.com/video")
+
+        self.gui._paste_widget_selection(self.gui.input_entry._entry)
+
+        self.assertEqual(self.gui.input_var.get(), "https://example.com/video")
 
 if __name__ == "__main__":
     unittest.main()

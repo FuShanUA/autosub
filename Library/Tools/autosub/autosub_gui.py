@@ -9,7 +9,7 @@ import json
 import re
 import psutil
 from datetime import datetime
-from PIL import Image, ImageTk
+from PIL import Image
 import customtkinter as ctk
 from ttkbootstrap.style import Style
 
@@ -722,15 +722,6 @@ class AutoSubGUI:
         self.status_label.pack(pady=2)
         log_frame = ctk.CTkFrame(f5, fg_color="transparent")
         log_frame.pack(fill="both", expand=True)
-        self.log_scrollbar = ctk.CTkScrollbar(
-            log_frame,
-            command=lambda *a: self.log_text.yview(*a),
-            corner_radius=4,
-            fg_color="#F5F5F7",
-            button_color="#C7C7CC",
-            button_hover_color="#AEAEB2",
-        )
-        self.log_scrollbar.pack(side="right", fill="y")
         self.log_text = ctk.CTkTextbox(
             log_frame,
             height=420,
@@ -740,8 +731,10 @@ class AutoSubGUI:
             text_color="#1D1D1F",
             border_width=1,
             border_color="#E5E5EA",
-            yscrollcommand=lambda *a: self.log_scrollbar.set(*a),
+            scrollbar_button_color="#C7C7CC",
+            scrollbar_button_hover_color="#AEAEB2",
         )
+        self._bind_text_editing(self.log_text)
         self.log_text.configure(state="disabled")
         self.log_text.pack(side="left", fill="both", expand=True)
 
@@ -838,17 +831,32 @@ class AutoSubGUI:
         )
 
     def _build_header(self):
-        logo_path = os.path.join(CURRENT_DIR, "assets", "autosub_v9.png")
-        if os.path.exists(logo_path):
+        logo_candidates = (
+            os.path.join(CURRENT_DIR, "autosub_gui_neon.png"),
+        )
+        logo_path = next((path for path in logo_candidates if os.path.exists(path)), None)
+        if logo_path:
             try:
+                self.header_logo_path = logo_path
                 logo = Image.open(logo_path).convert("RGBA").resize((40, 40), Image.LANCZOS)
-                self.header_logo = ImageTk.PhotoImage(logo)
-                ctk.CTkLabel(self.header, image=self.header_logo, text="").pack(side="left", padx=(20, 12))
+                self.header_logo = ctk.CTkImage(
+                    light_image=logo, dark_image=logo, size=(40, 40)
+                )
+                self.header_brand = ctk.CTkFrame(self.header, fg_color="transparent")
+                self.header_brand.pack(side="left", fill="y", padx=(24, 0))
+                ctk.CTkLabel(self.header_brand, image=self.header_logo, text="").pack(
+                    side="left", padx=(0, 12)
+                )
             except Exception:
                 pass
 
-        title_box = ctk.CTkFrame(self.header, fg_color="transparent")
+        if not hasattr(self, "header_brand"):
+            self.header_brand = ctk.CTkFrame(self.header, fg_color="transparent")
+            self.header_brand.pack(side="left", fill="y", padx=(24, 0))
+
+        title_box = ctk.CTkFrame(self.header_brand, fg_color="transparent")
         title_box.pack(side="left", fill="y", pady=14)
+        self.header_title_box = title_box
         ctk.CTkLabel(title_box, text="AutoSub Pro", text_color="#1D1D1F", font=(self.ui_font[0], 17, "bold")).pack(anchor="w")
         ctk.CTkLabel(title_box, text="视频字幕流水线", text_color="#86868B", font=(self.ui_font[0], 11)).pack(anchor="w")
 
@@ -924,7 +932,9 @@ class AutoSubGUI:
             "font": self.ui_font,
         }
         defaults.update(kwargs)
-        return ctk.CTkEntry(parent, **defaults)
+        entry = ctk.CTkEntry(parent, **defaults)
+        self._bind_text_editing(entry)
+        return entry
 
     def _combo(self, parent, **kwargs):
         defaults = {
@@ -943,7 +953,111 @@ class AutoSubGUI:
             "dropdown_font": self.ui_font,
         }
         defaults.update(kwargs)
-        return ctk.CTkComboBox(parent, **defaults)
+        combo = ctk.CTkComboBox(parent, **defaults)
+        self._bind_text_editing(combo)
+        return combo
+
+    def _bind_text_editing(self, widget):
+        """Give native Tk entry/text widgets standard editing shortcuts."""
+        for sequence in ("<Control-a>", "<Command-a>", "<Control-c>", "<Command-c>",
+                         "<Control-x>", "<Command-x>", "<Control-v>", "<Command-v>"):
+            widget.bind(sequence, self._text_editing_shortcut, add=True)
+        # Tk on macOS and Windows/X11 can report right-click as different buttons.
+        for sequence in ("<Button-2>", "<Button-3>"):
+            widget.bind(sequence, self._show_text_context_menu, add=True)
+
+    def _text_editing_shortcut(self, event):
+        key = str(getattr(event, "keysym", "")).lower()
+        widget = event.widget
+        if key == "a":
+            return self._select_all_widget(widget)
+        if key == "c":
+            return self._copy_widget_selection(widget)
+        if key == "x":
+            return self._cut_widget_selection(widget)
+        if key == "v":
+            return self._paste_widget_selection(widget)
+        return None
+
+    def _widget_is_editable(self, widget):
+        try:
+            return str(widget.cget("state")).lower() == "normal"
+        except Exception:
+            return False
+
+    def _widget_selection(self, widget):
+        try:
+            if isinstance(widget, tk.Entry):
+                if not widget.select_present():
+                    return ""
+                return widget.get(widget.index("sel.first"), widget.index("sel.last"))
+            if isinstance(widget, tk.Text):
+                return widget.get("sel.first", "sel.last")
+        except Exception:
+            pass
+        return ""
+
+    def _select_all_widget(self, widget):
+        if isinstance(widget, tk.Entry):
+            widget.select_range(0, "end")
+            widget.icursor("end")
+        elif isinstance(widget, tk.Text):
+            widget.tag_add("sel", "1.0", "end")
+        return "break"
+
+    def _copy_widget_selection(self, widget):
+        selected = self._widget_selection(widget)
+        if selected:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(selected)
+        return "break"
+
+    def _cut_widget_selection(self, widget):
+        if not self._widget_is_editable(widget):
+            return "break"
+        selected = self._widget_selection(widget)
+        if selected:
+            self._copy_widget_selection(widget)
+            if isinstance(widget, tk.Entry):
+                widget.delete(widget.index("sel.first"), widget.index("sel.last"))
+            elif isinstance(widget, tk.Text):
+                widget.delete("sel.first", "sel.last")
+        return "break"
+
+    def _paste_widget_selection(self, widget):
+        if not self._widget_is_editable(widget):
+            return "break"
+        try:
+            text = self.root.clipboard_get()
+        except Exception:
+            return "break"
+        selected = self._widget_selection(widget)
+        if selected and isinstance(widget, tk.Entry):
+            widget.delete(widget.index("sel.first"), widget.index("sel.last"))
+        elif selected and isinstance(widget, tk.Text):
+            widget.delete("sel.first", "sel.last")
+        if isinstance(widget, tk.Entry):
+            widget.insert(widget.index("insert"), text)
+        elif isinstance(widget, tk.Text):
+            widget.insert("insert", text)
+        return "break"
+
+    def _show_text_context_menu(self, event):
+        widget = event.widget
+        if not isinstance(widget, (tk.Entry, tk.Text)):
+            return None
+        menu = tk.Menu(self.root, tearoff=0)
+        if isinstance(widget, tk.Text) or not self._widget_is_editable(widget):
+            menu.add_command(label="复制", command=lambda: self._copy_widget_selection(widget))
+            menu.add_command(label="全选", command=lambda: self._select_all_widget(widget))
+        else:
+            menu.add_command(label="剪切", command=lambda: self._cut_widget_selection(widget))
+            menu.add_command(label="复制", command=lambda: self._copy_widget_selection(widget))
+            menu.add_command(label="粘贴", command=lambda: self._paste_widget_selection(widget))
+            menu.add_command(label="全选", command=lambda: self._select_all_widget(widget))
+        self._text_context_menu = menu
+        menu.tk_popup(event.x_root, event.y_root)
+        return "break"
 
     def _button(self, parent, text, command, primary=False, danger=False, **kwargs):
         defaults = {
@@ -977,7 +1091,9 @@ class AutoSubGUI:
         ctk.CTkLabel(p, text=l).grid(row=r, column=0, sticky="w", pady=2)
         var = tk.StringVar(value=str(self.settings.get(v.replace("_var", ""), "")))
         setattr(self, v, var)
-        self._entry(p, textvariable=var, width=420).grid(row=r, column=1, padx=5)
+        entry = self._entry(p, textvariable=var, width=420)
+        setattr(self, v.replace("_var", "_entry"), entry)
+        entry.grid(row=r, column=1, padx=5)
         self._button(p, "选择...", c).grid(row=r, column=2)
 
     def create_style_row(self, p, l1, v1, val1, l2, v2, val2, r):
