@@ -1,5 +1,6 @@
 import asyncio
 import importlib.util
+from io import StringIO
 import json
 import os
 from pathlib import Path
@@ -8,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
+from contextlib import redirect_stdout
 from unittest.mock import patch
 
 from PIL import Image
@@ -948,6 +950,286 @@ class TestWechatUploadTitle(unittest.TestCase):
         self.assertEqual(progress["pct"], 0)
         self.assertEqual(progress["source"], "aria-progressbar")
 
+    def test_noisy_wechat_request_failures_are_filtered(self):
+        noisy = (
+            ("blob:https://channels.weixin.qq.com/object", "net::ERR_ABORTED"),
+            (
+                "https://channels.weixin.qq.com/cgi-bin/.../report-perf?pf=web",
+                "net::ERR_ABORTED",
+            ),
+            (
+                "https://finder.video.qq.com/251/20302/stodownload?x=1",
+                "net::ERR_ABORTED",
+            ),
+        )
+        for url, failure in noisy:
+            self.assertTrue(self.module._is_noisy_wechat_request_failure(url, failure))
+
+        self.assertFalse(
+            self.module._is_noisy_wechat_request_failure(
+                "https://channels.weixin.qq.com/api/upload", "net::ERR_ABORTED"
+            )
+        )
+        self.assertFalse(
+            self.module._is_noisy_wechat_request_failure(
+                "https://finder.video.qq.com/251/20302/stodownload?x=1",
+                "net::ERR_CONNECTION_REFUSED",
+            )
+        )
+
+    def test_upload_progress_label_separates_processing_after_near_completion(self):
+        self.assertEqual(
+            self.module._upload_progress_stage_label(
+                {"source": "aria-progressbar"}, previous_pct=91
+            ),
+            "页面处理进度",
+        )
+        self.assertEqual(
+            self.module._upload_progress_stage_label(
+                {"source": "aria-progressbar"}, previous_pct=10
+            ),
+            "视频上传进度",
+        )
+        self.assertEqual(
+            self.module._upload_progress_stage_label(
+                {"source": "progress-node"}, previous_pct=91
+            ),
+            "视频上传进度",
+        )
+
+    def test_headless_login_failure_distinguishes_page_load_from_login_state(self):
+        class FakePage:
+            def __init__(self, module):
+                self.module = module
+                self.url = module.WECHAT_CREATE_URL
+
+            async def goto(self, _url, **_kwargs):
+                return None
+
+            async def content(self):
+                return "<html>create form did not load</html>"
+
+        async def fake_wait_input(_page, timeout=45):
+            self.assertEqual(timeout, 45)
+            return False
+
+        async def fake_wait_login(_page, timeout=600):
+            raise AssertionError("headless upload must not wait for QR login")
+
+        output = StringIO()
+        with patch.object(self.module, "SKILL_DIR", self.temp_dir), \
+             patch.object(self.module, "_wait_for_upload_input", fake_wait_input), \
+             patch.object(self.module, "_wait_login", fake_wait_login), \
+             patch.object(self.module.asyncio, "sleep", _noop_sleep), \
+             redirect_stdout(output):
+            ok = asyncio.run(
+                self.module._ensure_logged_in(
+                    FakePage(self.module), allow_qr=False, timeout=45
+                )
+            )
+
+        self.assertFalse(ok)
+        self.assertIn("发布页加载失败", output.getvalue())
+        self.assertIn("登录态可能仍有效", output.getvalue())
+        self.assertNotIn("登录态不可用", output.getvalue())
+
+    def test_required_publish_settings_apply_all_three_actions(self):
+        class FakeLocator:
+            def __init__(self, page, selector, has_text=None):
+                self.page = page
+                self.selector = selector
+                self.has_text = has_text
+                self.checked = False
+
+            @property
+            def first(self):
+                return self
+
+            async def count(self):
+                return (
+                    0
+                    if "declare-original-dialog" in self.selector
+                    or "post-with-link" in self.selector
+                    else 1
+                )
+
+            async def click(self):
+                if self.has_text:
+                    self.page.actions.append(f"{self.selector} ({self.has_text})")
+                else:
+                    self.page.actions.append(self.selector)
+                if "checkbox" in self.selector:
+                    self.checked = True
+
+            async def is_checked(self):
+                return self.checked
+
+        class FakePage:
+            def __init__(self):
+                self.actions = []
+
+            def locator(self, selector, has_text=None):
+                return FakeLocator(self, selector, has_text)
+
+        page = FakePage()
+        output = StringIO()
+        with redirect_stdout(output):
+            ok = asyncio.run(self.module._set_required_publish_settings(page))
+
+        self.assertTrue(ok)
+        self.assertEqual(
+            page.actions,
+            [
+                ".post-position-wrap .position-display",
+                ".post-position-wrap .option-item (不显示位置)",
+                ".post-with-mark-tag .mark-tag-select .select-display",
+                ".post-with-mark-tag .mark-tag-option (无需标注)",
+                ".declare-original-checkbox .ant-checkbox-wrapper",
+                ".declare-original-checkbox input[type='checkbox']",
+            ],
+        )
+        self.assertIn("微信位置、视频标注、原创标志均已设置", output.getvalue())
+
+    def test_location_option_waits_for_async_attachment(self):
+        class DelayedOptionLocator:
+            def __init__(self, page):
+                self.page = page
+                self.count_calls = 0
+
+            @property
+            def first(self):
+                return self
+
+            async def count(self):
+                self.count_calls += 1
+                return 0 if self.count_calls == 1 else 1
+
+            async def click(self):
+                self.page.actions.append("delayed-location-option")
+
+        class FakePage:
+            def __init__(self):
+                self.actions = []
+                self.option = DelayedOptionLocator(self)
+
+            def locator(self, selector, has_text=None):
+                if "option-item" in selector and has_text == "不显示位置":
+                    return self.option
+                return SimpleNamespace(
+                    first=SimpleNamespace(
+                        count=self._always_one,
+                        click=self._click_display,
+                    )
+                )
+
+            async def _always_one(self):
+                return 1
+
+            async def _click_display(self):
+                self.actions.append("position-display")
+
+        async def noop_sleep(_):
+            return None
+
+        page = FakePage()
+        output = StringIO()
+        with patch.object(self.module.asyncio, "sleep", noop_sleep), redirect_stdout(output):
+            ok = asyncio.run(self.module._select_wechat_location_none(page))
+
+        self.assertTrue(ok)
+        self.assertEqual(page.actions, ["position-display", "delayed-location-option"])
+        self.assertEqual(page.option.count_calls, 3)
+        self.assertIn("微信位置已设置为不显示", output.getvalue())
+
+    def test_required_publish_settings_can_be_read_back(self):
+        class FakeLocator:
+            def __init__(self, text="", checked=False):
+                self.text = text
+                self.checked = checked
+
+            @property
+            def first(self):
+                return self
+
+            @property
+            def first(self):
+                return self
+
+            async def count(self):
+                return 1
+
+            async def inner_text(self):
+                return self.text
+
+            async def is_checked(self):
+                return self.checked
+
+        class FakePage:
+            def locator(self, selector):
+                if "position-display" in selector:
+                    return FakeLocator("不显示位置")
+                if "mark-tag-select" in selector:
+                    return FakeLocator("无需标注")
+                if "declare-original-checkbox" in selector:
+                    return FakeLocator(checked=True)
+                return FakeLocator()
+
+        output = StringIO()
+        with redirect_stdout(output):
+            ok = asyncio.run(
+                self.module._verify_required_publish_settings(FakePage())
+            )
+
+        self.assertTrue(ok)
+        self.assertIn("位置=不显示", output.getvalue())
+        self.assertIn("标注=无需标注", output.getvalue())
+        self.assertIn("原创=已选", output.getvalue())
+
+    def test_ensure_required_publish_settings_reapplies_missing_state(self):
+        class FakeLocator:
+            def __init__(self, text="", checked=False):
+                self.text = text
+                self.checked = checked
+
+            async def count(self):
+                return 1
+
+            async def inner_text(self):
+                return self.text
+
+            async def is_checked(self):
+                return self.checked
+
+        class FakePage:
+            def __init__(self):
+                self.calls = 0
+
+            def locator(self, selector):
+                if "position-display" in selector:
+                    return FakeLocator("上海市")
+                if "mark-tag-select" in selector:
+                    return FakeLocator("无需标注")
+                if "declare-original-checkbox" in selector:
+                    return FakeLocator(checked=True)
+                return FakeLocator()
+
+        async def fake_set(_page):
+            return True
+
+        page = FakePage()
+        output = StringIO()
+        with redirect_stdout(output), patch.object(
+            self.module,
+            "_set_required_publish_settings",
+            fake_set,
+        ):
+            ok = asyncio.run(
+                self.module._ensure_required_publish_settings(page)
+            )
+
+        self.assertTrue(ok)
+        self.assertIn("微信发布设置不完整，自动补设", output.getvalue())
+
     def test_same_page_cover_flow_sets_both_previews_without_draft_reopen(self):
         calls = []
 
@@ -1223,8 +1505,8 @@ class TestWechatUploadTitle(unittest.TestCase):
         async def fake_entries(_page):
             return list(entries)
 
-        async def fake_open_entry(_page, index):
-            opened.append(index)
+        async def fake_open_entry(_page, entry):
+            opened.append(entry["index"])
             return True
 
         async def fake_cover_card(_page, cover_path, orientation, _title):
@@ -1237,6 +1519,12 @@ class TestWechatUploadTitle(unittest.TestCase):
             # Only the post-loop verification probe reaches this stub.
             return nodes_ready_at_verify
 
+        required_settings_calls = []
+
+        async def fake_required_settings(_page):
+            required_settings_calls.append(True)
+            return True
+
         patches = [
             patch.object(module, "_load_cached_upload_metadata", lambda _p: dict(metadata)),
             patch.object(module, "_generate_wechat_covers",
@@ -1246,7 +1534,9 @@ class TestWechatUploadTitle(unittest.TestCase):
             patch.object(module, "_ensure_logged_in", fake_true),
             patch.object(module, "_open_draft_list", fake_true),
             patch.object(module, "_draft_list_entries", fake_entries),
-            patch.object(module, "_open_draft_entry", fake_open_entry),
+            patch.object(module, "_open_draft_entry_by_signature", fake_open_entry),
+            patch.object(module, "_set_required_publish_settings", fake_required_settings),
+            patch.object(module, "_verify_required_publish_settings", fake_true),
             patch.object(module, "_wait_cover_editor_ready", fake_true),
             patch.object(module, "_upload_wechat_cover_card", fake_cover_card),
             patch.object(module, "_click_final_action", fake_final_action),
@@ -1268,18 +1558,23 @@ class TestWechatUploadTitle(unittest.TestCase):
         marker = os.path.join(temp_dir, ".wechat_uploaded")
         wrote_marker = os.path.isfile(marker)
         shutil.rmtree(temp_dir, ignore_errors=True)
-        return result, opened, wrote_marker
+        return result, opened, wrote_marker, required_settings_calls
 
     def test_repair_verifies_open_draft_without_reopening(self):
-        result, opened, wrote_marker = self._run_repair(nodes_ready_at_verify=True)
+        result, opened, wrote_marker, required_calls = self._run_repair(
+            nodes_ready_at_verify=True
+        )
 
         self.assertTrue(result)
         self.assertTrue(wrote_marker)
+        self.assertEqual(required_calls, [True])
         # Initial open plus one reopen per cover; verification stays in place.
         self.assertEqual(opened, [1, 1, 1])
 
     def test_repair_reopens_draft_when_editor_is_gone(self):
-        result, opened, wrote_marker = self._run_repair(nodes_ready_at_verify=False)
+        result, opened, wrote_marker, required_calls = self._run_repair(
+            nodes_ready_at_verify=False
+        )
 
         self.assertTrue(result)
         self.assertTrue(wrote_marker)
@@ -1291,7 +1586,7 @@ class TestWechatUploadTitle(unittest.TestCase):
             {"index": 0, "title": "draft desc", "time": "2026年10月25日 09:17"},
             {"index": 6, "title": "draft desc", "time": "2026年10月24日 22:02"},
         ]
-        result, opened, wrote_marker = self._run_repair(
+        result, opened, wrote_marker, _required_calls = self._run_repair(
             nodes_ready_at_verify=True,
             entries=entries,
             cached={"wechat_draft_time": "09:17"},
@@ -1388,8 +1683,8 @@ class TestWechatUploadTitle(unittest.TestCase):
 
         reopened = []
 
-        async def fake_open_entry(_page, index):
-            reopened.append(index)
+        async def fake_open_entry(_page, entry):
+            reopened.append(entry["index"])
             return True
 
         async def fake_editor_ready(_page, timeout=1800):
@@ -1397,7 +1692,7 @@ class TestWechatUploadTitle(unittest.TestCase):
 
         with patch.object(module, "_open_draft_list", fake_open_list), patch.object(
             module, "_draft_list_entries", fake_entries
-        ), patch.object(module, "_open_draft_entry", fake_open_entry), patch.object(
+        ), patch.object(module, "_open_draft_entry_by_signature", fake_open_entry), patch.object(
             module, "_wait_cover_editor_ready", fake_editor_ready
         ):
             recorded = asyncio.run(module._record_draft_reference(video, "page", "same"))
@@ -1437,6 +1732,41 @@ class TestWechatUploadTitle(unittest.TestCase):
             )
         )
 
+    def test_open_draft_entry_ref_clicks_signature_not_stale_index(self):
+        opened = []
+
+        async def fake_goto(_page, _page_number):
+            return True
+
+        async def fake_entries(_page):
+            return [{
+                "index": 4,
+                "title": "富士通为客户扩展核心优势",
+                "time": "2026年10月31日 22:05",
+            }]
+
+        async def fake_open_entry(_page, index):
+            opened.append(index)
+            return True
+
+        with patch.object(self.module, "_goto_draft_page", fake_goto), \
+             patch.object(self.module, "_draft_list_entries", fake_entries), \
+             patch.object(self.module, "_open_draft_entry", fake_open_entry):
+            ok = asyncio.run(
+                self.module._open_draft_entry_ref(
+                    object(),
+                    {
+                        "index": 7,
+                        "page": 2,
+                        "title": "富士通为客户扩展核心优势",
+                        "time": "2026年10月31日 22:05",
+                    },
+                )
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual(opened, [4])
+
     def test_draft_cover_readback_failure_is_failure(self):
         async def fake_open_draft_list(page):
             return True
@@ -1444,7 +1774,7 @@ class TestWechatUploadTitle(unittest.TestCase):
         async def fake_draft_entries(page):
             return [{"index": 0, "title": "本次描述", "time": "2026年10月10日 23:00"}]
 
-        async def fake_open_draft_entry(page, index):
+        async def fake_open_draft_entry(page, entry):
             return True
 
         async def fake_wait(page, timeout=0):
@@ -1458,7 +1788,7 @@ class TestWechatUploadTitle(unittest.TestCase):
 
         with patch.object(self.module, "_open_draft_list", fake_open_draft_list), \
              patch.object(self.module, "_draft_list_entries", fake_draft_entries), \
-             patch.object(self.module, "_open_draft_entry", fake_open_draft_entry), \
+             patch.object(self.module, "_open_draft_entry_by_signature", fake_open_draft_entry), \
              patch.object(self.module, "_wait_cover_editor_ready", fake_wait), \
              patch.object(self.module, "_verify_draft_form_fields", fake_verify_fields), \
              patch.object(self.module, "_verify_wechat_cover_previews", fake_verify_covers), \
@@ -1544,8 +1874,8 @@ class TestWechatUploadTitle(unittest.TestCase):
                 {"index": 1, "title": "本次描述", "time": "2026年09月18日 15:13"},
             ]
 
-        async def fake_open_draft_entry(page, index):
-            opened.append(index)
+        async def fake_open_draft_entry(page, entry):
+            opened.append(entry["index"])
             return True
 
         async def fake_wait(page, timeout=0):
@@ -1562,7 +1892,7 @@ class TestWechatUploadTitle(unittest.TestCase):
 
         with patch.object(self.module, "_open_draft_list", fake_open_draft_list), \
              patch.object(self.module, "_draft_list_entries", fake_draft_entries), \
-             patch.object(self.module, "_open_draft_entry", fake_open_draft_entry), \
+             patch.object(self.module, "_open_draft_entry_by_signature", fake_open_draft_entry), \
              patch.object(self.module, "_wait_cover_editor_ready", fake_wait), \
              patch.object(self.module, "_verify_draft_form_fields", fake_verify_fields), \
              patch.object(self.module, "_verify_wechat_cover_previews", fake_verify_covers), \
@@ -1587,7 +1917,7 @@ class TestWechatUploadTitle(unittest.TestCase):
         async def fake_draft_entries(page):
             return [{"index": 0, "title": "本次描述", "time": "2026年09月28日 22:19"}]
 
-        async def fake_open_draft_entry(page, index):
+        async def fake_open_draft_entry(page, entry):
             return True
 
         async def fake_wait(page, timeout=0):
@@ -1598,7 +1928,7 @@ class TestWechatUploadTitle(unittest.TestCase):
 
         with patch.object(self.module, "_open_draft_list", fake_open_draft_list), \
              patch.object(self.module, "_draft_list_entries", fake_draft_entries), \
-             patch.object(self.module, "_open_draft_entry", fake_open_draft_entry), \
+             patch.object(self.module, "_open_draft_entry_by_signature", fake_open_draft_entry), \
              patch.object(self.module, "_wait_cover_editor_ready", fake_wait), \
              patch.object(self.module, "_verify_draft_form_fields", fake_verify_fields), \
              patch.object(self.module.asyncio, "sleep", _noop_sleep):
@@ -1708,10 +2038,43 @@ class TestWechatUploadTitle(unittest.TestCase):
             return None
 
         with patch.object(self.module, "_try_selectors", fake_try_selectors):
-            with self.assertRaises(RuntimeError):
-                asyncio.run(self.module._click_final_action(object(), False))
+            with patch.object(
+                self.module,
+                "_confirm_wechat_original_dialog",
+                _noop_async_true,
+            ):
+                with self.assertRaises(RuntimeError):
+                    asyncio.run(self.module._click_final_action(object(), False))
 
         self.assertEqual(attempted, [self.module.SAVE_DRAFT_SELECTORS])
+
+    def test_final_action_uses_dom_click_when_dialog_overlaps_button(self):
+        class OverlayBlockedButton:
+            def __init__(self):
+                self.dom_clicked = False
+
+            async def click(self):
+                raise RuntimeError("dialog intercepts pointer events")
+
+            async def evaluate(self, _script):
+                self.dom_clicked = True
+                return True
+
+        button = OverlayBlockedButton()
+
+        async def fake_try_selectors(_page, _selectors, description="element"):
+            return button
+
+        with patch.object(self.module, "_try_selectors", fake_try_selectors), \
+             patch.object(
+                 self.module,
+                 "_confirm_wechat_original_dialog",
+                 _noop_async_true,
+             ):
+            action = asyncio.run(self.module._click_final_action(object(), False))
+
+        self.assertEqual(action, "存草稿")
+        self.assertTrue(button.dom_clicked)
 
     def test_ensure_logged_in_proves_login_with_create_form(self):
         class FakePage:
@@ -1868,6 +2231,10 @@ class TestWechatUploadTitle(unittest.TestCase):
 
 async def _noop_sleep(_delay):
     return None
+
+
+async def _noop_async_true(*_args, **_kwargs):
+    return True
 
 
 if __name__ == "__main__":

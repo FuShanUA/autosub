@@ -162,6 +162,20 @@ async def _goto_wechat_page(page, url):
     )
 
 
+def _is_noisy_wechat_request_failure(url, failure):
+    """Filter browser-cancelled requests that do not affect the upload."""
+    lower_url = str(url).lower()
+    failure_text = str(failure or "").lower()
+    if lower_url.startswith("blob:"):
+        return True
+    if "report-perf" in lower_url:
+        return True
+    return (
+        "stodownload" in lower_url
+        and "err_aborted" in failure_text
+    )
+
+
 def _find_ffprobe():
     """Find ffprobe even when the GUI launches Python with a restricted PATH."""
     found = shutil.which("ffprobe")
@@ -408,7 +422,7 @@ async def _record_draft_reference(video_path, page, desc):
     try:
         if not await _open_draft_list(page):
             return None
-        entries = await _draft_list_entries(page)
+        entries = await _draft_entries_all_pages(page)
         candidates = _repair_draft_candidates(entries, desc)
         if len(candidates) != 1:
             print(f">>> 草稿箱匹配到 {len(candidates)} 条同描述草稿，未记录草稿引用")
@@ -420,7 +434,7 @@ async def _record_draft_reference(video_path, page, desc):
             print(f">>> 已记录草稿引用: {draft_time}")
             # Reading the list leaves the page on the draft box. The caller
             # continues on the edit form, so reopen the matched draft.
-            if not await _open_draft_entry(page, candidates[0]["index"]):
+            if not await _open_draft_entry_ref(page, candidates[0]):
                 print(">>> 记录草稿引用后未能回到草稿编辑页")
                 return None
             if not await _wait_cover_editor_ready(page, timeout=600):
@@ -648,15 +662,20 @@ async def _ensure_logged_in(page, allow_qr=True, timeout=45):
     except Exception:
         pass
 
+    login_expired = "login" in page.url.lower()
     if not allow_qr:
-        print(">>> 微信登录态不可用或发布页加载失败；无头上传已停止。")
-        print(">>> 请先执行一次可见登录命令，扫码后再重试上传：")
+        if login_expired:
+            print(">>> 微信登录态不可用；无头上传已停止。")
+            print(">>> 请先执行一次可见登录命令，扫码后再重试上传：")
+        else:
+            print(">>> 微信发布页加载失败或上传入口未出现；登录态可能仍有效。")
+            print(">>> 请检查网络后重试；若连续失败，再执行可见登录命令：")
         print(f">>> {sys.executable} -u {os.path.abspath(__file__)} --login")
         return False
-    if "login" not in page.url.lower():
+    if login_expired:
+        print(">>> 微信登录态已失效，请在浏览器中重新扫码...")
+    else:
         print(">>> 发布页未出现上传入口，转入登录页复核登录态...")
-
-    print(">>> 微信登录态已失效，请在浏览器中重新扫码...")
     await page.goto(WECHAT_LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
     await asyncio.sleep(2)
     if not await _wait_login(page, timeout=600):
@@ -801,6 +820,198 @@ async def _add_tags(page, tags):
         except Exception as e:
             print(f">>> 添加标签 '{tag}' 失败: {e}")
     print(f">>> 已添加 {len(tags)} 个标签")
+
+
+async def _select_wechat_location_none(page):
+    """Set the location field to WeChat's explicit no-location option."""
+    try:
+        display = page.locator(".post-position-wrap .position-display").first
+        if await display.count() == 0:
+            print(">>> 未找到微信位置设置")
+            return False
+        await display.click()
+        option = page.locator(
+            ".post-position-wrap .option-item",
+            has_text="不显示位置",
+        ).first
+        # WeChat loads nearby-location options asynchronously after the
+        # display control is clicked. A fixed 0.3s wait can run before the
+        # "no location" row is attached.
+        for _ in range(20):
+            if await option.count() > 0:
+                break
+            await asyncio.sleep(0.25)
+        if await option.count() == 0:
+            print(">>> 未找到微信“不显示位置”选项")
+            return False
+        await option.click()
+        print(">>> 微信位置已设置为不显示")
+        return True
+    except Exception as exc:
+        print(f">>> 设置微信位置失败: {exc}")
+        return False
+
+
+async def _select_wechat_mark_tag_none(page):
+    """Set the video mark tag to the platform's no-annotation option."""
+    try:
+        display = page.locator(
+            ".post-with-mark-tag .mark-tag-select .select-display"
+        ).first
+        if await display.count() == 0:
+            print(">>> 未找到微信视频标注设置")
+            return False
+        await display.click()
+        await asyncio.sleep(0.3)
+        option = page.locator(
+            ".post-with-mark-tag .mark-tag-option",
+            has_text="无需标注",
+        ).first
+        if await option.count() == 0:
+            print(">>> 未找到微信“无需标注”选项")
+            return False
+        await option.click()
+        print(">>> 微信视频标注已设置为无需标注")
+        return True
+    except Exception as exc:
+        print(f">>> 设置微信视频标注失败: {exc}")
+        return False
+
+
+async def _confirm_wechat_original_dialog(page):
+    """Confirm an original-rights prompt if checking the checkbox opens one."""
+    for _ in range(10):
+        try:
+            dialog = page.locator(
+                ".post-with-link .weui-desktop-dialog__wrp:visible"
+            ).first
+            if await dialog.count() == 0:
+                return True
+
+            agreement = dialog.locator('input[type="checkbox"]').first
+            if await agreement.count() > 0 and not await agreement.is_checked():
+                wrapper = dialog.locator(".ant-checkbox-wrapper").first
+                if await wrapper.count() > 0:
+                    await wrapper.click()
+                else:
+                    await agreement.click()
+                await asyncio.sleep(0.2)
+
+            buttons = dialog.locator("button")
+            button = None
+            for index in range(await buttons.count()):
+                candidate = buttons.nth(index)
+                if (await candidate.inner_text()).strip() == "声明原创":
+                    button = candidate
+                    break
+
+            if button is not None and await button.is_enabled():
+                if await button.is_visible():
+                    await button.click()
+                    await asyncio.sleep(0.5)
+                    if await dialog.count() == 0:
+                        print(">>> 已确认微信原创声明")
+                        return True
+        except Exception:
+            pass
+        await asyncio.sleep(0.2)
+    return False
+
+
+async def _select_wechat_original(page):
+    """Enable the original-content marker and confirm any rights dialog."""
+    try:
+        checkbox = page.locator(
+            ".declare-original-checkbox input[type='checkbox']"
+        ).first
+        if await checkbox.count() == 0:
+            print(">>> 未找到微信声明原创开关")
+            return False
+        if not await checkbox.is_checked():
+            wrapper = page.locator(
+                ".declare-original-checkbox .ant-checkbox-wrapper"
+            ).first
+            if await wrapper.count() > 0:
+                await wrapper.click()
+            else:
+                await checkbox.click()
+            await asyncio.sleep(0.3)
+        if not await checkbox.is_checked():
+            await checkbox.click()
+            await asyncio.sleep(0.3)
+        if not await checkbox.is_checked():
+            print(">>> 微信声明原创开关未能选中")
+            return False
+        if not await _confirm_wechat_original_dialog(page):
+            return False
+        print(">>> 微信已选择原创标志")
+        return True
+    except Exception as exc:
+        print(f">>> 设置微信原创标志失败: {exc}")
+        return False
+
+
+async def _set_required_publish_settings(page):
+    """Apply the three mandatory WeChat publish settings."""
+    location_ok = await _select_wechat_location_none(page)
+    mark_ok = await _select_wechat_mark_tag_none(page)
+    original_ok = await _select_wechat_original(page)
+    if not (location_ok and mark_ok and original_ok):
+        return False
+    print(">>> 微信位置、视频标注、原创标志均已设置")
+    return True
+
+
+async def _read_required_publish_settings(page):
+    """Read the three mandatory settings without changing them."""
+    state = {"location": False, "mark": False, "original": False}
+    try:
+        location = page.locator(
+            ".post-position-wrap .position-display"
+        ).first
+        if await location.count() > 0:
+            state["location"] = (
+                "不显示位置" in await location.inner_text()
+            )
+    except Exception:
+        pass
+    try:
+        mark = page.locator(
+            ".post-with-mark-tag .mark-tag-select .select-display"
+        ).first
+        if await mark.count() > 0:
+            state["mark"] = "无需标注" in await mark.inner_text()
+    except Exception:
+        pass
+    try:
+        checkbox = page.locator(
+            ".declare-original-checkbox input[type='checkbox']"
+        ).first
+        if await checkbox.count() > 0:
+            state["original"] = await checkbox.is_checked()
+    except Exception:
+        pass
+    return state
+
+
+async def _verify_required_publish_settings(page):
+    """Confirm the saved draft still carries the three mandatory settings."""
+    state = await _read_required_publish_settings(page)
+    print(
+        ">>> 微信发布设置回读: "
+        f"位置={'不显示' if state['location'] else '未确认'}, "
+        f"标注={'无需标注' if state['mark'] else '未确认'}, "
+        f"原创={'已选' if state['original'] else '未确认'}"
+    )
+    return all(state.values())
+
+
+async def _ensure_required_publish_settings(page):
+    """Reapply the mandatory settings only when the saved state is incomplete."""
+    if await _verify_required_publish_settings(page):
+        return True
+    print(">>> 微信发布设置不完整，自动补设")
+    return await _set_required_publish_settings(page)
 
 
 async def _read_upload_progress(page):
@@ -958,6 +1169,14 @@ def _select_upload_progress(raw_progress):
     }
 
 
+def _upload_progress_stage_label(progress, previous_pct=-1):
+    """Label the ARIA bar that follows a near-complete upload as processing."""
+    source = str(progress.get("source") or "")
+    if source == "aria-progressbar" and previous_pct >= 90:
+        return "页面处理进度"
+    return "视频上传进度"
+
+
 async def _wait_upload_complete(page, timeout=10000):
     """等待视频上传完成。"""
     print(f">>> 等待视频上传完成（最多 {timeout} 秒）...")
@@ -982,7 +1201,8 @@ async def _wait_upload_complete(page, timeout=10000):
             return False
         if pct is not None:
             if pct != last_pct:
-                print(f"\r>>> 上传进度: {pct}% ({progress.get('source')})", end="", flush=True)
+                stage = _upload_progress_stage_label(progress, last_pct)
+                print(f"\r>>> {stage}: {pct}% ({progress.get('source')})", end="", flush=True)
                 last_pct = pct
                 last_progress_at = time.time()
             if pct >= 100:
@@ -990,7 +1210,7 @@ async def _wait_upload_complete(page, timeout=10000):
                 return True
         elif time.time() - last_diagnostic_at >= 60:
             detail = re.sub(r"\s+", " ", str(progress.get("detail") or "")).strip()
-            print(f"\n>>> 未识别到上传进度；页面文本片段: {detail[:300]}")
+            print(f"\n>>> 视频上传进度未识别；页面文本片段: {detail[:300]}")
             last_diagnostic_at = time.time()
             if time.time() - last_progress_at >= UPLOAD_NO_PROGRESS_SECONDS:
                 print(
@@ -1203,6 +1423,179 @@ async def _draft_list_entries(page):
         return []
 
 
+async def _current_draft_page_number(page):
+    """Return the draft list's current page number."""
+    if not hasattr(page, "locator"):
+        return 1
+    try:
+        value = await page.locator(
+            ".weui-desktop-pagination__num_current"
+        ).first.inner_text()
+        return int(str(value).strip())
+    except Exception:
+        return 1
+
+
+async def _goto_draft_page(page, page_number):
+    """Move the draft list to an explicit page."""
+    if not hasattr(page, "locator"):
+        return True
+    if page_number == await _current_draft_page_number(page):
+        return True
+    try:
+        target = page.locator(
+            ".weui-desktop-pagination__num",
+            has_text=str(page_number),
+        ).first
+        if await target.count() == 0:
+            return False
+        await target.click()
+        await asyncio.sleep(1)
+        return await _current_draft_page_number(page) == page_number
+    except Exception:
+        return False
+
+
+async def _draft_entries_all_pages(page):
+    """Read every draft entry, not only the first page."""
+    if not hasattr(page, "locator"):
+        return await _draft_list_entries(page)
+    # Always start from page 1 so the collected local indices are stable.
+    if not await _goto_draft_page(page, 1):
+        return []
+
+    entries = []
+    while True:
+        page_number = await _current_draft_page_number(page)
+        current_entries = await _draft_list_entries(page)
+        for entry in current_entries:
+            entry["page"] = page_number
+        entries.extend(current_entries)
+
+        next_button = page.locator(
+            ".weui-desktop-pagination__nav a",
+            has_text="下一页",
+        ).first
+        if await next_button.count() == 0:
+            break
+        disabled = (
+            await next_button.get_attribute("disabled")
+            or "disabled" in (await next_button.get_attribute("class") or "")
+        )
+        if disabled:
+            break
+        await next_button.click()
+        await asyncio.sleep(1)
+
+    await _goto_draft_page(page, 1)
+    return entries
+
+
+async def _open_draft_entry_ref(page, entry):
+    """Open a draft entry from any page."""
+    page_number = int(entry.get("page") or 1)
+    if await _goto_draft_page(page, page_number):
+        if await _open_draft_entry_by_signature(page, entry):
+            return True
+    else:
+        print(f">>> 无法切换到草稿箱第 {page_number} 页")
+
+    # A slow draft list can still show the previous page after pagination.
+    # Scan the visible pages again and click only on an exact signature match.
+    print(">>> 目标页未找到草稿签名，扫描草稿箱全部分页...")
+    if not await _goto_draft_page(page, 1):
+        return False
+    for _ in range(30):
+        if await _open_draft_entry_by_signature(page, entry):
+            return True
+        next_button = page.locator(
+            ".weui-desktop-pagination__nav a",
+            has_text="下一页",
+        ).first
+        if await next_button.count() == 0:
+            break
+        disabled = (
+            await next_button.get_attribute("disabled")
+            or "disabled" in (await next_button.get_attribute("class") or "")
+        )
+        if disabled:
+            break
+        await next_button.click()
+        await asyncio.sleep(1)
+    print(">>> 草稿箱全部分页中未找到唯一匹配的草稿签名")
+    return False
+
+
+async def _wait_draft_edit_open(page):
+    """Wait for the draft edit form after an entry has been clicked."""
+    for _ in range(30):
+        if await page.locator(".vertical-cover-wrap").count() > 0:
+            return True
+        if await page.locator(".horizon-cover-wrap").count() > 0:
+            return True
+        if await page.locator('input[type="file"]').count() > 0:
+            return True
+        await asyncio.sleep(1)
+    print(">>> 草稿编辑页未打开")
+    return False
+
+
+async def _open_draft_entry_by_signature(page, entry):
+    """Open the unique list item matching a previously read draft signature."""
+    expected_title = _normalize_draft_text(entry.get("title"))
+    expected_time = _normalize_draft_text(entry.get("time"))
+    if not expected_title and not expected_time:
+        print(">>> 草稿引用缺少标题和时间，无法安全打开")
+        return False
+    current_entries = await _draft_list_entries(page)
+    matches = [
+        item
+        for item in current_entries
+        if _normalize_draft_text(item.get("title")) == expected_title
+        and _normalize_draft_text(item.get("time")) == expected_time
+    ]
+    if len(matches) == 1:
+        return await _open_draft_entry(page, matches[0]["index"])
+    if len(matches) > 1:
+        print(f">>> 草稿箱按标题和时间匹配到 {len(matches)} 条草稿，拒绝猜测")
+        return False
+    try:
+        result = await page.evaluate(
+            """(expected) => {
+                const root = document.querySelector('wujie-app')?.shadowRoot?.querySelector('html') || document;
+                const normalize = (value) => String(value || '').replace(/\\s+/g, '');
+                const items = Array.from(root.querySelectorAll('.post-draft-item'));
+                const matches = items.filter((item) => {
+                    const title = normalize(
+                        item.querySelector('.post-title')?.innerText || item.innerText
+                    );
+                    const time = normalize(item.querySelector('.post-time')?.innerText || '');
+                    return title === expected.title && time === expected.time;
+                });
+                if (matches.length !== 1) {
+                    return matches.length;
+                }
+                const button = matches[0].querySelector('.opr-item');
+                if (!button) {
+                    return -2;
+                }
+                button.click();
+                return -1;
+            }""",
+            {"title": expected_title, "time": expected_time},
+        )
+        if result == -1:
+            return await _wait_draft_edit_open(page)
+        if result == -2:
+            print(">>> 匹配的草稿条目缺少编辑入口")
+        else:
+            print(f">>> 草稿箱按标题和时间匹配到 {result} 条草稿，拒绝猜测")
+        return False
+    except Exception as exc:
+        print(f">>> 按草稿签名打开编辑页失败: {exc}")
+        return False
+
+
 async def _open_draft_entry(page, index):
     """Open one draft by its current list index and wait for the edit form."""
     try:
@@ -1221,16 +1614,7 @@ async def _open_draft_entry(page, index):
         if not clicked:
             print(f">>> 草稿条目 {index} 缺少编辑入口")
             return False
-        for _ in range(30):
-            if await page.locator(".vertical-cover-wrap").count() > 0:
-                return True
-            if await page.locator(".horizon-cover-wrap").count() > 0:
-                return True
-            if await page.locator('input[type="file"]').count() > 0:
-                return True
-            await asyncio.sleep(1)
-        print(">>> 草稿编辑页未打开")
-        return False
+        return await _wait_draft_edit_open(page)
     except Exception as e:
         print(f">>> 打开草稿编辑页失败: {e}")
         return False
@@ -1240,7 +1624,7 @@ async def _snapshot_drafts(page):
     """Capture visible draft signatures before creating a new upload."""
     if not await _open_draft_list(page):
         return None
-    entries = await _draft_list_entries(page)
+    entries = await _draft_entries_all_pages(page)
     return {_draft_signature(entry) for entry in entries}
 
 
@@ -1260,14 +1644,14 @@ async def _verify_draft_saved(
     expected_desc = _normalize_draft_text(desc or title)
     start = time.time()
     while time.time() - start < timeout:
-        entries = await _draft_list_entries(page)
+        entries = await _draft_entries_all_pages(page)
         candidates = _new_draft_entries(entries, expected_desc, known_drafts)
         if candidates:
             if len(candidates) != 1:
                 print(f">>> 草稿箱匹配到 {len(candidates)} 条本次新增草稿，拒绝猜测")
                 return False
             print(">>> 草稿箱已确认保存本次新增的视频")
-            if not await _open_draft_entry(page, candidates[0]["index"]):
+            if not await _open_draft_entry_ref(page, candidates[0]):
                 print(">>> 保存后无法重新打开这条草稿")
                 return False
             if expected_covers:
@@ -1327,11 +1711,20 @@ async def _click_final_action(page, is_public):
         selectors, action = PUBLISH_SELECTORS, "发布"
     else:
         selectors, action = SAVE_DRAFT_SELECTORS, "存草稿"
+    await _confirm_wechat_original_dialog(page)
     btn = await _try_selectors(page, selectors, f"{action}按钮")
     if not btn:
         raise RuntimeError(f"找不到{action}按钮")
     print(f">>> 点击{action}按钮...")
-    await btn.click()
+    try:
+        await btn.click()
+    except Exception as click_error:
+        print(f">>> {action}按钮被弹层遮挡，改用DOM点击: {click_error}")
+        clicked = await btn.evaluate(
+            "element => { if (element.disabled) return false; element.click(); return true; }"
+        )
+        if not clicked:
+            raise
     return action
 
 
@@ -2316,7 +2709,7 @@ async def _open_draft_by_text(page, text):
         return False
     needle = _normalize_draft_text(text)
     for _ in range(30):
-        entries = await _draft_list_entries(page)
+        entries = await _draft_entries_all_pages(page)
         candidates = [
             entry
             for entry in entries
@@ -2326,7 +2719,7 @@ async def _open_draft_by_text(page, text):
             print(f">>> 草稿箱匹配到 {len(candidates)} 条同描述草稿，拒绝猜测")
             return False
         if len(candidates) == 1:
-            return await _open_draft_entry(page, candidates[0]["index"])
+            return await _open_draft_entry_ref(page, candidates[0])
         await asyncio.sleep(1)
     print(">>> 草稿箱未找到描述精确匹配的草稿")
     return False
@@ -2654,6 +3047,8 @@ async def upload_one_video(video_path, title, desc=None, tags=None, is_public=Fa
 
                     def _log_wechat_request_failed(request):
                         failure = request.failure
+                        if _is_noisy_wechat_request_failure(request.url, failure):
+                            return
                         print(
                             f">>> ⚠️ 微信网络请求失败: "
                             f"{request.method} {request.url[:220]} {failure or 'unknown'}"
@@ -2729,7 +3124,11 @@ async def upload_one_video(video_path, title, desc=None, tags=None, is_public=Fa
                     # 6. 添加标签
                     await _add_tags(page, tags)
 
-                    # 7. 设置可见性（公开 vs 仅自己可见）
+                    # 7. 设置微信必选发布项，再处理可见性和封面。
+                    if not await _set_required_publish_settings(page):
+                        raise RuntimeError("微信位置、视频标注或原创标志未设置成功")
+
+                    # 8. 设置可见性（公开 vs 仅自己可见）
                     resources_ready = await _wait_publish_resources_ready(page)
                     if not resources_ready:
                         if is_public:
@@ -2751,6 +3150,17 @@ async def upload_one_video(video_path, title, desc=None, tags=None, is_public=Fa
                             known_drafts,
                             video_path=video_path,
                         )
+                        if not await _verify_required_publish_settings(page):
+                            if not await _set_required_publish_settings(page):
+                                raise RuntimeError(
+                                    "微信位置、视频标注或原创标志未能在保存后保持"
+                                )
+                            action = await _click_final_action(page, False)
+                            await asyncio.sleep(6)
+                            if not await _verify_required_publish_settings(page):
+                                raise RuntimeError(
+                                    f"{action}后发布设置仍未保持"
+                                )
                         marker = os.path.join(os.path.dirname(video_path), ".wechat_uploaded")
                         with open(marker, "w") as f:
                             f.write("1")
@@ -2776,7 +3186,7 @@ async def upload_one_video(video_path, title, desc=None, tags=None, is_public=Fa
                     except Exception:
                         print(">>> 未找到公开选项（默认可能已是公开）")
 
-                    # 8. 发布
+                    # 9. 发布
                     await asyncio.sleep(1)
                     action = await _click_final_action(page, True)
                     await asyncio.sleep(5)
@@ -2790,10 +3200,10 @@ async def upload_one_video(video_path, title, desc=None, tags=None, is_public=Fa
                     except Exception as e:
                         print(f">>> 保存调试截图失败: {e}")
 
-                    # 9. 等待发布结果。
+                    # 10. 等待发布结果。
                     await _wait_published(page, timeout=30)
 
-                    # 10. 标记完成
+                    # 11. 标记完成
                     marker = os.path.join(os.path.dirname(video_path), ".wechat_uploaded")
                     with open(marker, "w") as f:
                         f.write("1")
@@ -2843,7 +3253,7 @@ async def _draft_exists_for(page, desc):
     try:
         if not await _open_draft_list(page):
             return False
-        entries = await _draft_list_entries(page)
+        entries = await _draft_entries_all_pages(page)
         return len(_repair_draft_candidates(entries, desc)) >= 1
     except Exception:
         return False
@@ -2862,8 +3272,8 @@ async def _list_draft_box(headless=False):
             if not await _open_draft_list(page):
                 print(">>> 无法打开草稿箱")
                 return False
-            entries = await _draft_list_entries(page)
-            print(f"\n=== 草稿箱第一页共 {len(entries)} 条 ===")
+            entries = await _draft_entries_all_pages(page)
+            print(f"\n=== 草稿箱共 {len(entries)} 条 ===")
             for entry in entries:
                 title = (entry.get("title") or "").replace("\n", " ")[:64]
                 print(f"[{entry.get('index')}] {entry.get('time')} | {title}")
@@ -2927,7 +3337,7 @@ async def repair_existing_draft(
                 print(">>> 无法打开草稿箱")
                 return False
 
-            entries = await _draft_list_entries(page)
+            entries = await _draft_entries_all_pages(page)
             known_drafts = {_draft_signature(entry) for entry in entries}
             target = _select_repair_draft_entry(entries, desc, draft_time)
             if not target:
@@ -2943,7 +3353,10 @@ async def repair_existing_draft(
                 return False
 
             print(f">>> 打开待修复草稿: {target.get('time')} (index={target.get('index')})")
-            if not await _open_draft_entry(page, target["index"]):
+            if not await _open_draft_entry_ref(page, target):
+                return False
+            if not await _set_required_publish_settings(page):
+                print(">>> 待修复草稿的位置、视频标注或原创标志未设置成功")
                 return False
             if not await _wait_cover_editor_ready(page, timeout=1800):
                 print(">>> 待修复草稿的封面编辑器未就绪")
@@ -2970,7 +3383,7 @@ async def repair_existing_draft(
                 if not await _open_draft_list(page):
                     print(">>> 修复后无法打开草稿箱核验")
                     return False
-                entries = await _draft_list_entries(page)
+                entries = await _draft_entries_all_pages(page)
                 updated_entries = [
                     entry
                     for entry in _repair_draft_candidates(entries, desc)
@@ -2984,7 +3397,7 @@ async def repair_existing_draft(
                     print(">>> 修复后无法唯一确定这条草稿，未写入成功标记")
                     return False
                 print(f">>> 重新打开草稿以设置下一张封面: {target.get('time')} (index={target.get('index')})")
-                if not await _open_draft_entry(page, target["index"]):
+                if not await _open_draft_entry_ref(page, target):
                     return False
                 if not await _wait_cover_editor_ready(page, timeout=1800):
                     print(">>> 修复后的草稿封面编辑器未就绪")
@@ -2999,11 +3412,11 @@ async def repair_existing_draft(
                 if not await _open_draft_list(page):
                     print(">>> 核验前无法打开草稿箱")
                     return False
-                entries = await _draft_list_entries(page)
+                entries = await _draft_entries_all_pages(page)
                 refreshed = _select_repair_draft_entry(entries, desc, draft_time)
                 if refreshed:
                     target = refreshed
-                if not await _open_draft_entry(page, target["index"]):
+                if not await _open_draft_entry_ref(page, target):
                     return False
             if not await _wait_cover_editor_ready(page, timeout=1800):
                 print(">>> 修复后的草稿封面编辑器未就绪")
@@ -3013,6 +3426,15 @@ async def repair_existing_draft(
                 return False
             if not await _verify_wechat_cover_previews(page, cover_previews):
                 return False
+            if not await _verify_required_publish_settings(page):
+                if not await _set_required_publish_settings(page):
+                    print(">>> 修复后的位置、视频标注或原创标志未设置成功")
+                    return False
+                action = await _click_final_action(page, False)
+                await asyncio.sleep(6)
+                if not await _verify_required_publish_settings(page):
+                    print(">>> 修复后的发布设置仍未保持")
+                    return False
 
             marker = os.path.join(os.path.dirname(video_path), ".wechat_uploaded")
             with open(marker, "w", encoding="utf-8") as handle:
