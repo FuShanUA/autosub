@@ -2371,7 +2371,38 @@ async def _active_cover_file_input(page, orientation, timeout=10000):
             if await inputs.count() > index:
                 return inputs.nth(index)
         await asyncio.sleep(0.2)
-    return page.locator(".single-cover-uploader-wrap input[type='file']").first
+    return None
+
+
+async def _click_cover_recommend_direct_edit(page, timeout=3):
+    """Open the real cover editor when WeChat shows its recommendation popover."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            clicked = await page.evaluate(
+                """() => {
+                    const root = document.querySelector('wujie-app')?.shadowRoot?.querySelector('html') || document;
+                    const visible = (el) => {
+                        if (!el) return false;
+                        const style = window.getComputedStyle(el);
+                        if (style.display === 'none' || style.visibility === 'hidden') return false;
+                        const rect = el.getBoundingClientRect();
+                        return rect.width > 0 && rect.height > 0;
+                    };
+                    const buttons = Array.from(
+                        root.querySelectorAll('.img-recommend-wrap .btn-directly-edit button')
+                    ).filter(visible);
+                    if (!buttons.length) return false;
+                    buttons[0].click();
+                    return true;
+                }"""
+            )
+        except Exception:
+            clicked = False
+        if clicked:
+            return True
+        await asyncio.sleep(0.2)
+    return False
 
 
 async def _upload_wechat_cover_card(page, cover_path, orientation, expected_title):
@@ -2399,7 +2430,12 @@ async def _upload_wechat_cover_card(page, cover_path, orientation, expected_titl
 
         try:
             await edit_btn.evaluate("element => element.click()")
+            await _click_cover_recommend_direct_edit(page)
             image_input = await _active_cover_file_input(page, orientation)
+            if image_input is None:
+                print(f">>> 未打开{'个人主页' if orientation == 'portrait' else '分享'}封面编辑弹层")
+                await _save_cover_editor_debug(page)
+                return False
             await image_input.wait_for(state="attached", timeout=10000)
         except Exception:
             print(">>> 封面编辑弹层未显示上传封面入口")
@@ -2468,7 +2504,11 @@ async def _upload_wechat_cover_card(page, cover_path, orientation, expected_titl
             await _close_cover_dialog(page)
             try:
                 await edit_btn.evaluate("element => element.click()")
+                await _click_cover_recommend_direct_edit(page)
                 image_input = await _active_cover_file_input(page, orientation)
+                if image_input is None:
+                    print(">>> 重开封面编辑弹层失败")
+                    return False
                 await image_input.wait_for(state="attached", timeout=10000)
                 await image_input.set_input_files(cover_path)
             except Exception:

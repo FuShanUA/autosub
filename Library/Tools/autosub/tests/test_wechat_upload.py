@@ -1381,6 +1381,36 @@ class TestWechatUploadTitle(unittest.TestCase):
         self.assertEqual(page.title, "编辑分享卡片")
         self.assertEqual(share_input, "input-1")
 
+    def test_active_cover_file_input_does_not_fallback_to_another_cover(self):
+        class FakePage:
+            async def evaluate(self, _script, _title):
+                return -1
+
+        page = FakePage()
+        with patch.object(self.module.asyncio, "sleep", _noop_sleep):
+            share_input = asyncio.run(
+                self.module._active_cover_file_input(page, "share", timeout=1)
+            )
+
+        self.assertIsNone(share_input)
+
+    def test_cover_recommend_direct_edit_clicks_visible_button(self):
+        class FakePage:
+            def __init__(self):
+                self.scripts = []
+
+            async def evaluate(self, script):
+                self.scripts.append(script)
+                return True
+
+        page = FakePage()
+        clicked = asyncio.run(
+            self.module._click_cover_recommend_direct_edit(page, timeout=1)
+        )
+
+        self.assertTrue(clicked)
+        self.assertIn(".img-recommend-wrap .btn-directly-edit button", page.scripts[0])
+
     def test_cover_dialog_confirm_waits_out_disabled_button(self):
         states = [
             {"title": "编辑个人主页卡片", "mask": False, "clicked": False,
