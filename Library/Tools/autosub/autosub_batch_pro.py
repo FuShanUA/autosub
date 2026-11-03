@@ -2040,7 +2040,10 @@ class BatchEngine:
                     _gd_pct = 100.0 if not need_gd else 0.0
                     _bi_pct = 100.0 if not need_bi else 0.0
                     _wx_pct = 100.0 if not need_wx else 0.0
-                    _mg_pct = 100.0 if not (need_bi or need_wx) else 0.0
+                    # A completed BI upload proves its metadata was generated.
+                    # WX may still need a short title, but the shared MG bar
+                    # must not restart from zero after BI has succeeded.
+                    _mg_pct = 100.0 if not need_bi else 0.0
                     task.pcts.update({
                         "DL": 100, "TR": 100, "TL": 100, "MR": 100,
                         "BR": 100, "GD": _gd_pct, "MG": _mg_pct,
@@ -2758,6 +2761,8 @@ class BatchEngine:
                                 with open(os.path.join(workdir, ".bili_uploaded"), "w") as f: f.write("1")
                             except: pass
                             task.pcts["BI"] = 100.0
+                            if need_wx:
+                                task.pcts["MG"] = 100.0
                         if wx_result[0]:
                             try:
                                 with open(os.path.join(workdir, ".wechat_uploaded"), "w", encoding="utf-8") as f: f.write("1")

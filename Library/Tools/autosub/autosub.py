@@ -3307,6 +3307,29 @@ def _fallback_wechat_title_from_source_title(source_title, max_chars):
     return normalize_shared_upload_title(value, max_chars=max_chars)
 
 
+def _last_resort_wechat_title_from_source_title(source_title, max_chars):
+    """Use a publisher-title prefix when every editorial title path fails.
+
+    This intentionally bypasses the Chinese natural-title gate. The gate is
+    useful for ranking generated hooks, but it must not block publication when
+    the publisher already supplied a usable topic.
+    """
+    value = re.sub(r"\s+", " ", str(source_title or "")).strip()
+    if not _is_usable_source_title(value):
+        return ""
+    value = value.replace("—", " ").replace("–", " ")
+    value = re.sub(r"\s+", " ", value).strip()
+    if len(value) > max_chars:
+        cut = value.rfind(" ", 0, max_chars + 1)
+        if cut < max_chars // 2:
+            cut = max_chars
+        value = value[:cut].rstrip(" .,:;!?")
+    candidate = sanitize_wechat_title(value, max_chars=max_chars)
+    if not candidate or candidate == "未命名视频":
+        return ""
+    return candidate
+
+
 _SUBTITLE_HOOK_MARKERS = (
     "穿针引线", "结缔组织", "筋膜", "烂掉", "裁掉", "人格分裂",
     "深水区", "马戏团", "正中央", "没有销售", "不招销售", "不做服务",
@@ -5375,6 +5398,22 @@ def prepare_wechat_upload_metadata(
         meta.get("wechat_title"),
         max_chars=SHARED_UPLOAD_TITLE_MAX_CHARS,
     )
+    if not wechat_title and os.path.exists(os.path.join(workdir, ".bili_uploaded")):
+        # A completed BI upload proves the shared description and cover are
+        # publishable. If every 16-character title path fails, keep the task
+        # recoverable with a publisher-title prefix instead of blocking WX.
+        fallback_title = _last_resort_wechat_title_from_source_title(
+            source_title or meta.get("source_title"),
+            SHARED_UPLOAD_TITLE_MAX_CHARS,
+        )
+        if fallback_title:
+            wechat_title = fallback_title
+            meta["wechat_title"] = fallback_title
+            _persist_upload_metadata(workdir, meta)
+            _log(
+                ">>> [MetaGen] 视频号标题（原标题最后兜底）: "
+                f"{fallback_title}"
+            )
     description = str(meta.get("description") or "").strip()
     cover_title = str(
         explicit_cover_title or meta.get("cover_title") or ""

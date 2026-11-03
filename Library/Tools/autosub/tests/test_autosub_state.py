@@ -955,6 +955,46 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         self.assertEqual(task.pcts["BI"], 0.0)
         self.assertEqual(task.pcts["WX"], 0.0)
 
+    def test_disk_truth_keeps_mg_complete_after_bili_success(self):
+        """A successful BI upload must not reset shared metadata progress."""
+        workdir = os.path.join(self.temp_dir, "task_bili_done_wx_pending")
+        os.makedirs(workdir)
+        with open(os.path.join(workdir, "video_hardsub.mp4"), "w") as handle:
+            handle.write("A" * 2 * 1024 * 1024)
+        for marker in (".burn_complete", ".bili_uploaded"):
+            with open(os.path.join(workdir, marker), "w", encoding="utf-8") as handle:
+                handle.write("1")
+
+        task = SubTask(
+            uid=7,
+            url="http://test.com",
+            title="Video 7",
+            workdir=workdir,
+            pcts={
+                "DL": 100.0,
+                "TR": 100.0,
+                "TL": 100.0,
+                "MR": 100.0,
+                "BR": 100.0,
+                "GD": 100.0,
+                "MG": 0.0,
+                "BI": 100.0,
+                "WX": 0.0,
+            },
+        )
+        engine = BatchEngine(output_dir=self.temp_dir, sub_dir_name="project_1")
+        engine.do_gdsync = False
+        engine.do_bili = True
+        engine.do_wechat = True
+
+        with patch.object(BatchEngine, "get_duration", return_value="00:00:10"):
+            engine.disk_truth(task)
+
+        self.assertEqual(task.status, "排队中 (MG)")
+        self.assertEqual(task.pcts["MG"], 100.0)
+        self.assertEqual(task.pcts["BI"], 100.0)
+        self.assertEqual(task.pcts["WX"], 0.0)
+
     def test_worker_enters_upload_pipeline_from_remaining_bi_wx_status(self):
         """A restarted task with only BI/WX left must run uploads, not wait as GD."""
         workdir = os.path.join(self.temp_dir, "worker_remaining_bi_wx")
@@ -2063,6 +2103,35 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         with open(os.path.join(workdir, "upload_metadata.json"), encoding="utf-8") as handle:
             saved = json.load(handle)
         self.assertEqual(saved["wechat_title"], "Palantir培养年轻人才")
+
+    def test_wechat_metadata_uses_publisher_title_after_bili_success(self):
+        """A completed BI upload keeps WX recoverable with a source-title prefix."""
+        workdir = os.path.join(self.temp_dir, "wechat_publisher_fallback")
+        os.makedirs(workdir)
+        with open(os.path.join(workdir, ".bili_uploaded"), "w", encoding="utf-8") as handle:
+            handle.write("1")
+        metadata = {
+            "source_title": "How To Take Enterprise AI Pilots To Production — With Russell Jukes",
+            "title": "Russell联合Amazon共同创新，通过自研与采购互补的AI技术栈为企业解决落地问题",
+            "description": "共享简介",
+            "cover_title": "封面标题",
+            "wechat_title": "",
+        }
+
+        with patch.object(autosub, "generate_upload_metadata", return_value=metadata):
+            result = autosub.prepare_wechat_upload_metadata(
+                workdir,
+                source_title=(
+                    "How To Take Enterprise AI Pilots To Production — "
+                    "With Russell Jukes"
+                ),
+            )
+
+        self.assertEqual(result["wechat_title"], "How To Take")
+        self.assertLessEqual(len(result["wechat_title"]), 16)
+        with open(os.path.join(workdir, "upload_metadata.json"), encoding="utf-8") as handle:
+            saved = json.load(handle)
+        self.assertEqual(saved["wechat_title"], "How To Take")
 
     def test_wechat_only_retry_reports_wx_not_mg(self):
         """A lone WX retry is a WX stage even while its metadata is rebuilt."""
