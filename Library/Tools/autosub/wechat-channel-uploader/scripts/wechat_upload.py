@@ -2271,22 +2271,30 @@ async def _cover_dialog_canvas_size(page, orientation):
                 const scope = wrappers.length ? wrappers[wrappers.length - 1] : null;
                 if (!scope) return null;
                 const bound = (item) => item.width > 0 && item.height > 0 && visible(item);
-                let canvas = Array.from(scope.querySelectorAll(payload.canvasSelector)).find(bound);
-                if (!canvas) {
-                    const candidates = Array.from(
+                let candidates = Array.from(scope.querySelectorAll(payload.canvasSelector)).filter(bound);
+                if (!candidates.length) {
+                    candidates = Array.from(
                         scope.querySelectorAll('.croppie-container canvas.cr-image')
                     ).filter(bound);
-                    canvas = candidates.find(
-                        (item) => payload.expectedRatio
-                            && Math.abs(item.width / item.height - payload.expectedRatio) <= 0.03
-                    ) || candidates[0];
                 }
-                if (!canvas) return null;
+                if (!candidates.length) return null;
+                const matchesExpected = (item) => {
+                    const ratio = item.width / item.height;
+                    if (payload.expectedRatio && Math.abs(ratio - payload.expectedRatio) <= 0.05) {
+                        return true;
+                    }
+                    if (payload.orientation === 'share' && Math.abs(ratio - 1.0) <= 0.05) {
+                        return true;
+                    }
+                    return false;
+                };
+                const canvas = candidates.find(matchesExpected) || candidates[0];
                 return {width: canvas.width, height: canvas.height};
             }""",
             {
                 "canvasSelector": _cover_dialog_canvas_selector(orientation),
                 "expectedRatio": _expected_cover_ratio(orientation),
+                "orientation": orientation,
             },
         )
     except Exception:
@@ -2405,7 +2413,7 @@ async def _cover_dialog_text(page):
         return ""
 
 
-async def _click_cover_dialog_confirm(page, orientation=None, timeout=240000):
+async def _click_cover_dialog_confirm(page, orientation=None, timeout=240000, stop_if_closed=False):
     """Click the active cover dialog's confirm button, waiting out WeChat processing."""
     deadline = time.time() + timeout / 1000
     last_signature = None
@@ -2417,8 +2425,14 @@ async def _click_cover_dialog_confirm(page, orientation=None, timeout=240000):
             if state.get("clicked"):
                 print(f">>> 已点击封面弹层按钮: {label}（弹层: {state.get('title') or '未知'}）")
                 return True
+            if stop_if_closed and state.get("reason") == "no-cover-dialog":
+                print(">>> 封面弹层已在等待确认期间关闭")
+                return True
             if state.get("reason") in ("disabled", "masked", "hidden"):
                 break
+        if stop_if_closed and (state or {}).get("reason") == "no-cover-dialog":
+            print(">>> 封面弹层已在等待确认期间关闭")
+            return True
         signature = (
             (state or {}).get("title"),
             (state or {}).get("reason"),
@@ -2737,7 +2751,7 @@ async def _upload_wechat_cover_card(page, cover_path, orientation, expected_titl
             if not captured_debug:
                 await _save_cover_dialog_debug(page, f"still_open_{orientation}")
                 captured_debug = True
-            if not await _click_cover_dialog_confirm(page, orientation, timeout=30000):
+            if not await _click_cover_dialog_confirm(page, orientation, timeout=30000, stop_if_closed=True):
                 await asyncio.sleep(5)
                 continue
             await asyncio.sleep(10)
@@ -2881,13 +2895,23 @@ def _cover_preview_similarity(local_path, preview_bytes):
 async def _verify_cover_preview_matches(page, expected, orientation):
     if not expected or not expected.get("local_path"):
         return False
+    label = "个人主页" if orientation == "portrait" else "分享"
     wrap_selector = ".vertical-cover-wrap" if orientation == "portrait" else ".horizon-cover-wrap"
-    current = await _current_cover_preview(page, wrap_selector, orientation)
+    images = await _cover_wrap_images(page, wrap_selector)
+    current = _matching_cover_preview(images, orientation)
     if not current:
-        print(f">>> 回读时{'个人主页' if orientation == 'portrait' else '分享'}封面预览缺失")
+        loaded = [
+            img for img in (images or [])
+            if int(img.get("naturalWidth") or 0) > 0 and int(img.get("naturalHeight") or 0) > 0
+        ]
+        if loaded:
+            dims = ", ".join(f"{img.get('naturalWidth')}x{img.get('naturalHeight')}" for img in loaded)
+            print(f">>> 回读时{label}封面比例不匹配（疑似仍是视频原帧）: {dims}")
+            return False
+        print(f">>> 回读时{label}封面预览缺失")
         return None
     if current.get("src") and current.get("src") == expected.get("src"):
-        print(f">>> 回读{'个人主页' if orientation == 'portrait' else '分享'}封面 URL 一致")
+        print(f">>> 回读{label}封面 URL 一致")
         return True
 
     preview_bytes = await _preview_image_bytes(page, current.get("src"))
@@ -2897,7 +2921,7 @@ async def _verify_cover_preview_matches(page, expected, orientation):
     if score is None:
         return False
     print(
-        f">>> 回读{'个人主页' if orientation == 'portrait' else '分享'}封面相似度: "
+        f">>> 回读{label}封面相似度: "
         f"{score:.2f} (阈值 20.00)"
     )
     return score <= 20.0
@@ -3022,6 +3046,101 @@ async def _set_wechat_covers_for_upload(
     return previews or {}
 
 
+async def _reopen_matching_draft(page, desc, known_drafts=None, timeout=600):
+    """Open the draft list and reopen the unique matching draft by description."""
+    if not await _open_draft_list(page):
+        print(">>> 无法打开草稿箱")
+        return False
+    entries = await _draft_entries_all_pages(page)
+    target = None
+    if known_drafts is not None:
+        new_matches = _new_draft_entries(entries, desc, known_drafts)
+        if len(new_matches) == 1:
+            target = new_matches[0]
+    if target is None:
+        target = _select_repair_draft_entry(entries, desc)
+    if not target:
+        print(">>> 未能在草稿箱唯一匹配到本次草稿，跳过盲目重开")
+        return False
+    if not await _open_draft_entry_ref(page, target):
+        return False
+    return await _wait_cover_editor_ready(page, timeout=timeout)
+
+
+async def _repair_existing_draft_missing_covers(
+    page,
+    title,
+    desc,
+    portrait_cover,
+    share_cover,
+    cover_headline,
+    known_drafts=None,
+):
+    """Inspect a unique existing matching draft and backfill any missing/mismatched covers."""
+    entries = await _draft_entries_all_pages(page)
+    if not entries and await _open_draft_list(page):
+        entries = await _draft_entries_all_pages(page)
+    target = _select_repair_draft_entry(entries, desc)
+    if not target:
+        candidates = _repair_draft_candidates(entries, desc)
+        if len(candidates) > 1:
+            print(
+                ">>> 草稿箱存在多条同描述草稿；跳过重复上传，"
+                "如需补封面请使用 --repair-covers --draft-time"
+            )
+        else:
+            print(
+                ">>> 草稿箱已存在同描述草稿；跳过重复上传，"
+                "如需补封面请使用 --repair-covers"
+            )
+        return True
+    if not await _open_draft_entry_ref(page, target):
+        return False
+    if not await _wait_cover_editor_ready(page, timeout=600):
+        print(">>> 已有草稿封面编辑器未就绪，无法补修封面")
+        return False
+
+    previews = {}
+    missing = []
+    for orient, path in (("portrait", portrait_cover), ("share", share_cover)):
+        if not path:
+            continue
+        expected_info = {"local_path": os.path.abspath(path)}
+        result = await _verify_cover_preview_matches(page, expected_info, orient)
+        if result is False:
+            missing.append((orient, path))
+        else:
+            previews[orient] = expected_info
+
+    if not missing:
+        print(">>> 草稿箱已存在同描述草稿且横竖封面均完整，跳过重复上传")
+        return True
+
+    print(f">>> 已有草稿缺失封面（{', '.join(o for o, _ in missing)}），开始自动补修...")
+    for idx, (orient, path) in enumerate(missing):
+        if idx > 0 and hasattr(page, "locator") and not await _cover_editor_nodes_ready(page):
+            await _reopen_matching_draft(page, desc, known_drafts=None, timeout=600)
+        preview = await _upload_wechat_cover_card(page, path, orient, cover_headline)
+        if not preview:
+            return False
+        previews[orient] = preview
+        action = await _click_final_action(page, False)
+        await asyncio.sleep(6)
+        is_last = idx == len(missing) - 1
+        expected_covers = previews if is_last else None
+        if not await _verify_draft_saved(
+            page,
+            title,
+            desc,
+            expected_covers=expected_covers,
+            known_drafts=None,
+        ):
+            print(f">>> {action}后补修封面核验失败")
+            return False
+    print(">>> 已有草稿缺失封面已自动补修完成！")
+    return True
+
+
 async def _set_wechat_covers_sequentially(
     page,
     portrait_cover,
@@ -3045,19 +3164,9 @@ async def _set_wechat_covers_sequentially(
         ("share", share_cover),
     ):
         label = "个人主页" if orientation == "portrait" else "分享"
-        if orientation == "share" and not await _cover_editor_nodes_ready(page):
+        if orientation == "share" and hasattr(page, "locator") and not await _cover_editor_nodes_ready(page):
             print(">>> 正在从草稿箱重新打开草稿以设置分享卡片封面...")
-            if not await _open_draft_list(page):
-                print(">>> 无法打开草稿箱")
-            else:
-                entries = await _draft_entries_all_pages(page)
-                updated_entries = [
-                    entry for entry in entries if _draft_signature(entry) not in known_drafts
-                ]
-                target = updated_entries[0] if updated_entries else (entries[0] if entries else None)
-                if target:
-                    if await _open_draft_entry_ref(page, target):
-                        await _wait_cover_editor_ready(page, timeout=600)
+            await _reopen_matching_draft(page, desc, known_drafts=known_drafts, timeout=600)
 
         preview = None
         for attempt in range(1, 4):
@@ -3276,13 +3385,20 @@ async def upload_one_video(video_path, title, desc=None, tags=None, is_public=Fa
                     if known_drafts is None:
                         raise RuntimeError("上传前无法读取草稿箱，已停止以避免修改旧草稿")
                     if _known_draft_has_description(known_drafts, desc):
+                        repaired = await _repair_existing_draft_missing_covers(
+                            page,
+                            title,
+                            desc,
+                            portrait_cover,
+                            share_cover,
+                            cover_headline,
+                            known_drafts=known_drafts,
+                        )
+                        if not repaired:
+                            return False
                         marker = os.path.join(os.path.dirname(video_path), ".wechat_uploaded")
                         with open(marker, "w", encoding="utf-8") as handle:
                             handle.write("1")
-                        print(
-                            ">>> 草稿箱已存在同描述草稿；跳过重复上传，"
-                            "如需补封面请使用 --repair-covers"
-                        )
                         return True
 
                     def _log_wechat_response(response):
@@ -3406,6 +3522,8 @@ async def upload_one_video(video_path, title, desc=None, tags=None, is_public=Fa
                             known_drafts,
                             video_path=video_path,
                         )
+                        if isinstance(cover_previews, dict) and cover_previews.get("share", {}).get("unverified"):
+                            print(">>> ⚠️ 警告：分享卡片封面未确认生效，请用 --repair-covers 补修或目视确认")
                         if not await _verify_required_publish_settings(page):
                             if not await _set_required_publish_settings(page):
                                 raise RuntimeError(

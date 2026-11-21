@@ -2391,6 +2391,125 @@ class TestWechatUploadTitle(unittest.TestCase):
         self.assertIn("--no-proxy-server", launch_kwargs["args"])
         self.assertNotIn("HeadlessChrome", launch_kwargs["user_agent"])
 
+    def test_verify_cover_preview_matches_rejects_wrong_ratio_video_frame(self):
+        async def fake_loaded_video_frame(_page, _selector):
+            return [{"src": "https://example.test/frame.jpg", "naturalWidth": 1920, "naturalHeight": 1080}]
+
+        async def fake_unloaded_preview(_page, _selector):
+            return [{"src": "", "naturalWidth": 0, "naturalHeight": 0}]
+
+        with patch.object(self.module, "_cover_wrap_images", fake_loaded_video_frame):
+            res_wrong = asyncio.run(
+                self.module._verify_cover_preview_matches(
+                    object(), {"local_path": "/tmp/share.jpg"}, "share"
+                )
+            )
+        with patch.object(self.module, "_cover_wrap_images", fake_unloaded_preview):
+            res_unloaded = asyncio.run(
+                self.module._verify_cover_preview_matches(
+                    object(), {"local_path": "/tmp/share.jpg"}, "share"
+                )
+            )
+
+        self.assertIs(res_wrong, False)
+        self.assertIsNone(res_unloaded)
+
+    def test_cover_dialog_confirm_stop_if_closed_exits_without_debug(self):
+        class FakePage:
+            async def evaluate(self, _script, _label):
+                return {"title": "", "mask": False, "clicked": False,
+                        "reason": "no-cover-dialog", "buttons": []}
+
+        saved = []
+
+        async def fake_debug(_page, tag):
+            saved.append(tag)
+
+        with patch.object(self.module.asyncio, "sleep", _noop_sleep), \
+             patch.object(self.module, "_save_cover_dialog_debug", fake_debug):
+            confirmed = asyncio.run(
+                self.module._click_cover_dialog_confirm(
+                    FakePage(), "share", timeout=30000, stop_if_closed=True
+                )
+            )
+
+        self.assertTrue(confirmed)
+        self.assertEqual(saved, [])
+
+    def test_repair_existing_draft_missing_covers_skips_complete_and_repairs_missing_share(self):
+        module = self.module
+        uploads = []
+        saves = []
+        verifies = []
+
+        async def fake_entries(_page):
+            return [{"index": 0, "title": "同描述草稿", "time": "2026年11月21日 09:00"}]
+
+        async def fake_open_ref(_page, _entry):
+            return True
+
+        async def fake_wait_ready(_page, timeout=600):
+            return True
+
+        async def fake_upload(_page, cover_path, orientation, _headline):
+            uploads.append((orientation, cover_path))
+            return {"src": f"https://example.test/{orientation}.jpg", "local_path": cover_path}
+
+        async def fake_save(_page, _is_public):
+            saves.append(True)
+            return "存草稿"
+
+        async def fake_verify_saved(_page, _title, _desc, expected_covers=None, known_drafts=None):
+            verifies.append(expected_covers)
+            return True
+
+        # Case 1: both portrait & share match -> no upload or save
+        async def verify_both_ok(_page, _expected, _orient):
+            return True
+
+        with patch.object(module, "_draft_entries_all_pages", fake_entries), \
+             patch.object(module, "_open_draft_entry_ref", fake_open_ref), \
+             patch.object(module, "_wait_cover_editor_ready", fake_wait_ready), \
+             patch.object(module, "_verify_cover_preview_matches", verify_both_ok), \
+             patch.object(module, "_upload_wechat_cover_card", fake_upload), \
+             patch.object(module, "_click_final_action", fake_save), \
+             patch.object(module, "_verify_draft_saved", fake_verify_saved), \
+             patch.object(module.asyncio, "sleep", _noop_sleep):
+            ok1 = asyncio.run(
+                module._repair_existing_draft_missing_covers(
+                    object(), "标题", "同描述草稿", "portrait.jpg", "share.jpg", "封面标"
+                )
+            )
+
+        self.assertTrue(ok1)
+        self.assertEqual(uploads, [])
+        self.assertEqual(saves, [])
+
+        # Case 2: portrait matches, share mismatches (False) -> uploads ONLY share, saves, verifies
+        async def verify_share_missing(_page, _expected, orient):
+            return True if orient == "portrait" else False
+
+        with patch.object(module, "_draft_entries_all_pages", fake_entries), \
+             patch.object(module, "_open_draft_entry_ref", fake_open_ref), \
+             patch.object(module, "_wait_cover_editor_ready", fake_wait_ready), \
+             patch.object(module, "_verify_cover_preview_matches", verify_share_missing), \
+             patch.object(module, "_upload_wechat_cover_card", fake_upload), \
+             patch.object(module, "_click_final_action", fake_save), \
+             patch.object(module, "_verify_draft_saved", fake_verify_saved), \
+             patch.object(module.asyncio, "sleep", _noop_sleep):
+            ok2 = asyncio.run(
+                module._repair_existing_draft_missing_covers(
+                    object(), "标题", "同描述草稿", "portrait.jpg", "share.jpg", "封面标"
+                )
+            )
+
+        self.assertTrue(ok2)
+        self.assertEqual(uploads, [("share", "share.jpg")])
+        self.assertEqual(len(saves), 1)
+        self.assertEqual(len(verifies), 1)
+        self.assertIn("portrait", verifies[0])
+        self.assertIn("share", verifies[0])
+
 
 async def _noop_sleep(_delay):
     return None
