@@ -469,7 +469,7 @@ def sanitize_wechat_title(title, max_chars=16):
     """Clean a title to WeChat's short-title punctuation rules and length limit."""
     cleaned = str(title).replace(",", " ").replace("，", " ")
     cleaned = re.sub(
-        r"[^0-9A-Za-z\u3400-\u4dbf\u4e00-\u9fff《》“”‘’：:+?%℃ ]",
+        r"[^0-9A-Za-z\u3400-\u4dbf\u4e00-\u9fff《》：:+?%℃ ]",
         " ",
         cleaned,
     )

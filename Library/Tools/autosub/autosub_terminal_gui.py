@@ -54,6 +54,8 @@ class TerminalGUI:
         self.written_rows = set()
         self.last_data_time = 0.0
         self.last_render_time = 0.0
+        self._last_terminal_size = None
+        self._resize_after_id = None
         
         # Premium Dark Sleek Styling
         self.root.title("AutoSub Engine Console")
@@ -79,18 +81,7 @@ class TerminalGUI:
         self.root.grid_rowconfigure(1, weight=0)
         self.root.grid_columnconfigure(0, weight=1)
         
-        # Select premium Mac monospace fonts
-        self.custom_font = font.Font(family="Courier", size=15)
-        if sys.platform == "darwin":
-            preferred_fonts = [
-                ("Sarasa Mono SC", 15), ("Sarasa Mono HC", 15), ("Sarasa Mono TC", 15),
-                ("Sarasa Mono J", 15), ("Menlo", 13), ("Monaco", 13), ("Courier New", 15)
-            ]
-            available = font.families()
-            for f_name, f_size in preferred_fonts:
-                if f_name in available:
-                    self.custom_font = font.Font(family=f_name, size=f_size)
-                    break
+        self.custom_font = self._select_terminal_font()
         
         custom_font = self.custom_font
         
@@ -195,6 +186,29 @@ class TerminalGUI:
         
         # Start GUI queue poller
         self.root.after(50, self.poll_queue)
+
+    def _select_terminal_font(self):
+        """Pick a font whose CJK width is exactly two ASCII cells."""
+        candidates = [
+            ("Sarasa Mono SC", 15), ("Sarasa Mono HC", 15), ("Sarasa Mono TC", 15),
+            ("Sarasa Mono J", 15), ("Menlo", 13), ("Monaco", 13), ("Courier New", 15)
+        ]
+        available = font.families()
+        fallback = font.Font(family="Courier", size=15)
+        for family, size in candidates:
+            if family not in available:
+                continue
+            candidate = font.Font(family=family, size=size)
+            ascii_w = candidate.measure("A")
+            if (
+                candidate.measure("中") == 2 * ascii_w
+                and candidate.measure("│") == ascii_w
+                and candidate.measure("█") == ascii_w
+            ):
+                return candidate
+            if str(fallback.cget("family")) == "Courier":
+                fallback = candidate
+        return fallback
         
     def start_process(self):
         try:
@@ -523,14 +537,27 @@ class TerminalGUI:
     def _send_current_size(self):
         """Send the current terminal size once after the engine dashboard starts."""
         try:
-            width = self.text_area.winfo_width()
-            height = self.text_area.winfo_height()
+            self._send_terminal_size(
+                self.text_area.winfo_width(), self.text_area.winfo_height()
+            )
+        except Exception:
+            pass
+
+    def _send_terminal_size(self, width, height):
+        """Send a deduplicated rows/cols update measured from the Text widget."""
+        try:
             if width < 100 or height < 100:
                 return
-            char_width = self.custom_font.measure("A")
-            char_height = self.custom_font.metrics("linespace")
-            cols = max(40, (width - 32) // char_width)
-            rows = max(10, (height - 32) // char_height)
+            char_width = max(1, self.custom_font.measure("A"))
+            char_height = max(1, self.custom_font.metrics("linespace"))
+            padx = int(self.text_area.cget("padx") or 0)
+            pady = int(self.text_area.cget("pady") or 0)
+            cols = max(40, (width - 2 * padx) // char_width)
+            rows = max(10, (height - 2 * pady) // char_height)
+            terminal_size = (rows, cols)
+            if terminal_size == self._last_terminal_size:
+                return
+            self._last_terminal_size = terminal_size
             self._send_stdin_bytes(f"\x1e{rows},{cols}\n".encode("utf-8"))
         except Exception:
             pass
@@ -641,16 +668,17 @@ class TerminalGUI:
             else:
                 return
         
-        # Calculate character dimensions
-        char_width = self.custom_font.measure("A")
-        char_height = self.custom_font.metrics("linespace")
-        
-        # Compute columns and rows (minus padding)
-        cols = max(40, (event.width - 32) // char_width)
-        rows = max(10, (event.height - 32) // char_height)
-        
-        # Send the resize control message
-        self._send_stdin_bytes(f"\x1e{rows},{cols}\n".encode("utf-8"))
+        # macOS emits several Configure events during a fullscreen transition.
+        # Debounce them and send only the final terminal cell size.
+        if self._resize_after_id is not None:
+            try:
+                self.root.after_cancel(self._resize_after_id)
+            except Exception:
+                pass
+        width, height = event.width, event.height
+        self._resize_after_id = self.root.after(
+            80, lambda: self._send_terminal_size(width, height)
+        )
 
 def find_table_column_indices(lines):
     # Search for a separator/border line
@@ -694,6 +722,10 @@ def main():
     # Support dynamic command forwarding
     if len(sys.argv) > 1:
         cmd = sys.argv[1:]
+        # App-bundle argument forwarding supplies a .py path directly. The
+        # repository scripts are not marked executable, so run them with Python.
+        if cmd and cmd[0].endswith(".py") and not os.access(cmd[0], os.X_OK):
+            cmd = [PYTHON_EXE, *cmd]
     else:
         cmd = [PYTHON_EXE, os.path.join(CURRENT_DIR, "autosub_launcher.py")]
     

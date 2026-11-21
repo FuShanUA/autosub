@@ -783,6 +783,8 @@ def humanize_text(text: str, is_source: bool = False) -> str:
                      This ensures the LLM always receives clean English source text.
     is_source=False: Post-LLM full pipeline (ASR + terminology translation + cleanup).
     """
+    original_text = text
+
     # 0. Apply Regex Rules from STYLE_GUIDE.md
     for pattern, replacement, rule_type in REGEX_RULES:
         if is_source and rule_type != "asr":
@@ -811,6 +813,11 @@ def humanize_text(text: str, is_source: bool = False) -> str:
     # 3. Trim extra spaces
     text = re.sub(r'\s+', ' ', text).strip()
 
+    # A cleanup rule must never turn a Chinese translation into an English-only
+    # proper noun. If that happens, keep the pre-cleanup translation instead.
+    if re.search(r'[\u4e00-\u9fff]', original_text) and not re.search(r'[\u4e00-\u9fff]', text):
+        return original_text.strip()
+
     return text
 
 
@@ -836,8 +843,9 @@ def is_untranslated(block: Dict) -> bool:
     korean_chars = len(re.findall(r'[\uac00-\ud7af]', text))
     if re.search(r'[\u4e00-\u9fff]', text):
         chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', text))
-        english_words = len(re.findall(r'[a-zA-Z]+', text))
-        english_tokens = re.findall(r"\b[A-Za-z][A-Za-z0-9'-]*\b", text)
+        ordinary_text = _strip_spelled_out_url(_URL_OR_DOMAIN_RE.sub(" ", text))
+        english_words = len(re.findall(r'[a-zA-Z]+', ordinary_text))
+        english_tokens = re.findall(r"\b[A-Za-z][A-Za-z0-9'-]*\b", ordinary_text)
         # A translated list of products can legitimately contain many English
         # proper nouns/acronyms. Those letters must not make the whole block
         # look untranslated, while ordinary English words remain a failure.
@@ -895,9 +903,27 @@ _URL_OR_DOMAIN_RE = re.compile(
 )
 
 
+# Ad reads dictate a URL letter by letter ("D-E-E-L dot com slash sorcery").
+# A faithful Chinese translation has to keep those Latin letters, so neither
+# the spelled-out letters nor the dictation words are evidence that the block
+# was left untranslated.
+_SPELLED_OUT_LETTERS_RE = re.compile(r"\b[A-Za-z](?:[\s\-]+[A-Za-z]\b)+")
+_URL_DICTATION_RE = re.compile(
+    r"\b(?:dot|slash|colon|https?|www|com|net|org|io|dotcom)\b",
+    re.IGNORECASE,
+)
+
+
+def _strip_spelled_out_url(text: str) -> str:
+    """Removes dictated URL fragments so they do not count as English prose."""
+    return _URL_DICTATION_RE.sub(" ", _SPELLED_OUT_LETTERS_RE.sub(" ", text))
+
+
 def english_chars_ratio_excluding_urls(text: str) -> float:
     """Measure ordinary English without counting URLs or domain names."""
-    return english_chars_ratio(_URL_OR_DOMAIN_RE.sub(" ", text))
+    return english_chars_ratio(
+        _strip_spelled_out_url(_URL_OR_DOMAIN_RE.sub(" ", text))
+    )
 
 
 def parse_translated_lines(result_text: str) -> Dict[str, str]:

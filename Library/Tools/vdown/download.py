@@ -360,6 +360,7 @@ def download_video(url, custom_cookies=None, out_dir=None, title=None, start_tim
     cmd = [
         YTDLP_EXE,
         "--no-playlist",
+        "--no-cache-dir",
         "--progress",
         "--newline",
         "--restrict-filenames",
@@ -401,18 +402,15 @@ def download_video(url, custom_cookies=None, out_dir=None, title=None, start_tim
         browser_name = resolved_cookies.split(":")[1]
         log(f"   Cookies: Fetching from browser {browser_name}...")
         cmd.extend(["--cookies-from-browser", browser_name])
-        if "youtube.com" in url or "youtu.be" in url:
-             cmd.extend(["--user-agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"])
+        # Do not pin a Chrome user-agent here. A stale UA (for example Chrome 124
+        # while the installed browser is much newer) makes YouTube's bot checks
+        # more likely and can invalidate otherwise usable browser cookies.
         resolved_cookies = None # Prevent use_temp_cookies from doing anything
 
     with use_temp_cookies(resolved_cookies) as temp_cookies:
         if temp_cookies:
             log(f"   Cookies: {resolved_cookies} (Isolated via {os.path.basename(temp_cookies)})")
             cmd.extend(["--cookies", temp_cookies])
-            # On Mac, browser cookies can sometimes prompt for Keychain access and hang.
-            # We'll rely on cookies.txt if provided.
-            if "youtube.com" in url or "youtu.be" in url:
-                cmd.extend(["--user-agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"])
         else:
             # Without cookies, yt-dlp defaults handle client selection
             pass

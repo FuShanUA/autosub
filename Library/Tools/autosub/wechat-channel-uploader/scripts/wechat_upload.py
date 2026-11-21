@@ -769,6 +769,11 @@ UPLOAD_DONE_INDICATORS = [
 # 进度百分比连续这么久不变就判定上传卡死。正常上传每几秒就会跳一个百分点，
 # 而卡死时页面仍在轮询自己的接口，看起来"还活着"，只有进度不再前进。
 UPLOAD_STALL_SECONDS = float(os.environ.get("WECHAT_UPLOAD_STALL_SECONDS", "900"))
+# Large videos can sit at 99% while WeChat transcodes/processes them on the
+# server. This phase is not network upload progress and needs a longer budget.
+UPLOAD_PROCESSING_STALL_SECONDS = float(
+    os.environ.get("WECHAT_UPLOAD_PROCESSING_STALL_SECONDS", "3600")
+)
 # 文件已选择但页面始终不给进度时，也不能占用串行上传槽位到 10000 秒。
 UPLOAD_NO_PROGRESS_SECONDS = float(
     os.environ.get("WECHAT_UPLOAD_NO_PROGRESS_SECONDS", "300")
@@ -1266,6 +1271,7 @@ async def _wait_upload_complete(page, timeout=10000):
     print(f">>> 等待视频上传完成（最多 {timeout} 秒）...")
     start = time.time()
     last_pct = -1
+    last_stage = ""
     last_progress_at = start
     last_diagnostic_at = 0.0
     while time.time() - start < timeout:
@@ -1288,6 +1294,7 @@ async def _wait_upload_complete(page, timeout=10000):
                 stage = _upload_progress_stage_label(progress, last_pct)
                 print(f"\r>>> {stage}: {pct}% ({progress.get('source')})", end="", flush=True)
                 last_pct = pct
+                last_stage = stage
                 last_progress_at = time.time()
             if pct >= 100:
                 print()
@@ -1317,9 +1324,14 @@ async def _wait_upload_complete(page, timeout=10000):
                         return True
             except Exception:
                 pass
-        if last_pct >= 0 and time.time() - last_progress_at >= UPLOAD_STALL_SECONDS:
+        stall_limit = (
+            UPLOAD_PROCESSING_STALL_SECONDS
+            if last_stage == "页面处理进度"
+            else UPLOAD_STALL_SECONDS
+        )
+        if last_pct >= 0 and time.time() - last_progress_at >= stall_limit:
             print(
-                f"\n>>> 上传进度在 {UPLOAD_STALL_SECONDS} 秒内停在 {last_pct}%，判定为卡死，放弃等待"
+                f"\n>>> 上传进度在 {stall_limit} 秒内停在 {last_pct}%，判定为卡死，放弃等待"
             )
             return False
         for error_text in ("上传失败", "网络出错，请重新上传"):
@@ -3240,6 +3252,8 @@ async def upload_one_video(video_path, title, desc=None, tags=None, is_public=Fa
     from playwright.async_api import async_playwright
     last_error = None
     file_selected = False
+    ambiguous_draft_checked = False
+    ambiguous_draft_verified = False
     for attempt in range(1, max_retries + 1):
         try:
             async with async_playwright() as p:
@@ -3454,6 +3468,31 @@ async def upload_one_video(video_path, title, desc=None, tags=None, is_public=Fa
                     return True
 
                 finally:
+                    # The old flow closed this context before the outer except
+                    # could inspect the draft box, turning every ambiguous
+                    # upload into a manual-check failure. Verify while the page
+                    # is still available.
+                    if file_selected and page and not page.is_closed():
+                        active_exception = sys.exc_info()[1]
+                        if active_exception is not None:
+                            ambiguous_draft_checked = True
+                            if await _draft_exists_for(page, desc):
+                                marker = os.path.join(
+                                    os.path.dirname(video_path), ".wechat_uploaded"
+                                )
+                                with open(marker, "w", encoding="utf-8") as handle:
+                                    handle.write("1")
+                                ambiguous_draft_verified = True
+                                print(
+                                    ">>> 异常后草稿箱已确认存在本次草稿；"
+                                    "上传按成功记录，封面差异请用 --repair-covers "
+                                    "或目视核对"
+                                )
+                            else:
+                                print(
+                                    ">>> 异常后草稿箱未找到本次草稿；"
+                                    "本次上传未保存成功"
+                                )
                     try:
                         await context.close()
                     finally:
@@ -3464,6 +3503,8 @@ async def upload_one_video(video_path, title, desc=None, tags=None, is_public=Fa
             print(f">>> 尝试 {attempt} 失败: {e}")
             if file_selected:
                 print(">>> 文件已提交给微信，为避免重复上传，本次不再自动重试")
+                if ambiguous_draft_verified:
+                    return True
                 # The video is in WeChat's hands. If the draft box confirms a
                 # draft for this description, the upload itself succeeded and
                 # only a cover detail is off: record success instead of
@@ -3487,7 +3528,7 @@ async def upload_one_video(video_path, title, desc=None, tags=None, is_public=Fa
                         ">>> 草稿箱未找到本次草稿；请用 --repair-covers 或重跑，"
                         "不要盲目重复上传"
                     )
-                else:
+                elif not ambiguous_draft_checked:
                     print(
                         ">>> 草稿箱核验未执行：浏览器上下文已关闭。"
                         "请先在微信草稿箱人工确认，避免重复上传"

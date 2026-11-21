@@ -22,6 +22,7 @@ except ModuleNotFoundError:
         audit_second_person_references,
         clean_untranslated_english,
         detect_misaligned_blocks,
+        humanize_text,
         is_untranslated,
         merge_processed_blocks,
         parse_translated_lines,
@@ -36,6 +37,7 @@ except ModuleNotFoundError:
         audit_second_person_references=audit_second_person_references,
         clean_untranslated_english=clean_untranslated_english,
         detect_misaligned_blocks=detect_misaligned_blocks,
+        humanize_text=humanize_text,
         is_untranslated=is_untranslated,
         merge_processed_blocks=merge_processed_blocks,
         parse_translated_lines=parse_translated_lines,
@@ -73,6 +75,44 @@ class TranslationDetectionTests(unittest.TestCase):
             )
         )
 
+    def test_url_with_english_proper_nouns_in_chinese_is_not_untranslated(self):
+        self.assertFalse(
+            smart_translate.is_untranslated(
+                {
+                    "lines": [
+                        "更上一层楼。想了解更多，请访问 rogo.com/invest。"
+                        "OpenAI、Cursor、Anthropic、"
+                    ]
+                }
+            )
+        )
+
+    def test_dictated_url_ad_read_in_chinese_is_not_untranslated(self):
+        # Ad reads spell a URL out loud, and the Chinese line must keep those
+        # Latin letters. Regression: block 606 of task 20 (cBArIbI6gVA) failed
+        # TL validation forever because of this.
+        self.assertFalse(
+            smart_translate.is_untranslated(
+                {"lines": ["访问 deal.com/sorcery。即 D-E-E-L dot com slash sorcery。"]}
+            )
+        )
+        self.assertFalse(
+            smart_translate.is_untranslated(
+                {"lines": ["访问 deal.com/sorcery，也就是 D-E-E-L 点 com 斜杠 sorcery。"]}
+            )
+        )
+
+    def test_untranslated_dictated_url_source_is_still_untranslated(self):
+        self.assertTrue(
+            smart_translate.is_untranslated(
+                {
+                    "lines": [
+                        "Visit deal com slash sorcery. That's D-E-E-L dot com slash sorcery."
+                    ]
+                }
+            )
+        )
+
     def test_credit_line_with_english_names_is_not_untranslated(self):
         self.assertFalse(
             smart_translate.is_untranslated(
@@ -84,6 +124,22 @@ class TranslationDetectionTests(unittest.TestCase):
         self.assertTrue(
             smart_translate.is_untranslated({"lines": ["这是AI actually good"]})
         )
+
+    def test_humanizer_preserves_chinese_parenthetical(self):
+        # Regression: task 36 block 286 was reduced to "Amadé" by the old
+        # full-width-parenthesis cleanup rule, then failed TL validation.
+        text = "Amadé（我用他来代指 Anthropic 的管理层和董事会）"
+        result = smart_translate.humanize_text(text, is_source=False)
+
+        self.assertEqual(result, text)
+        self.assertFalse(smart_translate.is_untranslated({"lines": [result]}))
+
+    def test_humanizer_removes_english_only_parenthetical(self):
+        result = smart_translate.humanize_text(
+            "这是中文翻译（English comment）", is_source=False
+        )
+
+        self.assertEqual(result, "这是中文翻译")
 
 
 class TranslationRebuildTests(unittest.TestCase):
@@ -499,6 +555,25 @@ class BatchQualityGateTests(unittest.TestCase):
 
         blocks = srt_utils.parse_srt(output)
         self.assertEqual(blocks[0]["lines"][0], "中文")
+
+    def test_index_merge_preserves_chinese_parenthetical(self):
+        source = self._write_srt(
+            "source-cn-parenthetical.srt",
+            "Amadé, who I am using as a stand in",
+        )
+        translated = self._write_srt(
+            "translated-cn-parenthetical.srt",
+            "Amadé（我用他来代指 Anthropic 的管理层和董事会）",
+        )
+        output = os.path.join(self.temp_dir, "merged-cn-parenthetical.bi.srt")
+
+        srt_utils.merge_tracks(translated, source, output)
+
+        blocks = srt_utils.parse_srt(output)
+        self.assertEqual(
+            blocks[0]["lines"][0],
+            "Amadé（我用他来代指 Anthropic 的管理层和董事会）",
+        )
 
     def test_bilingual_srt_checks_translation_line_not_source_line(self):
         path = os.path.join(self.temp_dir, "video.bi.srt")

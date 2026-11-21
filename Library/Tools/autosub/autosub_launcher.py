@@ -519,6 +519,60 @@ def pause_project(project_path):
         return False
 
 
+def resume_project_state(project_path):
+    """Clear pause flags after an engine has been stopped for takeover."""
+    state_path = os.path.join(project_path, "batch_state.json")
+    if not os.path.exists(state_path):
+        return False
+    try:
+        with open(state_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            data["global_pause"] = False
+            for key, value in data.items():
+                if str(key).isdigit() and isinstance(value, dict):
+                    value["is_paused"] = False
+            with open(state_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        console.print(f"[bold red]恢复项目状态时出错: {e}[/]")
+        return False
+
+
+def takeover_running_project(project_path, pid):
+    """Stop a running engine cleanly so this launcher can own the project."""
+    if not pause_project(project_path):
+        return False
+
+    # The engine's pause monitor kills active children, but the engine itself
+    # remains alive. Give it a moment before terminating the parent process.
+    time.sleep(2.0)
+    try:
+        import psutil
+        process = psutil.Process(pid)
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except psutil.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+    except Exception:
+        pass
+
+    lock_file = os.path.join(project_path, "batch_engine.lock")
+    try:
+        if os.path.exists(lock_file):
+            with open(lock_file, "r", encoding="utf-8") as f:
+                locked_pid = int(f.read().strip())
+            if locked_pid == pid:
+                os.remove(lock_file)
+    except Exception:
+        pass
+
+    return resume_project_state(project_path)
+
+
 def has_uncompleted_tasks(project_path):
     """Check if a project directory has a batch_state.json with uncompleted tasks."""
     state_path = os.path.join(project_path, "batch_state.json")
@@ -1322,16 +1376,29 @@ def main():
 
             if is_run:
                 console.print(f"\n✨ [bold green]检测到项目 [cyan]{proj_name}[/] 正在后台运行 (PID {pid})。[/]")
-                console.print("📈 [bold cyan]将自动为您唤醒【只读 Live 看板监控模式】，查看实时进度...[/]")
-                time.sleep(2.0)
-                cmd = [
-                    PYTHON_EXE,
-                    BATCH_SCRIPT,
-                    "--output", project_root,
-                    "--sub-dir-name", proj_name
-                ]
-                launch_engine(cmd)
-                return
+                mode = Prompt.ask(
+                    "\n请选择运行方式",
+                    choices=["m", "r"],
+                    default="m",
+                )
+                if mode == "m":
+                    console.print("📈 [bold cyan]将唤醒【只读 Live 看板监控模式】，查看实时进度...[/]")
+                    time.sleep(2.0)
+                    cmd = [
+                        PYTHON_EXE,
+                        BATCH_SCRIPT,
+                        "--output", project_root,
+                        "--sub-dir-name", proj_name
+                    ]
+                    launch_engine(cmd)
+                    return
+
+                console.print(f"🔄 [bold yellow]正在接管项目 [cyan]{proj_name}[/]，会暂停并重启引擎...[/]")
+                if not takeover_running_project(proj_path, pid):
+                    console.print("⚠️ [bold red]接管失败，项目仍由原引擎运行。[/]")
+                    return
+                console.print("✅ [bold green]原引擎已停止，正在以可交互模式恢复项目...[/]")
+                is_run = False
 
             quality = "high"
             cookies_path = None

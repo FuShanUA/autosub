@@ -53,8 +53,8 @@ These regex patterns will be executed in order by the post-processing script.
 | Remove Leading Punctuation | `^[，。！？、,\.\?!]\s*` | `` | Remove punctuation at the start of a line |
 | Fix Period Comma | `([。．！？\.\?!])\s*[，,]` | `\1` | Fix comma occurring right after a sentence terminator |
 | Remove Ellipsis Start | `^\s*\.{2,}` | `` | Remove leading ellipsis "..." |
-| Remove Parentheses (En) | `\([^)]*\)` | `` | Remove content in standard brackets (comments) |
-| Remove Parentheses (Cn) | `（[^）]*）` | `` | Remove content in full-width brackets |
+| Remove Parentheses (En) | `\([^)\u4e00-\u9fff]*\)` | `` | Remove English-only standard-bracket comments |
+| Remove Parentheses (Cn) | `（[^）\u4e00-\u9fff]*）` | `` | Remove English-only full-width-bracket comments |
 | Remove Square Brackets | `\[[A-Za-z0-9\s,.?!'-]{2,}\]` | `` | Remove [sound effects] etc. |
 | Fix Double Punctuation | `[，,]{2,}` | `，` | Fix accidental double commas |
 | Space after Comma | `，(?=[a-zA-Z0-9])` | `， ` | Add space after comma if followed by English/Number |

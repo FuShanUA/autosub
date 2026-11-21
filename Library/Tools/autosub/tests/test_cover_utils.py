@@ -16,6 +16,7 @@ import cover_utils
 from PIL import Image, ImageFont
 
 from cover_utils import (
+    _BILI_BADGE_WIDTH_RATIO,
     _DENSE_SAMPLE_FRAME_COUNT,
     _COVER_STYLE_VERSION,
     _COVER_DATE_BACKGROUND,
@@ -44,6 +45,7 @@ from cover_utils import (
     _publish_date_badge_text,
     _load_title_fonts,
     _legacy_cover_cache_marker,
+    _title_layout,
     cover_style_matches,
     read_cover_metadata,
     _wrap_title,
@@ -594,6 +596,13 @@ class TestCoverUtils(unittest.TestCase):
 
         self.assertEqual(value, "2026-10-29")
 
+    def test_read_publish_date_falls_back_to_dated_filename(self):
+        value = _read_publish_date(
+            os.path.join(self.temp_dir, "2026-10-29 interview static.mp4")
+        )
+
+        self.assertEqual(value, "2026-10-29")
+
     def test_accepts_legacy_hash_only_cover_marker(self):
         output = os.path.join(self.temp_dir, "video.cover.bili.jpg")
         Image.new("RGB", (1920, 1080), (42, 82, 126)).save(
@@ -817,6 +826,28 @@ class TestCoverUtils(unittest.TestCase):
         top = min(point[1] for point in red_points)
         self.assertGreaterEqual(top, face_bbox[1] + face_bbox[3] + 10)
 
+    def test_title_card_never_moves_above_low_subject(self):
+        image = Image.new("RGB", (1920, 1080), (42, 82, 126))
+        face_bbox = (1249, 330, 469, 469)
+        _draw_title(
+            image,
+            "Ali访谈：正在发生的网络攻击，等等等等，我们就会迎来书中描述的",
+            "wide",
+            face_bbox=face_bbox,
+        )
+
+        rgb = image.convert("RGB")
+        red_points = [
+            (x, y)
+            for y in range(image.height)
+            for x in range(image.width)
+            if self._is_red(rgb.getpixel((x, y)))
+        ]
+        self.assertTrue(red_points)
+        top = min(point[1] for point in red_points)
+        self.assertGreaterEqual(top, face_bbox[1] + face_bbox[3] + 10)
+        self.assertGreaterEqual(top / image.height, 0.55)
+
     def test_title_card_uses_lower_center_and_wide_sentence_layout(self):
         image = Image.new("RGB", (1920, 1080), (42, 82, 126))
         _draw_title(
@@ -838,11 +869,28 @@ class TestCoverUtils(unittest.TestCase):
         bottom = max(point[1] for point in points)
         card_width = (right - left + 1) / image.width
         card_center_y = (top + bottom) / 2 / image.height
-        self.assertGreaterEqual(card_width, 0.84)
-        self.assertLessEqual(card_width, 0.96)
-        self.assertAlmostEqual((left + right) / 2 / image.width, 0.5, delta=0.01)
-        self.assertGreaterEqual(card_center_y, 0.58)
-        self.assertLessEqual(card_center_y, 0.68)
+        self.assertGreaterEqual(card_width, 0.58)
+        self.assertLessEqual(card_width, 0.82)
+        self.assertLessEqual((right + 1) / image.width, 0.82)
+        self.assertGreaterEqual(card_center_y, 0.68)
+        self.assertLessEqual(card_center_y, 0.90)
+
+    def test_bili_title_card_reserves_bottom_right_badge(self):
+        image = Image.new("RGB", (1920, 1080), (42, 82, 126))
+        _draw_title(
+            image,
+            "Databricks CEO：企业AI落后的核心障碍是数据、流程和组织",
+            "wide",
+        )
+
+        rgb = image.convert("RGB")
+        badge = rgb.crop((
+            int(image.width * (1 - _BILI_BADGE_WIDTH_RATIO)),
+            int(image.height * 0.88),
+            image.width,
+            image.height,
+        ))
+        self.assertFalse(any(self._is_red(pixel) for pixel in badge.getdata()))
 
     def test_cover_font_starts_larger(self):
         fonts, lines = _fit_font("抽象产品", 1920, 94)
@@ -859,6 +907,32 @@ class TestCoverUtils(unittest.TestCase):
                 cover_utils._line_metrics(line, fonts)[0],
                 int(1920 * 0.88),
             )
+
+    def test_narrow_covers_wrap_before_accepting_layout(self):
+        title = "我们提前两年就在美妆圈播下种子，不想让品牌突然冒出来"
+        cases = (
+            ("share", 1080, 810, 74, 0.80),
+            ("portrait", 1080, 1440, 84, 0.88),
+        )
+        for orientation, width, height, start_size, width_ratio in cases:
+            with self.subTest(orientation=orientation):
+                fonts, lines, metrics, _, _, box_height = _title_layout(
+                    title,
+                    width,
+                    height,
+                    start_size,
+                    None,
+                    orientation,
+                )
+                self.assertEqual(len(lines), 2)
+                self.assertGreater(fonts[0].size, 48)
+                self.assertLessEqual(box_height, height)
+                for line, metric in zip(lines, metrics):
+                    self.assertLessEqual(
+                        metric[0],
+                        int(width * width_ratio),
+                        msg=line,
+                    )
 
     def _assert_frame_overlay_style(self, image):
         rgb = image.convert("RGB")

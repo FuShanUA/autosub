@@ -10,4 +10,8 @@ export VIRTUAL_ENV="$DIR/.venv"
 export PATH="$DIR/.venv/bin:$PATH"
 # Use the Python binary copied into this .app bundle so macOS
 # identifies the process as belonging to this bundle, not Python.app
-exec "$(dirname "$0")/AutoSubLauncher" autosub_terminal_gui.py
+if [ "$#" -gt 0 ]; then
+  exec "$(dirname "$0")/AutoSubLauncher" autosub_terminal_gui.py "$@"
+else
+  exec "$(dirname "$0")/AutoSubLauncher" autosub_terminal_gui.py
+fi

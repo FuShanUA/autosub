@@ -113,13 +113,10 @@ def is_non_speech_marker(text):
 
 
 def remove_parenthetical_glosses(text):
-    """Remove glosses while preserving intentional non-speech markers."""
-    def replace(match):
-        return match.group(0) if is_non_speech_marker(match.group(0)) else ""
-
+    """Remove English-only glosses while preserving Chinese parentheticals."""
     return re.sub(
-        r'\s*[\(\（][^\)\）]*[\)\）]',
-        replace,
+        r'\s*[\(\（][^\)\）\u4e00-\u9fff]*[\)\）]',
+        '',
         text,
     ).strip()
 

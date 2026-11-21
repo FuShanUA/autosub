@@ -241,6 +241,93 @@ class TestWechatUploadTitle(unittest.TestCase):
 
         self.assertEqual(ffprobe, "/opt/homebrew/bin/ffprobe")
 
+    def test_normalize_wechat_title_removes_curly_quotes(self):
+        title = self.module._normalize_wechat_title("Palantir’s卡普谈Tru")
+
+        self.assertNotIn("’", title)
+        self.assertNotIn("'", title)
+        self.assertLessEqual(len(title), self.module.WECHAT_TITLE_MAX_CHARS)
+
+    def test_known_draft_description_prevents_duplicate_upload(self):
+        known = {("已有描述", "2026年11月15日 20:31")}
+
+        self.assertTrue(
+            self.module._known_draft_has_description(known, "已有 描述")
+        )
+        self.assertFalse(
+            self.module._known_draft_has_description(known, "另一条描述")
+        )
+
+    def test_cover_canvas_selector_is_orientation_aware(self):
+        self.assertEqual(
+            self.module._cover_dialog_canvas_selector("portrait"),
+            ".cover-croppie.vertical canvas.cr-image",
+        )
+        self.assertIn(
+            ".cover-croppie.horizon canvas.cr-image",
+            self.module._cover_dialog_canvas_selector("share"),
+        )
+
+    def test_expected_cover_ratio_matches_card_shape(self):
+        self.assertAlmostEqual(self.module._expected_cover_ratio("portrait"), 3 / 4)
+        self.assertAlmostEqual(self.module._expected_cover_ratio("share"), 4 / 3)
+
+    def test_wait_cover_dialog_canvas_accepts_bound_cover_ratio(self):
+        sizes = iter([
+            {"width": 1920, "height": 802},
+            {"width": 1080, "height": 810},
+        ])
+
+        async def fake_size(_page, _orientation):
+            return next(sizes)
+
+        async def fake_sleep(_seconds):
+            return None
+
+        with patch.object(self.module, "_cover_dialog_canvas_size", fake_size), \
+             patch.object(self.module.asyncio, "sleep", fake_sleep):
+            result = asyncio.run(
+                self.module._wait_cover_dialog_canvas(object(), "share", seconds=30)
+            )
+
+        self.assertTrue(result)
+
+    def test_wait_cover_dialog_canvas_rejects_video_frame_ratio(self):
+        async def fake_size(_page, _orientation):
+            return {"width": 1920, "height": 802}
+
+        async def fake_sleep(_seconds):
+            return None
+
+        clock = {"now": 0.0}
+
+        def fake_time():
+            clock["now"] += 1.0
+            return clock["now"]
+
+        with patch.object(self.module, "_cover_dialog_canvas_size", fake_size), \
+             patch.object(self.module.asyncio, "sleep", fake_sleep), \
+             patch.object(self.module.time, "time", fake_time):
+            result = asyncio.run(
+                self.module._wait_cover_dialog_canvas(object(), "portrait", seconds=3)
+            )
+
+        self.assertFalse(result)
+
+    def test_draft_entries_dedupe_repeated_page_reads(self):
+        entries = [
+            {"page": 1, "index": 0, "title": "同描述", "time": "21:43"},
+            {"page": 1, "index": 0, "title": "同描述", "time": "21:43"},
+            {"page": 2, "index": 0, "title": "同描述", "time": "21:43"},
+            {"page": 1, "index": 1, "title": "另一条", "time": "21:44"},
+        ]
+
+        result = self.module._dedupe_draft_entries(entries)
+
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0]["title"], "同描述")
+        self.assertEqual(result[1]["title"], "另一条")
+
     def test_auto_title_comes_from_subtitle_not_filename(self):
         fake = FakeLLM(
             '{"title":"FDE守住核心优势","evidence":["守住核心优势"]}'
@@ -813,6 +900,52 @@ class TestWechatUploadTitle(unittest.TestCase):
             )
 
         self.assertTrue(result)
+
+    def test_wait_upload_complete_allows_long_processing_at_99_percent(self):
+        """Near-complete server processing gets a longer stall budget."""
+        class FakeLocator:
+            def __init__(self):
+                self.first = self
+
+            async def count(self):
+                return 0
+
+            async def is_visible(self):
+                return False
+
+            async def get_attribute(self, _name):
+                return None
+
+        class FakePage:
+            calls = {"count": 0}
+
+            async def evaluate(self, *_args, **_kwargs):
+                self.calls["count"] += 1
+                pct = 99 if self.calls["count"] == 1 else 0
+                return {
+                    "pct": pct,
+                    "source": "aria-progressbar",
+                    "detail": f"{pct}%",
+                }
+
+            def locator(self, _selector):
+                return FakeLocator()
+
+        clock = {"now": 0.0}
+
+        def fake_time():
+            clock["now"] += 200.0
+            return clock["now"]
+
+        with patch.object(self.module.time, "time", fake_time), \
+             patch.object(self.module.asyncio, "sleep", _noop_sleep):
+            result = asyncio.run(
+                self.module._wait_upload_complete(FakePage(), timeout=10000)
+            )
+
+        self.assertFalse(result)
+        self.assertGreaterEqual(clock["now"], self.module.UPLOAD_PROCESSING_STALL_SECONDS)
+        self.assertLess(clock["now"], 10000.0)
 
     def test_wait_upload_complete_fails_when_page_reports_network_error(self):
         class FakeLocator:

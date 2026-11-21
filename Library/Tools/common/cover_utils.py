@@ -42,7 +42,7 @@ _PLATFORM_ALIASES = {
     "wx": "wechat",
 }
 
-_COVER_STYLE_VERSION = "kaiti-alliance-hard-shadow-lower-card-v14"
+_COVER_STYLE_VERSION = "kaiti-alliance-lower-safe-v17"
 _FONT_FALLBACKS = (
     os.path.join(os.path.dirname(__file__), "fonts", "LXGWWenKai-Medium.ttf"),
     "/Users/shanfu/Library/Fonts/LXGWWenKai-Medium.ttf",
@@ -68,6 +68,9 @@ _COVER_DATE_BACKGROUND = (255, 212, 0)
 _COVER_DATE_TEXT = (17, 17, 17)
 _COVER_DATE_BORDER = (255, 255, 255)
 _TITLE_CENTER_Y_RATIO = 0.62
+_TITLE_MIN_TOP_RATIO = 0.55
+_TITLE_BOTTOM_MARGIN_RATIO = 0.045
+_BILI_BADGE_WIDTH_RATIO = 0.18
 _MIN_FRAME_BRIGHTNESS = 40.0
 _MIN_FALLBACK_FRAME_BRIGHTNESS = 8.0
 _SAMPLE_FRAME_COUNT = 16
@@ -218,6 +221,14 @@ def _read_publish_date(video_path: str) -> str:
     """Read the publish date saved beside the source or hardsub video."""
     base = os.path.splitext(os.path.abspath(video_path))[0]
     original_base = base[:-8] if base.endswith("_hardsub") else base
+    filename_match = re.search(
+        r"(?<!\d)(\d{4}-\d{2}-\d{2})(?!\d)",
+        os.path.basename(video_path),
+    )
+    if filename_match:
+        normalized = _normalize_publish_date(filename_match.group(1))
+        if normalized:
+            return normalized
     candidates = []
     for current_base in (base, original_base):
         candidates.extend(
@@ -590,6 +601,13 @@ def _face_score(
             abs(center_x - 0.5) for _, center_x, _ in subjects
         ) / len(subjects)
         score -= 20.0 * average_center_distance
+        largest_subject_area = max(area for area, _, _ in subjects)
+        if largest_subject_area > 0.22:
+            score -= 220.0 * min(1.0, largest_subject_area / 0.45)
+        for _, _, center_y in subjects:
+            if center_y > 0.68:
+                score -= 120.0 * min(1.0, (center_y - 0.68) / 0.24)
+                break
     score -= 18.0 * background_count
     score -= 35.0 * max(0, len(subjects) - _MAX_PANEL_SUBJECTS)
     if composition == _COMPOSITION_NONE:
@@ -1064,34 +1082,86 @@ def _title_box_y(
     box_height: int,
     face_bbox: Optional[Tuple[int, int, int, int]],
 ) -> int:
-    """Place the card in the lower middle, moving around the subject."""
-    centered = int(height * _TITLE_CENTER_Y_RATIO - box_height / 2)
-    if not face_bbox:
-        return max(0, min(height - box_height, centered))
+    """Place the card in the lower band; never move it above a subject."""
+    bottom_margin = max(24, int(height * _TITLE_BOTTOM_MARGIN_RATIO))
+    desired = height - bottom_margin - box_height
+    minimum_top = int(height * _TITLE_MIN_TOP_RATIO)
+    y = max(desired, minimum_top)
 
-    _, face_y, _, face_height = face_bbox
-    face_bottom = face_y + face_height
-    margin = max(24, int(box_height * 0.12))
-    overlaps_subject = (
-        centered < face_bottom + margin
-        and centered + box_height > face_y - margin
+    if face_bbox:
+        _, face_y, _, face_height = face_bbox
+        face_bottom = face_y + face_height
+        margin = max(24, int(box_height * 0.12))
+        y = max(y, face_bottom + margin)
+
+    return max(0, min(height - box_height, y))
+
+
+def _title_layout(
+    title: str,
+    width: int,
+    height: int,
+    start_size: int,
+    face_bbox: Optional[Tuple[int, int, int, int]],
+    orientation: str,
+):
+    """Fit a readable title card into the lower safe area.
+
+    Bilibili overlays video duration in the bottom-right corner. Keeping the
+    wide and 4:3 cards left of that reserve prevents the badge from covering
+    the headline. The font is reduced before the card is allowed to overlap a
+    detected face.
+    """
+    reserve_badge = orientation in ("wide", "share")
+    max_width_ratio = 0.80 if reserve_badge else 0.88
+    bottom_margin = max(24, int(height * _TITLE_BOTTOM_MARGIN_RATIO))
+    minimum_top = int(height * _TITLE_MIN_TOP_RATIO)
+    available_height = height - bottom_margin - minimum_top
+    if face_bbox:
+        _, face_y, _, face_height = face_bbox
+        face_bottom = face_y + face_height
+        available_height = min(
+            available_height,
+            height - bottom_margin - (face_bottom + max(24, int(height * 0.03))),
+        )
+    available_height = max(80, available_height)
+
+    size = start_size
+    while size >= 48:
+        fonts = _load_title_fonts(size)
+        max_text_width = int(width * max_width_ratio)
+        lines = _wrap_title(title, fonts, max_text_width)
+        metrics = [_line_metrics(line, fonts) for line in lines]
+        line_heights = [ascent + descent for _, ascent, descent in metrics]
+        line_gap = max(10, int(size * 0.16))
+        vertical_padding = max(20, int(size * 0.34))
+        box_height = (
+            sum(line_heights)
+            + line_gap * (len(lines) - 1)
+            + vertical_padding * 2
+        )
+        line_widths = [metric[0] for metric in metrics]
+        if (
+            all(line_width <= max_text_width for line_width in line_widths)
+            and box_height <= available_height
+        ):
+            return fonts, lines, metrics, line_heights, line_gap, box_height
+        size -= 2
+
+    max_text_width = int(width * max_width_ratio)
+    fonts = _load_title_fonts(48)
+    lines = _wrap_title(title, fonts, max_text_width)
+    lines = [_truncate_line(line, fonts, max_text_width) for line in lines]
+    metrics = [_line_metrics(line, fonts) for line in lines]
+    line_heights = [ascent + descent for _, ascent, descent in metrics]
+    line_gap = max(10, int(48 * 0.16))
+    vertical_padding = max(20, int(48 * 0.34))
+    box_height = (
+        sum(line_heights)
+        + line_gap * (len(lines) - 1)
+        + vertical_padding * 2
     )
-    below = face_bottom + margin
-    if overlaps_subject and below + box_height <= height:
-        return below
-
-    above = face_y - margin - box_height
-    if overlaps_subject and above >= 0:
-        return above
-
-    if not overlaps_subject:
-        return max(0, min(height - box_height, centered))
-
-    below_clearance = height - face_bottom
-    above_clearance = face_y
-    if below_clearance >= above_clearance:
-        return max(0, min(height - box_height, face_bottom + margin))
-    return max(0, min(height - box_height, face_y - margin - box_height))
+    return fonts, lines, metrics, line_heights, line_gap, box_height
 
 
 def _draw_title(
@@ -1110,23 +1180,31 @@ def _draw_title(
     else:
         font_size = 78
 
-    fonts, lines = _fit_font(title, width, font_size)
-    metrics = [_line_metrics(line, fonts) for line in lines]
-    line_heights = [ascent + descent for _, ascent, descent in metrics]
-    line_gap = max(10, int(fonts[0].size * 0.16))
-    text_height = sum(line_heights) + line_gap * (len(lines) - 1)
+    (
+        fonts,
+        lines,
+        metrics,
+        line_heights,
+        line_gap,
+        box_height,
+    ) = _title_layout(
+        title, width, height, font_size, face_bbox, orientation
+    )
     text_width = max(item[0] for item in metrics)
 
     horizontal_padding = max(34, int(fonts[0].size * 0.58))
-    vertical_padding = max(20, int(fonts[0].size * 0.34))
     compact_title_length = len(re.sub(r"\s+", "", str(title)))
-    box_min_ratio = 0.88 if compact_title_length >= 14 else 0.70
+    reserve_badge = orientation in ("wide", "share")
+    box_min_ratio = 0.62 if compact_title_length >= 14 else 0.50
+    max_box_ratio = 0.78 if reserve_badge else 0.94
     box_width = min(
-        int(width * 0.94),
+        int(width * max_box_ratio),
         max(int(width * box_min_ratio), text_width + horizontal_padding * 2),
     )
-    box_height = min(height, text_height + vertical_padding * 2)
-    box_x = (width - box_width) // 2
+    if reserve_badge:
+        box_x = max(24, int(width * 0.035))
+    else:
+        box_x = (width - box_width) // 2
     box_y = _title_box_y(height, box_height, face_bbox)
     corner_radius = max(24, int(box_height * 0.24))
     shadow_offset = max(10, int(box_height * 0.12))
@@ -1148,7 +1226,7 @@ def _draw_title(
         fill=_COVER_BACKGROUND,
     )
 
-    y = box_y + vertical_padding
+    y = box_y + max(20, int(fonts[0].size * 0.34))
     for line, (_, ascent, _), line_height in zip(lines, metrics, line_heights):
         line_width = _line_metrics(line, fonts)[0]
         x = box_x + (box_width - line_width) / 2

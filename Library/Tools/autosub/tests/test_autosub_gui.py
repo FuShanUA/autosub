@@ -83,6 +83,24 @@ class TestTerminalGUI(unittest.TestCase):
         
         self.gui.proc.stdin.write.assert_called_with(b'\n')
 
+    def test_terminal_resize_is_deduplicated_and_uses_padding(self):
+        """Repeated resize events should send one final rows/cols update."""
+        self.gui.engine_started = True
+        self.gui._last_terminal_size = None
+        self.gui.proc.stdin.write.reset_mock()
+
+        self.gui._send_terminal_size(500, 300)
+        self.gui._send_terminal_size(500, 300)
+
+        self.assertEqual(self.gui.proc.stdin.write.call_count, 1)
+        message = self.gui.proc.stdin.write.call_args[0][0].decode("utf-8")
+        rows, cols = map(int, message.strip().lstrip("\x1e").split(","))
+        char_width = self.gui.custom_font.measure("A")
+        line_height = self.gui.custom_font.metrics("linespace")
+        expected_cols = max(40, (500 - 32) // char_width)
+        expected_rows = max(10, (300 - 32) // line_height)
+        self.assertEqual((rows, cols), (expected_rows, expected_cols))
+
 
 class TestAutoSubGUIEditing(unittest.TestCase):
     def setUp(self):

@@ -469,6 +469,59 @@ def cjk_truncate(s: str, max_width: int, ellipsis: str = '...') -> str:
     return ''.join(result) + ellipsis
 
 
+def cjk_wrap(s: str, max_width: int) -> List[str]:
+    """Wrap text to a terminal display width without dropping content."""
+    s = sanitize_title(str(s))
+    if max_width <= 0:
+        return [s] if s else []
+
+    lines: List[str] = []
+    current = ""
+    current_w = 0
+
+    def append_word(word: str) -> None:
+        nonlocal current, current_w
+        word_w = cjk_display_width(word)
+        separator_w = 1 if current else 0
+
+        if current and current_w + separator_w + word_w <= max_width:
+            current += f" {word}"
+            current_w += separator_w + word_w
+            return
+
+        if current:
+            lines.append(current)
+            current = ""
+            current_w = 0
+
+        if word_w <= max_width:
+            current = word
+            current_w = word_w
+            return
+
+        chunk = ""
+        chunk_w = 0
+        for char in word:
+            char_w = cjk_display_width(char)
+            if chunk and chunk_w + char_w > max_width:
+                lines.append(chunk)
+                chunk = char
+                chunk_w = char_w
+            else:
+                chunk += char
+                chunk_w += char_w
+        if chunk:
+            lines.append(chunk)
+
+    for word in s.split(" "):
+        if word:
+            append_word(word)
+
+    if current:
+        lines.append(current)
+    return lines or [""]
+
+
 def parse_duration_to_seconds(dur_str):
     if not dur_str: return 0
     if ":" in dur_str:
@@ -640,8 +693,14 @@ def is_wechat_over_limit_reason(reason: Optional[str]) -> bool:
 
 
 def is_wechat_ambiguous_upload_reason(reason: Optional[str]) -> bool:
-    """Whether WeChat received the file but did not confirm the final result."""
-    return "文件已提交给微信" in str(reason or "")
+    """Whether WeChat may have received the file but did not confirm the result."""
+    value = str(reason or "")
+    if "文件已提交给微信" in value:
+        return True
+    # A child can die with EPIPE after the file input was accepted. The upload
+    # may already be in WeChat's hands, so treat it as ambiguous and do not
+    # automatically submit another file.
+    return "视频文件已选择" in value and "EPIPE" in value
 
 
 CHINESE_CHAR_RE = re.compile(r'[\u4e00-\u9fff]')
@@ -3190,6 +3249,9 @@ class BatchEngine:
 
 # --- UI 渲染 ---
 class Dashboard:
+    # Fits combined post-processing stages such as "(GD/BI/WX)" on one line.
+    STATUS_COLUMN_WIDTH = 14
+
     def __init__(self, engine: BatchEngine):
         self.engine = engine
         self.console = Console(force_terminal=True, _environ=_rich_environ())
@@ -3199,9 +3261,8 @@ class Dashboard:
 
 
     def make_bar(self, p, stage_active, row_color):
-        # 动态缩减进度条宽度以适应小窗口
-        term_width = self.console.width
-        w = 10 if term_width >= 135 else 6
+        # 与 Dashboard 进度列的 width=5 保持一致，避免 Rich 再裁剪进度条。
+        w = 5
 
         # 只要有进度 (哪怕很小)，就至少显示一格，确保可视化反馈
         filled = math.ceil(p / 100 * w) if p > 0 else 0
@@ -3213,105 +3274,92 @@ class Dashboard:
             bar_color = "grey37"
 
         bar = "█" * filled + "░" * (w - filled)
-        pct = f"{int(p)}%" if term_width < 100 else f"{p:>5.1f}%"
+        pct = "100%" if p >= 100 else f"{p:.1f}%"
         # 紧凑布局：进度条与百分比
         return f"[{bar_color}]{bar}[/]\n[{bar_color}]{pct.center(w)}[/]"
 
 
+    def make_title_bar(self, title: str, term_width: int) -> Text:
+        """Render the full playlist title as one or more centered bars."""
+        title_lines = cjk_wrap(sanitize_title(title), max(1, term_width))
+        padded_lines = []
+        for line in title_lines:
+            line_w = cjk_display_width(line)
+            pad_l = max(0, (term_width - line_w) // 2)
+            pad_r = max(0, term_width - line_w - pad_l)
+            padded_lines.append(" " * pad_l + line + " " * pad_r)
+        return Text("\n".join(padded_lines), style="bold white on blue")
+
+
     def render(self):
-        # 计算动态页长 (根据终端高度)
+        # 计算动态页长 (根据终端高度和标题折行后的实际行数)
         term_height = self.console.height
         term_width = self.console.width
-        # Table 每一行约占用 2-3 行高度 (换行 + 线条)
-        self.page_size = max(5, (term_height - 10) // 3)
 
-        # Title bar: separate line above table, padded to full terminal width.
+        # Title bar: separate lines above the table, padded to full terminal width.
         # Avoids Rich's title-in-border rendering which misaligns with CJK/emoji.
-        title_content = f"  {self.engine.playlist_title}  "
-        title_content = sanitize_title(title_content)
-        title_w = cjk_display_width(title_content)
-        if title_w > term_width:
-            title_content = cjk_truncate(title_content, term_width)
-            title_w = cjk_display_width(title_content)
-        t_pad_l = max(0, (term_width - title_w) // 2)
-        t_pad_r = max(0, term_width - title_w - t_pad_l)
-        title_bar = Text(' ' * t_pad_l + title_content + ' ' * t_pad_r, style='bold white on blue')
+        title_bar = self.make_title_bar(self.engine.playlist_title, term_width)
+        title_bar_lines = len(title_bar.plain.splitlines())
 
         table = Table(
             box=box.ROUNDED, expand=True, border_style="bright_blue", show_lines=True,
         )
 
-        # Dynamic Responsive Layout Modes
-        if term_width >= 135:
-            # 1. Wide Mode: Show all columns with massive Title column (ratio=1)
-            table.add_column("ID", width=3, justify="center", vertical="middle")
-            table.add_column("Video Title", ratio=1, min_width=40, justify="left", vertical="middle", no_wrap=True, overflow="crop")
-            table.add_column("Duration", width=8, justify="center", vertical="middle")
-            table.add_column("Status", width=8, justify="center", vertical="middle")
+        stages = ["DL", "TR", "TL", "MR", "BR", "GD"]
+        if self.engine.do_bili or self.engine.do_wechat:
+            stages.append("MG")
+        if self.engine.do_bili:
+            stages.append("BI")
+        if self.engine.do_wechat:
+            stages.append("WX")
 
-            stages = ["DL", "TR", "TL", "MR", "BR", "GD"]
-            if self.engine.do_bili or self.engine.do_wechat:
-                stages.append("MG")
-            if self.engine.do_bili: stages.append("BI")
-            if self.engine.do_wechat: stages.append("WX")
-            for s in stages:
-                table.add_column(s, width=10, justify="center", vertical="middle")
-            active_stages = list(stages)
-            _metadata_stage_count = int(
-                self.engine.do_bili or self.engine.do_wechat
-            )
-            _title_w = max(
-                20,
-                term_width - 107 - (
-                    10 * (
-                        _metadata_stage_count
-                        + int(self.engine.do_bili)
-                        + int(self.engine.do_wechat)
-                    )
-                ),
-            )
+        # ID(3)+Duration(8)+Status(14), each column has 2 padding cells;
+        # each 5-cell stage column uses 7 cells, and there are len(stages)+5
+        # vertical borders. This leaves the stated width for title text.
+        title_width = term_width - 38 - 8 * len(stages)
+        if title_width < 20:
+            # Narrow mode: drop stage columns instead of squeezing the title.
+            stages = []
+            title_width = max(20, term_width - 38)
 
-        elif term_width >= 105:
-            # 2. Medium Mode: Show all columns but optimize progress stages to be extremely compact (width=6)
-            table.add_column("ID", width=3, justify="center", vertical="middle")
-            table.add_column("Video Title", ratio=1, min_width=30, justify="left", vertical="middle", no_wrap=True, overflow="crop")
-            table.add_column("Duration", width=8, justify="center", vertical="middle")
-            table.add_column("Status", width=8, justify="center", vertical="middle")
-
-            stages = ["DL", "TR", "TL", "MR", "BR", "GD"]
-            if self.engine.do_bili or self.engine.do_wechat:
-                stages.append("MG")
-            if self.engine.do_bili: stages.append("BI")
-            if self.engine.do_wechat: stages.append("WX")
-            for s in stages:
-                table.add_column(s, width=6, justify="center", vertical="middle")
-            active_stages = list(stages)
-            _metadata_stage_count = int(
-                self.engine.do_bili or self.engine.do_wechat
-            )
-            _title_w = max(
-                20,
-                term_width - 83 - (
-                    6 * (
-                        _metadata_stage_count
-                        + int(self.engine.do_bili)
-                        + int(self.engine.do_wechat)
-                    )
-                ),
-            )
-
-        else:
-            # 3. Narrow Mode: Completely hide stage progress columns to prioritize Title column
-            table.add_column("ID", width=3, justify="center", vertical="middle")
-            table.add_column("Video Title", ratio=1, min_width=25, justify="left", vertical="middle", no_wrap=True, overflow="crop")
-            table.add_column("Duration", width=8, justify="center", vertical="middle")
-            table.add_column("Status", width=8, justify="center", vertical="middle")
-            active_stages = []
-            _title_w = max(20, term_width - 32)
+        table.add_column("ID", width=3, justify="center", vertical="middle")
+        table.add_column(
+            "Video Title",
+            ratio=1,
+            min_width=20,
+            justify="left",
+            vertical="middle",
+            overflow="fold",
+        )
+        table.add_column("Duration", width=8, justify="center", vertical="middle")
+        table.add_column(
+            "Status",
+            width=self.STATUS_COLUMN_WIDTH,
+            justify="center",
+            vertical="middle",
+        )
+        for s in stages:
+            table.add_column(s, width=5, justify="center", vertical="middle")
+        active_stages = list(stages)
 
         with self.engine.lock:
             all_tasks = sorted(self.engine.task_map.values(), key=lambda x: x.uid)
             total_tasks = len(all_tasks)
+
+            used_height = title_bar_lines + 2 + 2  # header, separator, captions
+            page_size = 0
+            for task in all_tasks:
+                title_lines = len(
+                    cjk_wrap(sanitize_title(task.title), max(1, title_width))
+                )
+                row_height = max(2, title_lines) + 1  # content + row separator
+                if page_size and used_height + row_height > term_height:
+                    break
+                if not page_size and used_height + row_height > term_height:
+                    break
+                used_height += row_height
+                page_size += 1
+            self.page_size = max(1, page_size)
 
             # 分页切片
             if self.scroll_offset >= total_tasks: self.scroll_offset = max(0, total_tasks - self.page_size)
@@ -3361,9 +3409,15 @@ class Dashboard:
 
                 row: list = [
                     Text(str(t.uid), style=row_style),
-                    Text(cjk_truncate(t.title, _title_w), style=row_style, no_wrap=True, overflow="crop"),
+                    Text(sanitize_title(t.title), style=row_style, overflow="fold"),
                     Text(t.duration if t.duration else "Unknown", style=row_style),
-                    Text(disp_status, style=row_style, justify="center")
+                    Text(
+                        disp_status,
+                        style=row_style,
+                        justify="center",
+                        no_wrap=True,
+                        overflow="crop",
+                    )
                 ]
                 for s in active_stages:
                     s_active = (s == active_stage) or (0 < t.pcts.get(s, 0.0) < 100.0)
@@ -3607,11 +3661,15 @@ def main():
                             cmd_mode, id_buf, dash.cmd_buf = None, "", ""
                         continue
 
-                if ch == b'p':
-
+                # 'p'/'r' switch command mode only while nothing has been typed.
+                # Once an ID is in the buffer the same letters must be accepted
+                # as a stage suffix, otherwise a stage ending in R (TR/MR/BR)
+                # can never be completed: the trailing 'r' used to re-enter R
+                # mode and wipe the visible prompt.
+                if ch == b'p' and not id_buf:
                     dash.cmd_buf = "P (A/ID): "
                     cmd_mode = 'P'
-                elif ch == b'r':
+                elif ch == b'r' and not id_buf:
                     dash.cmd_buf = "R (ID/ID+STAGE): "
                     cmd_mode = 'R'
                 elif ch.isdigit() and cmd_mode:

@@ -1,5 +1,6 @@
 
 yt-dlp
+yt-dlp-ejs
 faster-whisper
 mlx-whisper
 google-generativeai

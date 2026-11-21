@@ -59,6 +59,53 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         res = autosub_launcher.parse_indices("", 10)
         self.assertEqual(res, set(range(1, 11)))
 
+    def test_takeover_running_project_stops_engine_and_clears_pause(self):
+        """Takeover must remove the old lock and clear pause flags for restart."""
+        import psutil
+
+        project = os.path.join(self.temp_dir, "running_project")
+        os.makedirs(project)
+        state_path = os.path.join(project, "batch_state.json")
+        lock_path = os.path.join(project, "batch_engine.lock")
+        state = {
+            "1": {
+                "uid": 1,
+                "status": "暂停中 (TR)",
+                "is_paused": True,
+            },
+            "global_pause": True,
+        }
+        with open(state_path, "w", encoding="utf-8") as handle:
+            json.dump(state, handle, ensure_ascii=False)
+        with open(lock_path, "w", encoding="utf-8") as handle:
+            handle.write("4242")
+
+        class FakeProcess:
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return None
+
+        with patch.object(psutil, "Process", return_value=FakeProcess()):
+            result = autosub_launcher.takeover_running_project(project, 4242)
+
+        self.assertTrue(result)
+        self.assertFalse(os.path.exists(lock_path))
+        with open(state_path, "r", encoding="utf-8") as handle:
+            resumed = json.load(handle)
+        self.assertFalse(resumed["global_pause"])
+        self.assertFalse(resumed["1"]["is_paused"])
+
+    def test_wechat_epipe_after_file_selection_is_ambiguous(self):
+        """A post-selection EPIPE must block automatic re-upload."""
+        output = ">>> 视频文件已选择，等待上传...\nError: write EPIPE"
+
+        self.assertTrue(batch_pro.is_wechat_ambiguous_upload_reason(output))
+        self.assertFalse(
+            batch_pro.is_wechat_ambiguous_upload_reason("Error: write EPIPE")
+        )
+
     def test_dashboard_completed_bar_stays_green(self):
         """A 100% stage must render green even while its task row is running."""
         from autosub_batch_pro import Dashboard
@@ -75,6 +122,139 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         self.assertIn("[grey37]", queued_active)
         self.assertNotIn("[bright_blue]", queued_active)
         self.assertIn("[grey37]", inactive)
+
+    def test_dashboard_title_bar_wraps_instead_of_truncating(self):
+        """Long playlist titles must remain fully visible across wrapped lines."""
+        from autosub_batch_pro import Dashboard
+
+        dashboard = Dashboard(SimpleNamespace())
+        title = "这是一个非常长的中文标题需要自动换行而不是截断显示全部内容"
+        bar = dashboard.make_title_bar(title, 20)
+        lines = bar.plain.splitlines()
+
+        self.assertNotIn("...", bar.plain)
+        self.assertGreater(len(lines), 1)
+        self.assertEqual("".join(line.strip() for line in lines), title)
+        self.assertTrue(all(batch_pro.cjk_display_width(line) == 20 for line in lines))
+
+    def test_dashboard_status_column_fits_combined_upload_stages(self):
+        """The status column must show combined stages such as GD/BI/WX."""
+        from autosub_batch_pro import Dashboard
+
+        dashboard = Dashboard(SimpleNamespace())
+        dashboard.console = batch_pro.Console(
+            width=140,
+            height=40,
+            force_terminal=True,
+            _environ={},
+        )
+        task = SimpleNamespace(
+            uid=33,
+            title="Combined upload stages",
+            duration="01:14:57",
+            status="运行中 (GD/BI/WX)",
+            pcts={stage: 0.0 for stage in ("DL", "TR", "TL", "MR", "BR", "GD", "MG", "BI", "WX")},
+        )
+        engine = SimpleNamespace(
+            playlist_title="AutoSub",
+            lock=threading.Lock(),
+            task_map={33: task},
+            do_bili=True,
+            do_wechat=True,
+        )
+        dashboard.engine = engine
+
+        renderable = dashboard.render()
+        table = renderable.renderables[1]
+        output = batch_pro.Console(width=140, record=True, _environ={})
+        output.print(renderable)
+
+        self.assertEqual(table.columns[3].width, Dashboard.STATUS_COLUMN_WIDTH)
+        self.assertEqual(Dashboard.STATUS_COLUMN_WIDTH, 14)
+        self.assertIn("(GD/BI/WX)", output.export_text())
+
+    def test_dashboard_video_titles_wrap_without_ellipsis(self):
+        """Task titles must remain complete and fold inside the title column."""
+        from autosub_batch_pro import Dashboard
+
+        dashboard = Dashboard(SimpleNamespace())
+        dashboard.console = batch_pro.Console(
+            width=133,
+            height=30,
+            force_terminal=True,
+            _environ={},
+        )
+        long_title = (
+            "Palantir CEO Alex Karp: Why the West is Destroying Itself, "
+            "Data Empire, Skeptics, How to Win"
+        )
+        task = SimpleNamespace(
+            uid=10,
+            title=long_title,
+            duration="40:15",
+            status="运行中 (DL)",
+            pcts={stage: 0.0 for stage in ("DL", "TR", "TL", "MR", "BR", "GD", "MG", "BI", "WX")},
+        )
+        engine = SimpleNamespace(
+            playlist_title="YY",
+            lock=threading.Lock(),
+            task_map={10: task},
+            do_bili=True,
+            do_wechat=True,
+        )
+        dashboard.engine = engine
+
+        renderable = dashboard.render()
+        table = renderable.renderables[1]
+        output = batch_pro.Console(width=133, record=True, _environ={})
+        output.print(renderable)
+        rendered = output.export_text()
+
+        self.assertEqual(table.columns[1].overflow, "fold")
+        self.assertFalse(table.columns[1].no_wrap)
+        for fragment in (
+            "Palantir CEO Alex Karp:",
+            "Why the West is",
+            "Destroying Itself, Data",
+            "Empire, Skeptics, How",
+            "to Win",
+        ):
+            self.assertIn(fragment, rendered)
+
+    def test_dashboard_compact_stage_columns_leave_title_space(self):
+        """Five-cell progress columns should not be cropped by Rich."""
+        from autosub_batch_pro import Dashboard
+
+        dashboard = Dashboard(SimpleNamespace())
+        dashboard.console = batch_pro.Console(
+            width=133,
+            height=30,
+            force_terminal=True,
+            _environ={},
+        )
+        task = SimpleNamespace(
+            uid=10,
+            title="Title",
+            duration="40:15",
+            status="运行中 (DL)",
+            pcts={stage: 12.3 for stage in ("DL", "TR", "TL", "MR", "BR", "GD", "MG", "BI", "WX")},
+        )
+        engine = SimpleNamespace(
+            playlist_title="YY",
+            lock=threading.Lock(),
+            task_map={10: task},
+            do_bili=True,
+            do_wechat=True,
+        )
+        dashboard.engine = engine
+
+        renderable = dashboard.render()
+        table = renderable.renderables[1]
+        stage_columns = table.columns[4:]
+
+        self.assertGreaterEqual(len(stage_columns), 9)
+        self.assertTrue(all(column.width == 5 for column in stage_columns))
+        self.assertEqual(dashboard.make_bar(12.3, True, "bright_blue").count("░"), 4)
 
     def test_find_tool_checks_macos_homebrew_fallback(self):
         """A GUI-launched process must find Homebrew ffprobe without a login PATH."""
@@ -5437,6 +5617,14 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
         self.assertLessEqual(len(title), 16)
         self.assertNotIn("_", title)
         self.assertNotIn("-", title)
+
+    def test_build_wechat_title_removes_curly_quotes(self):
+        """WeChat rejects curly quotes even though they look like text punctuation."""
+        title = autosub.sanitize_wechat_title("Palantir’s卡普谈Tru")
+
+        self.assertNotIn("’", title)
+        self.assertNotIn("'", title)
+        self.assertLessEqual(len(title), 16)
 
     def test_confirm_wechat_upload_defaults_to_draft(self):
         """WeChat upload confirmation defaults to saving a draft."""
