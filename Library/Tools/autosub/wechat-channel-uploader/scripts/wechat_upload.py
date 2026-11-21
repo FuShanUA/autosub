@@ -113,6 +113,12 @@ if not os.path.isdir(_COMMON_DIR):
     _COMMON_DIR = "/Users/shanfu/cc/Library/Tools/common"
 if os.path.isdir(_COMMON_DIR) and _COMMON_DIR not in sys.path:
     sys.path.insert(0, _COMMON_DIR)
+if not os.path.isfile(os.path.join(_COMMON_DIR, "subtitle_title.py")):
+    _SECONDARY_COMMON_DIR = "/Users/shanfu/cc/Library/Tools/common"
+    if os.path.isdir(_SECONDARY_COMMON_DIR) and _SECONDARY_COMMON_DIR not in sys.path:
+        # Keep repository-side cover_utils first, but allow the shared
+        # subtitle_title module to be found in nested checkout layouts.
+        sys.path.insert(1, _SECONDARY_COMMON_DIR)
 try:
     from llm_utils import get_client as _get_llm_client, LLMProvider as _LLMProvider  # type: ignore
 except Exception:
@@ -467,7 +473,7 @@ def _normalize_wechat_title(title):
     """Apply WeChat's short-title punctuation and length rules."""
     cleaned = str(title).replace(",", " ").replace("，", " ")
     cleaned = re.sub(
-        r"[^0-9A-Za-z\u3400-\u4dbf\u4e00-\u9fff《》“”‘’：:+?%℃ ]",
+        r"[^0-9A-Za-z\u3400-\u4dbf\u4e00-\u9fff《》：:+?%℃ ]",
         " ",
         cleaned,
     )
@@ -1014,6 +1020,84 @@ async def _ensure_required_publish_settings(page):
     return await _set_required_publish_settings(page)
 
 
+async def _set_wechat_collection(page, collection_name: str) -> bool:
+    """Select or create a WeChat Channels collection (添加到合集)."""
+    if not collection_name or not collection_name.strip():
+        return True
+    target = collection_name.strip()[:10]
+    try:
+        album_wrap = page.locator(".post-album-wrap").first
+        if await album_wrap.count() == 0:
+            print(">>> 表单中未找到'添加到合集'入口")
+            return False
+
+        display_text = album_wrap.locator(".display-text").first
+        current = (await display_text.inner_text()).strip() if await display_text.count() > 0 else ""
+        if target in current:
+            print(f">>> 当前视频已关联微信合集: {target}")
+            return True
+
+        # Click dropdown trigger to reveal options
+        await album_wrap.locator(".post-album-display-wrap").first.click()
+        await asyncio.sleep(0.5)
+
+        # Check existing options
+        options = album_wrap.locator(".option-list-wrap .option-item")
+        matched = None
+        for i in range(await options.count()):
+            opt = options.nth(i)
+            name_el = opt.locator(".name").first
+            if await name_el.count() > 0 and (await name_el.inner_text()).strip() == target:
+                matched = opt
+                break
+
+        if matched is not None:
+            await matched.click()
+            await asyncio.sleep(0.5)
+            print(f">>> 已选择已有合集: {target}")
+            return True
+
+        # Create new collection
+        create_link = album_wrap.locator(".create a").first
+        if await create_link.count() == 0:
+            print(f">>> 未找到'创建新合集'按钮，无法创建: {target}")
+            await album_wrap.locator(".post-album-display-wrap").first.click()
+            return False
+
+        await create_link.click()
+        await asyncio.sleep(0.8)
+
+        # Fill collection input
+        dialog_input = page.locator(".create-dialog-wrap input.weui-desktop-form__input").first
+        await dialog_input.wait_for(state="visible", timeout=5000)
+        await dialog_input.fill(target)
+        await asyncio.sleep(0.3)
+
+        # Click create button
+        create_btn = page.locator(
+            ".create-dialog-wrap"
+        ).locator("xpath=ancestor::div[contains(@class, 'weui-desktop-dialog')]").locator(".weui-desktop-btn_primary").first
+        if await create_btn.count() == 0:
+            create_btn = page.locator("button:has-text('创建')").first
+        await create_btn.click()
+        await asyncio.sleep(1.0)
+
+        # Dismiss "我知道了" dialog
+        know_btn = page.locator(".create-dialog-success-wrap button, button:has-text('我知道了')").first
+        if await know_btn.count() > 0:
+            try:
+                await know_btn.click(timeout=3000)
+                await asyncio.sleep(0.5)
+            except Exception:
+                pass
+
+        print(f">>> 成功新建并关联微信合集: {target}")
+        return True
+    except Exception as exc:
+        print(f">>> 设置微信合集失败 ({target}): {exc}")
+        return False
+
+
 async def _read_upload_progress(page):
     """Read upload progress from progress nodes, ARIA state, or page text."""
     try:
@@ -1285,6 +1369,31 @@ def _new_draft_entries(entries, expected_desc, known_drafts=None):
     ]
 
 
+def _dedupe_draft_entries(entries):
+    """Drop duplicate page reads while preserving distinct list positions."""
+    seen = set()
+    result = []
+    for entry in entries or []:
+        # A stale page re-read repeats the same position and the same draft,
+        # so the page number must not keep such a duplicate alive.
+        identity = (entry.get("index"), _draft_signature(entry))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        result.append(entry)
+    return result
+
+
+def _known_draft_has_description(known_drafts, desc):
+    """Whether the pre-upload draft snapshot already contains this description."""
+    expected = _normalize_draft_text(desc)
+    return any(
+        tuple(item)[0] == expected
+        for item in (known_drafts or set())
+        if isinstance(item, (tuple, list)) and len(item) >= 1
+    )
+
+
 async def _click_visible_draft_link(page):
     links = page.locator("a", has_text="草稿箱")
     count = await links.count()
@@ -1407,53 +1516,129 @@ async def _open_draft_list(page):
 
 async def _draft_list_entries(page):
     """Read the currently visible draft entries from the Wujie shadow DOM."""
-    try:
-        return await page.evaluate(
-            """() => {
-                const root = document.querySelector('wujie-app')?.shadowRoot?.querySelector('html') || document;
-                return Array.from(root.querySelectorAll('.post-draft-item')).map((item, index) => ({
-                    index,
-                    title: item.querySelector('.post-title')?.innerText || item.innerText,
-                    time: item.querySelector('.post-time')?.innerText || '',
-                    text: item.innerText,
-                }));
-            }"""
-        )
-    except Exception:
-        return []
+    # Draft items are attached before they are painted, and innerText of an
+    # unpainted node is empty. Reading too early therefore yields rows with no
+    # title, which later looks like "the draft disappeared".
+    entries = []
+    for _ in range(20):
+        try:
+            entries = await page.evaluate(
+                """() => {
+                    const root = document.querySelector('wujie-app')?.shadowRoot?.querySelector('html') || document;
+                    return Array.from(root.querySelectorAll('.post-draft-item')).map((item, index) => ({
+                        index,
+                        title: item.querySelector('.post-title')?.innerText || item.innerText,
+                        time: item.querySelector('.post-time')?.innerText || '',
+                        text: item.innerText,
+                    }));
+                }"""
+            )
+        except Exception:
+            return []
+        if any(_normalize_draft_text(item.get("title")) for item in entries):
+            return entries
+        await asyncio.sleep(0.5)
+    return entries
 
 
 async def _current_draft_page_number(page):
-    """Return the draft list's current page number."""
-    if not hasattr(page, "locator"):
-        return 1
+    """Return the draft list's current page number, or None when unknown.
+
+    The pagination lives inside the Wujie shadow root, so a plain locator read
+    silently failed and defaulted to 1. That made _goto_draft_page(1) believe it
+    was already on page 1 and skip the click, leaving the list on the last page
+    it had visited.
+    """
     try:
-        value = await page.locator(
-            ".weui-desktop-pagination__num_current"
-        ).first.inner_text()
-        return int(str(value).strip())
+        return await page.evaluate(
+            """() => {
+                const roots = [
+                    document.querySelector('wujie-app')?.shadowRoot?.querySelector('html'),
+                    document,
+                ].filter(Boolean);
+                let current = null;
+                for (const root of roots) {
+                    current = root.querySelector('.weui-desktop-pagination__num_current');
+                    if (current) break;
+                }
+                if (!current) return null;
+                const value = parseInt((current.innerText || '').trim(), 10);
+                return Number.isFinite(value) ? value : null;
+            }"""
+        )
     except Exception:
-        return 1
+        return None
+
+
+async def _click_draft_page_number(page, page_number):
+    """Click a pagination number inside the Wujie shadow root."""
+    try:
+        return bool(
+            await page.evaluate(
+                """(wanted) => {
+                    const roots = [
+                        document.querySelector('wujie-app')?.shadowRoot?.querySelector('html'),
+                        document,
+                    ].filter(Boolean);
+                    let target = null;
+                    for (const root of roots) {
+                        target = Array.from(
+                            root.querySelectorAll('.weui-desktop-pagination__num')
+                        ).find((el) => (el.innerText || '').trim() === String(wanted));
+                        if (target) break;
+                    }
+                    if (!target) return false;
+                    target.click();
+                    return true;
+                }""",
+                page_number,
+            )
+        )
+    except Exception:
+        return False
 
 
 async def _goto_draft_page(page, page_number):
     """Move the draft list to an explicit page."""
-    if not hasattr(page, "locator"):
-        return True
-    if page_number == await _current_draft_page_number(page):
-        return True
-    try:
-        target = page.locator(
-            ".weui-desktop-pagination__num",
-            has_text=str(page_number),
-        ).first
-        if await target.count() == 0:
+    for _ in range(20):
+        current = await _current_draft_page_number(page)
+        if current == page_number:
+            return True
+        if current is None:
+            # No pagination rendered: a single-page list is already page 1.
+            return page_number == 1
+        if not await _click_draft_page_number(page, page_number):
             return False
-        await target.click()
-        await asyncio.sleep(1)
-        return await _current_draft_page_number(page) == page_number
-    except Exception:
-        return False
+        await asyncio.sleep(0.5)
+    return await _current_draft_page_number(page) == page_number
+
+
+async def _goto_first_draft_page(page):
+    """Return to page 1 even when the pagination indicator cannot be read.
+
+    Clicking 上一页 until it is disabled converges on the first page without
+    depending on the current-page element, and is a no-op once there.
+    """
+    await _goto_draft_page(page, 1)
+    for _ in range(20):
+        try:
+            prev_button = page.locator(
+                ".weui-desktop-pagination__nav a",
+                has_text="上一页",
+            ).first
+            if await prev_button.count() == 0:
+                return True
+            disabled = (
+                await prev_button.get_attribute("disabled")
+                or "disabled" in (await prev_button.get_attribute("class") or "")
+            )
+        except Exception:
+            return True
+        if disabled:
+            return True
+        await prev_button.click()
+        await asyncio.sleep(0.8)
+    return True
 
 
 async def _draft_entries_all_pages(page):
@@ -1461,16 +1646,17 @@ async def _draft_entries_all_pages(page):
     if not hasattr(page, "locator"):
         return await _draft_list_entries(page)
     # Always start from page 1 so the collected local indices are stable.
-    if not await _goto_draft_page(page, 1):
-        return []
+    await _goto_first_draft_page(page)
 
     entries = []
+    page_number = 0
     while True:
-        page_number = await _current_draft_page_number(page)
+        page_number += 1
         current_entries = await _draft_list_entries(page)
         for entry in current_entries:
             entry["page"] = page_number
         entries.extend(current_entries)
+        page_key = tuple(_draft_signature(item) for item in current_entries)
 
         next_button = page.locator(
             ".weui-desktop-pagination__nav a",
@@ -1485,44 +1671,41 @@ async def _draft_entries_all_pages(page):
         if disabled:
             break
         await next_button.click()
-        await asyncio.sleep(1)
+        # The page indicator flips before the list re-renders, so require the
+        # rows themselves to change; otherwise a stale page is collected twice.
+        advanced = False
+        for _ in range(20):
+            await asyncio.sleep(0.5)
+            probe = await _draft_list_entries(page)
+            if tuple(_draft_signature(item) for item in probe) != page_key:
+                advanced = True
+                break
+        if not advanced:
+            break
 
-    await _goto_draft_page(page, 1)
-    return entries
+    await _goto_first_draft_page(page)
+    return _dedupe_draft_entries(entries)
 
 
 async def _open_draft_entry_ref(page, entry):
-    """Open a draft entry from any page."""
-    page_number = int(entry.get("page") or 1)
-    if await _goto_draft_page(page, page_number):
-        if await _open_draft_entry_by_signature(page, entry):
-            return True
-    else:
-        print(f">>> 无法切换到草稿箱第 {page_number} 页")
+    """Open a draft entry, reloading the list when pagination is unreliable.
 
-    # A slow draft list can still show the previous page after pagination.
-    # Scan the visible pages again and click only on an exact signature match.
-    print(">>> 目标页未找到草稿签名，扫描草稿箱全部分页...")
-    if not await _goto_draft_page(page, 1):
-        return False
-    for _ in range(30):
+    Driving the pagination widget can leave the list parked on the wrong page,
+    and a stale page reads as "the draft disappeared". A fresh draft-list
+    navigation always lands on page 1, so retry from there instead of scanning.
+    """
+    page_number = int(entry.get("page") or 1)
+    for attempt in range(3):
+        if attempt:
+            print(">>> 重新加载草稿箱后重试打开草稿...")
+            if not await _open_draft_list(page):
+                return False
+        if page_number > 1 and not await _goto_draft_page(page, page_number):
+            print(f">>> 无法切换到草稿箱第 {page_number} 页")
+            continue
         if await _open_draft_entry_by_signature(page, entry):
             return True
-        next_button = page.locator(
-            ".weui-desktop-pagination__nav a",
-            has_text="下一页",
-        ).first
-        if await next_button.count() == 0:
-            break
-        disabled = (
-            await next_button.get_attribute("disabled")
-            or "disabled" in (await next_button.get_attribute("class") or "")
-        )
-        if disabled:
-            break
-        await next_button.click()
-        await asyncio.sleep(1)
-    print(">>> 草稿箱全部分页中未找到唯一匹配的草稿签名")
+    print(">>> 草稿箱中未找到唯一匹配的草稿签名")
     return False
 
 
@@ -1554,11 +1737,32 @@ async def _open_draft_entry_by_signature(page, entry):
         if _normalize_draft_text(item.get("title")) == expected_title
         and _normalize_draft_text(item.get("time")) == expected_time
     ]
+    if not matches and expected_title:
+        # Saving a draft refreshes its displayed timestamp, so a stale time
+        # must not hide an otherwise unique title match.
+        title_only = [
+            item
+            for item in current_entries
+            if _normalize_draft_text(item.get("title")) == expected_title
+        ]
+        if len(title_only) == 1:
+            print(">>> 草稿时间已刷新，按唯一标题匹配打开")
+            return await _open_draft_entry(page, title_only[0]["index"])
     if len(matches) == 1:
         return await _open_draft_entry(page, matches[0]["index"])
     if len(matches) > 1:
         print(f">>> 草稿箱按标题和时间匹配到 {len(matches)} 条草稿，拒绝猜测")
         return False
+    print(
+        ">>> 草稿签名未命中；期望时间="
+        f"{expected_time or '(空)'} 期望标题前40字={expected_title[:40] or '(空)'}"
+    )
+    for item in current_entries[:5]:
+        print(
+            "    实际条目: 时间="
+            f"{_normalize_draft_text(item.get('time')) or '(空)'} "
+            f"标题前40字={_normalize_draft_text(item.get('title'))[:40] or '(空)'}"
+        )
     try:
         result = await page.evaluate(
             """(expected) => {
@@ -2012,16 +2216,35 @@ async def _save_cover_dialog_debug(page, tag="confirm"):
         pass
 
 
-async def _click_uploaded_cover_thumb(page):
-    """Click the dialog's 上传封面 thumbnail to make it the crop source.
+def _cover_dialog_canvas_selector(orientation):
+    """Return the crop canvas selector for the requested cover orientation."""
+    if orientation == "portrait":
+        return ".cover-croppie.vertical canvas.cr-image"
+    if orientation == "share":
+        return ".cover-croppie.normal canvas.cr-image, .cover-croppie.horizon canvas.cr-image"
+    return ".croppie-container canvas.cr-image"
 
-    WeChat does not always switch the croppie source after the file input is
-    set; a person would click the uploaded thumbnail under the key-frame
-    slider. Do the same so the crop canvas shows our image.
+
+def _expected_cover_ratio(orientation):
+    """Width/height ratio WeChat's cropper binds for each cover slot."""
+    if orientation == "portrait":
+        return 3 / 4
+    if orientation == "share":
+        return 4 / 3
+    return None
+
+
+async def _cover_dialog_canvas_size(page, orientation):
+    """Bound bitmap size of the crop canvas in the active cover dialog.
+
+    WeChat binds the uploaded cover to croppie only after it reaches their CDN;
+    until then the canvas still holds the video frame. Headless screenshots do
+    not reliably capture canvas pixels, so the bound bitmap's aspect ratio is
+    the dependable signal that the crop source is our cover.
     """
     try:
         return await page.evaluate(
-            """() => {
+            """(payload) => {
                 const root = document.querySelector('wujie-app')?.shadowRoot?.querySelector('html') || document;
                 const visible = (el) => {
                     if (!el) return false;
@@ -2034,89 +2257,59 @@ async def _click_uploaded_cover_thumb(page):
                     root.querySelectorAll('.edit-cover-dialog-container .weui-desktop-dialog__wrp')
                 ).filter(visible);
                 const scope = wrappers.length ? wrappers[wrappers.length - 1] : null;
-                if (!scope) return false;
-                const labels = Array.from(scope.querySelectorAll('.text-wrap'))
-                    .filter((el) => (el.textContent || '').trim() === '上传封面');
-                for (const label of labels) {
-                    const target = label.parentElement;
-                    if (target && visible(target)) {
-                        target.click();
-                        return true;
-                    }
+                if (!scope) return null;
+                const bound = (item) => item.width > 0 && item.height > 0 && visible(item);
+                let canvas = Array.from(scope.querySelectorAll(payload.canvasSelector)).find(bound);
+                if (!canvas) {
+                    const candidates = Array.from(
+                        scope.querySelectorAll('.croppie-container canvas.cr-image')
+                    ).filter(bound);
+                    canvas = candidates.find(
+                        (item) => payload.expectedRatio
+                            && Math.abs(item.width / item.height - payload.expectedRatio) <= 0.03
+                    ) || candidates[0];
                 }
-                return false;
-            }"""
-        )
-    except Exception:
-        return False
-
-
-async def _cover_dialog_canvas_matches(page, cover_path, threshold=90.0):
-    """Whether the crop canvas already shows our uploaded cover.
-
-    WeChat keeps cropping the video frame (or nothing) until the uploaded image
-    finishes reaching its CDN. Confirming before that saves a crop of the wrong
-    source, so compare the canvas against the local cover inside the page.
-    """
-    try:
-        with open(cover_path, "rb") as handle:
-            encoded = base64.b64encode(handle.read()).decode("ascii")
-    except OSError:
-        return True
-    try:
-        return await page.evaluate(
-            """async (payload) => {
-                const root = document.querySelector('wujie-app')?.shadowRoot?.querySelector('html') || document;
-                const visible = (el) => {
-                    if (!el) return false;
-                    const style = window.getComputedStyle(el);
-                    if (style.display === 'none' || style.visibility === 'hidden') return false;
-                    const rect = el.getBoundingClientRect();
-                    return rect.width > 0 && rect.height > 0;
-                };
-                const wrappers = Array.from(
-                    root.querySelectorAll('.edit-cover-dialog-container .weui-desktop-dialog__wrp')
-                ).filter(visible);
-                const scope = wrappers.length ? wrappers[wrappers.length - 1] : null;
-                if (!scope) return false;
-                const canvas = scope.querySelector('.croppie-container canvas.cr-image');
-                if (!canvas || !canvas.width || !canvas.height) return false;
-                const load = (src) => new Promise((resolve, reject) => {
-                    const image = new Image();
-                    image.onload = () => resolve(image);
-                    image.onerror = reject;
-                    image.src = src;
-                });
-                let local;
-                try {
-                    local = await load('data:image/jpeg;base64,' + payload.b64);
-                } catch (err) {
-                    return true;
-                }
-                const size = 32;
-                const sample = (source, sw, sh) => {
-                    const out = document.createElement('canvas');
-                    out.width = size;
-                    out.height = size;
-                    const ctx = out.getContext('2d');
-                    ctx.drawImage(source, 0, 0, sw, sh, 0, 0, size, size);
-                    return ctx.getImageData(0, 0, size, size).data;
-                };
-                const a = sample(canvas, canvas.width, canvas.height);
-                const b = sample(local, local.naturalWidth, local.naturalHeight);
-                let sum = 0;
-                for (let i = 0; i < a.length; i += 4) {
-                    const d1 = a[i] - b[i];
-                    const d2 = a[i + 1] - b[i + 1];
-                    const d3 = a[i + 2] - b[i + 2];
-                    sum += d1 * d1 + d2 * d2 + d3 * d3;
-                }
-                return Math.sqrt(sum / (a.length / 4)) <= payload.threshold;
+                if (!canvas) return null;
+                return {width: canvas.width, height: canvas.height};
             }""",
-            {"b64": encoded, "threshold": threshold},
+            {
+                "canvasSelector": _cover_dialog_canvas_selector(orientation),
+                "expectedRatio": _expected_cover_ratio(orientation),
+            },
         )
     except Exception:
+        return None
+
+
+async def _wait_cover_dialog_canvas(page, orientation, seconds=180):
+    """Wait until croppie binds a cover with the expected aspect ratio.
+
+    Clicking the uploaded thumbnail is deliberately avoided: a real click on
+    that node re-opens the file picker and resets the uploader, which destroys
+    the cover that was already bound.
+    """
+    expected = _expected_cover_ratio(orientation)
+    if expected is None:
         return True
+    deadline = time.time() + seconds
+    last_size = None
+    while time.time() < deadline:
+        size = await _cover_dialog_canvas_size(page, orientation)
+        if isinstance(size, dict) and size.get("width") and size.get("height"):
+            current = (size["width"], size["height"])
+            if current != last_size:
+                last_size = current
+                print(
+                    f">>> 封面裁剪画布: {current[0]}x{current[1]}"
+                    f" (比例 {current[0] / current[1]:.3f}，期望 {expected:.3f})"
+                )
+            ratio = current[0] / current[1]
+            if abs(ratio - expected) <= 0.05:
+                return True
+            if orientation == "share" and abs(ratio - 1.0) <= 0.05:
+                return True
+        await asyncio.sleep(1)
+    return False
 
 
 async def _close_cover_dialog(page):
@@ -2479,26 +2672,9 @@ async def _upload_wechat_cover_card(page, cover_path, orientation, expected_titl
             return False
 
         # WeChat only switches the crop source to our image once it finishes
-        # reaching its CDN; until then the canvas crops the video frame (or
-        # nothing) and 确认 would save that wrong source. Wait for the canvas
-        # to actually show our cover, reopening the dialog once if needed.
-        async def _wait_canvas_shows_cover(seconds):
-            deadline = time.time() + seconds
-            last_thumb_click = 0.0
-            while time.time() < deadline:
-                if await _cover_dialog_canvas_matches(page, cover_path):
-                    return True
-                # A person would click the uploaded thumbnail to make it the
-                # crop source; do the same while waiting for WeChat to catch up.
-                if time.time() - last_thumb_click >= 10:
-                    last_thumb_click = time.time()
-                    if await _click_uploaded_cover_thumb(page):
-                        print(">>> 已点击弹层内的上传封面缩略图")
-                await asyncio.sleep(2)
-            return False
-
-        await _click_uploaded_cover_thumb(page)
-        canvas_ok = await _wait_canvas_shows_cover(180)
+        # reaching its CDN; until then the canvas crops the video frame and
+        # 确认 would save that wrong source.
+        canvas_ok = await _wait_cover_dialog_canvas(page, orientation, 180)
         if not canvas_ok:
             print(">>> 裁剪画布仍未切换到上传封面，关闭弹层重开一次")
             await _close_cover_dialog(page)
@@ -2514,8 +2690,7 @@ async def _upload_wechat_cover_card(page, cover_path, orientation, expected_titl
             except Exception:
                 print(">>> 重开封面编辑弹层失败")
                 return False
-            await _click_uploaded_cover_thumb(page)
-            canvas_ok = await _wait_canvas_shows_cover(180)
+            canvas_ok = await _wait_cover_dialog_canvas(page, orientation, 180)
         if not canvas_ok:
             print(">>> 裁剪画布始终未切换到上传封面，放弃本次封面设置以保留现有封面")
             await _save_cover_dialog_debug(page, f"canvas_mismatch_{orientation}")
@@ -2858,6 +3033,20 @@ async def _set_wechat_covers_sequentially(
         ("share", share_cover),
     ):
         label = "个人主页" if orientation == "portrait" else "分享"
+        if orientation == "share" and not await _cover_editor_nodes_ready(page):
+            print(">>> 正在从草稿箱重新打开草稿以设置分享卡片封面...")
+            if not await _open_draft_list(page):
+                print(">>> 无法打开草稿箱")
+            else:
+                entries = await _draft_entries_all_pages(page)
+                updated_entries = [
+                    entry for entry in entries if _draft_signature(entry) not in known_drafts
+                ]
+                target = updated_entries[0] if updated_entries else (entries[0] if entries else None)
+                if target:
+                    if await _open_draft_entry_ref(page, target):
+                        await _wait_cover_editor_ready(page, timeout=600)
+
         preview = None
         for attempt in range(1, 4):
             preview = await _upload_wechat_cover_card(
@@ -2963,7 +3152,8 @@ async def _wait_published(page, timeout=30):
 
 async def upload_one_video(video_path, title, desc=None, tags=None, is_public=False,
                            llm_provider="dashscope", llm_model="glm-5.2", headless=False,
-                           max_retries=2, auto_title=True, cover_title=None, attribution=None):
+                           max_retries=2, auto_title=True, cover_title=None, attribution=None,
+                           collection=None):
     """上传单个视频到微信视频号。返回 True/False。"""
     if not os.path.exists(video_path):
         print(f">>> 视频文件不存在: {video_path}")
@@ -3071,6 +3261,15 @@ async def upload_one_video(video_path, title, desc=None, tags=None, is_public=Fa
                         known_drafts = await _snapshot_drafts(page)
                     if known_drafts is None:
                         raise RuntimeError("上传前无法读取草稿箱，已停止以避免修改旧草稿")
+                    if _known_draft_has_description(known_drafts, desc):
+                        marker = os.path.join(os.path.dirname(video_path), ".wechat_uploaded")
+                        with open(marker, "w", encoding="utf-8") as handle:
+                            handle.write("1")
+                        print(
+                            ">>> 草稿箱已存在同描述草稿；跳过重复上传，"
+                            "如需补封面请使用 --repair-covers"
+                        )
+                        return True
 
                     def _log_wechat_response(response):
                         # Normal page polling returns many 200/201 responses.
@@ -3167,6 +3366,9 @@ async def upload_one_video(video_path, title, desc=None, tags=None, is_public=Fa
                     # 7. 设置微信必选发布项，再处理可见性和封面。
                     if not await _set_required_publish_settings(page):
                         raise RuntimeError("微信位置、视频标注或原创标志未设置成功")
+
+                    if collection and str(collection).strip():
+                        await _set_wechat_collection(page, str(collection).strip())
 
                     # 8. 设置可见性（公开 vs 仅自己可见）
                     resources_ready = await _wait_publish_resources_ready(page)
@@ -3266,7 +3468,12 @@ async def upload_one_video(video_path, title, desc=None, tags=None, is_public=Fa
                 # draft for this description, the upload itself succeeded and
                 # only a cover detail is off: record success instead of
                 # reporting a failure the user has to disprove by hand.
-                if await _draft_exists_for(page, desc):
+                page_is_open = False
+                try:
+                    page_is_open = not page.is_closed()
+                except Exception:
+                    page_is_open = False
+                if page_is_open and await _draft_exists_for(page, desc):
                     marker = os.path.join(os.path.dirname(video_path), ".wechat_uploaded")
                     with open(marker, "w", encoding="utf-8") as handle:
                         handle.write("1")
@@ -3275,10 +3482,16 @@ async def upload_one_video(video_path, title, desc=None, tags=None, is_public=Fa
                         "封面差异请用 --repair-covers 或目视核对"
                     )
                     return True
-                print(
-                    ">>> 草稿箱未找到本次草稿；请用 --repair-covers 或重跑，"
-                    "不要盲目重复上传"
-                )
+                if page_is_open:
+                    print(
+                        ">>> 草稿箱未找到本次草稿；请用 --repair-covers 或重跑，"
+                        "不要盲目重复上传"
+                    )
+                else:
+                    print(
+                        ">>> 草稿箱核验未执行：浏览器上下文已关闭。"
+                        "请先在微信草稿箱人工确认，避免重复上传"
+                    )
                 return False
             if attempt < max_retries:
                 print(f">>> 等待 5 秒后重试...")
@@ -3629,6 +3842,11 @@ def main():
         default=None,
         help="修复草稿时用草稿箱显示时间区分同描述草稿，例如 23:36",
     )
+    parser.add_argument(
+        "--collection",
+        default=None,
+        help="微信视频号合集名称（不超过10字，如不存在则自动新建并关联）",
+    )
     parser.add_argument("--headless", action="store_true", help="无头模式（不显示浏览器窗口）")
     parser.add_argument("--no_auto_title", action="store_true", help="禁用字幕自动标题，使用传入/文件名标题")
     parser.add_argument("--interval", type=float, default=10.0, help="批量上传间隔秒数")
@@ -3696,6 +3914,7 @@ def main():
         auto_title=not args.no_auto_title,
         cover_title=args.cover_title,
         attribution=args.attribution,
+        collection=args.collection,
     ))
     sys.exit(0 if ok else 1)
 
