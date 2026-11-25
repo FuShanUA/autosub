@@ -106,6 +106,24 @@ class TestAutoSubStateAndLauncher(unittest.TestCase):
             batch_pro.is_wechat_ambiguous_upload_reason("Error: write EPIPE")
         )
 
+    def test_download_cookie_permission_failure_is_actionable(self):
+        """macOS cookie access errors must not collapse into Exit 1."""
+        output = 'ERROR: could not find chrome cookies database in "/Google/Chrome"'
+
+        reason = batch_pro.get_download_failure_reason(output)
+
+        self.assertIn("无法读取 Chrome Cookies", reason)
+        self.assertIn("完全磁盘访问权限", reason)
+
+    def test_download_bot_check_failure_is_actionable(self):
+        """YouTube bot checks must identify the login cookie as the issue."""
+        output = "ERROR: [youtube] abc: Sign in to confirm you're not a bot."
+
+        reason = batch_pro.get_download_failure_reason(output)
+
+        self.assertIn("YouTube 登录态无效", reason)
+        self.assertIn("cookies.txt", reason)
+
     def test_dashboard_completed_bar_stays_green(self):
         """A 100% stage must render green even while its task row is running."""
         from autosub_batch_pro import Dashboard

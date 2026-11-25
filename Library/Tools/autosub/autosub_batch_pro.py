@@ -703,6 +703,26 @@ def is_wechat_ambiguous_upload_reason(reason: Optional[str]) -> bool:
     return "视频文件已选择" in value and "EPIPE" in value
 
 
+def get_download_failure_reason(output: str) -> Optional[str]:
+    """Turn common yt-dlp cookie failures into an actionable reason."""
+    value = output.lower()
+    if (
+        "could not find chrome cookies database" in value
+        or "operation not permitted" in value
+        or "authorization denied" in value
+    ):
+        return (
+            "无法读取 Chrome Cookies：请在系统设置 > 隐私与安全性 > 完全磁盘访问权限中"
+            "允许 AutoSub Launcher，或改用已登录的 cookies.txt"
+        )
+    if "sign in to confirm" in value or "not a bot" in value:
+        return (
+            "YouTube 登录态无效或触发机器人校验：请重新导出已登录的 cookies.txt，"
+            "或授权 launcher 读取 Chrome Cookies"
+        )
+    return None
+
+
 CHINESE_CHAR_RE = re.compile(r'[\u4e00-\u9fff]')
 
 
@@ -2395,8 +2415,13 @@ class BatchEngine:
                 if task.pcts.get(stage, 0.0) >= 100.0:
                     task.pcts[stage] = 0.0
                 task.status = f"失败 ({stage})"
-                task.error = f"上传卡死（看门狗：{_stall_note}）" if _stall_note else f"Exit {p.returncode}"
                 last_out = "".join(output_lines[-10:]).strip()
+                if _stall_note:
+                    task.error = f"上传卡死（看门狗：{_stall_note}）"
+                elif stage == "DL":
+                    task.error = get_download_failure_reason(last_out) or f"Exit {p.returncode}"
+                else:
+                    task.error = f"Exit {p.returncode}"
                 logger.error(f"Task {task.uid} | {stage} | FAILED | Code: {p.returncode} | Last Out: {last_out}")
                 return False
         except Exception as e:
@@ -2925,6 +2950,8 @@ class BatchEngine:
                         # 失败重试逻辑
                         if task.error and (
                             "登录态失效" in task.error
+                            or "无法读取 Chrome Cookies" in task.error
+                            or "YouTube 登录态无效" in task.error
                             or is_wechat_ambiguous_upload_reason(task.error)
                         ):
                             task.status = f"失败 ({stage})"
